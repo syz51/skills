@@ -31,3 +31,7 @@ The frontend source attribution also records antfu/design and its upstream inspi
 The locally maintained content-research-writer metadata records a rewrite retaining the purpose of the [original Composio skill](https://github.com/ComposioHQ/awesome-claude-skills/tree/044d48b594f060c164f3b20fac9ea01374721bca/content-research-writer), rather than its text. Its recorded conceptual references include Anthropic doc-coauthoring, Corey Haines copy-editing, and K-Dense scientific-writing and citation-management. They are acknowledged in `skills/content-research-writer/sources.json`; attribution is not a claim that all upstream material shares this project's license.
 
 Tauri guidance is locally authored and links to official documentation. Consolidated frontend policy is locally maintained; the source provenance and attribution files document its upstream inputs. No license notice here replaces the terms supplied with incorporated material.
+
+## Rust binary dependencies
+
+Release archives include `THIRD_PARTY_LICENSES.txt`, generated from the exact locked Cargo dependencies. Preserve it with the executable. Dependency declarations and their upstream sources are recorded in `Cargo.lock`; their terms are separate from the root license for original contributions.

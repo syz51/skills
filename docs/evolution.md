@@ -2,6 +2,12 @@
 
 The scripts separate evidence collection from policy changes. Use an independent private working repository for real feedback and releases; do not upload source transcripts or personal configuration to this public repository.
 
+## Incremental Rust migration
+
+The public publisher and its daily runner now live in the Rust `codex-skills` executable. They directly use the `codex-commit` library for generation-only messages from public diffs. The source-feedback, verification, retry, prompt-evaluation and weekly private-release contracts remain in their existing Python modules. A broader migration should preserve those contracts component by component; this release does not replace the entire maintenance pipeline.
+
+The old `scripts/public_export.py` and `scripts/public_export_job.py` remain regression references. Use the Rust commands in [Public publication](publication.md) for deployed publishing. Python remains a prerequisite for the current validation suite and maintenance commands below.
+
 ## Components
 
 - `read_guidance.py` returns bounded guidance text and hashes of exactly what was returned.

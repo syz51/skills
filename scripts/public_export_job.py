@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Publish the curated public inventory once per daily deadline, retrying failures."""
-import argparse
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 from zoneinfo import ZoneInfo
 
-from public_export import ExportError, configuration, execute, locks, save
+from public_export import ExportError, configuration, execute, locks, save, rust_cli
 
 
 def latest_due(now):
@@ -43,15 +43,7 @@ def run(config, now=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, required=True)
-    args = parser.parse_args()
-    try:
-        print(json.dumps(run(json.loads(args.config.expanduser().read_text())), indent=2))
-    except (ExportError, OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-        print('Daily public export stopped; its deadline remains pending.')
-        return 1
-    return 0
+    return rust_cli(['daily', *sys.argv[1:]])
 
 
 if __name__ == '__main__':

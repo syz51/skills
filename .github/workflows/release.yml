@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify annotated tag, version and main ancestry
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$(git cat-file -t "$RELEASE_TAG")" = tag
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          python3 - <<'CHECK'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as source:
+              assert tomllib.load(source)['package']['version'] == os.environ['RELEASE_TAG'][1:]
+          CHECK
+      - name: Require successful CI for exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GH_REPO/commits/$GITHUB_SHA/check-runs?per_page=100" > "$RUNNER_TEMP/checks.json"
+          jq -e --arg sha "$GITHUB_SHA" \
+            --argjson required '["tests (3.13)","tests (3.14)","Rust (ubuntu-latest)","Rust (macos-latest)"]' '
+            [.[].check_runs[] | select(.app.id == 15368 and .head_sha == $sha)] as $runs
+            | $required | all(.[]; . as $name
+              | [$runs[] | select(.name == $name)] | sort_by(.started_at, .id) | last
+              | .status == "completed" and .conclusion == "success")
+          ' "$RUNNER_TEMP/checks.json"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Build and verify native binary
+        env:
+          TARGET: ${{ matrix.target }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/codex-skills"
+          "$binary" --help
+          test "$("$binary" --version)" = "codex-skills ${RELEASE_TAG#v}"
+          mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/dist"
+          python3 scripts/bundle_rust_licenses.py --target "$TARGET" --output "$RUNNER_TEMP/package/THIRD_PARTY_LICENSES.txt"
+          cp "$binary" LICENSE README.md "$RUNNER_TEMP/package/"
+          tar -czf "$RUNNER_TEMP/dist/codex-skills-$RELEASE_TAG-$TARGET.tar.gz" -C "$RUNNER_TEMP/package" codex-skills LICENSE README.md THIRD_PARTY_LICENSES.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified archives
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+      - name: Check assets and publish new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 3
+          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'Release already exists; refusing to replace published assets.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --title "codex-skills $RELEASE_TAG" \
+            --notes-file "$GITHUB_WORKSPACE/CHANGELOG.md" *.tar.gz SHA256SUMS

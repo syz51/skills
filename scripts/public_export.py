@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Export an explicit committed file inventory without sharing private Git history."""
-import argparse
 import contextlib
 import fcntl
 import hashlib
@@ -300,20 +299,21 @@ def execute(config, publish=False):
             return {'changed': changed, 'file_count': len(files), 'public_commit': commit, 'source_commit': revision}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('plan', 'publish'))
-    parser.add_argument('--config', type=Path, required=True)
-    args = parser.parse_args()
+def rust_cli(arguments):
+    """Preserve the old command entrypoint while Rust owns live publication."""
+    binary = Path(os.environ.get('CODEX_SKILLS_BIN', '~/.local/bin/codex-skills')).expanduser()
+    if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        print('Install codex-skills or set CODEX_SKILLS_BIN to its absolute executable path.', file=sys.stderr)
+        return 1
     try:
-        print(json.dumps(execute(json.loads(args.config.read_text()), args.command == 'publish'), indent=2))
-    except ExportError as error:
-        print(str(error), file=sys.stderr)
+        os.execv(str(binary), [str(binary), *arguments])
+    except OSError:
+        print('Could not start the configured codex-skills executable.', file=sys.stderr)
         return 1
-    except (OSError, ValueError, subprocess.SubprocessError):
-        print('Public export failed; inspect the inventory, source, destination, and local state.', file=sys.stderr)
-        return 1
-    return 0
+
+
+def main():
+    return rust_cli(sys.argv[1:])
 
 
 if __name__ == '__main__':
