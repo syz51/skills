@@ -582,7 +582,7 @@
     "tests/test_claude_capture.py": "f16860ddf07ebe06e9d479cf7bc710a63706da3c0dafeb59ffab246107d37b09",
     "tests/test_evidence.py": "46f4f20fe39c328e29163d884a21b7925be1c142057821d0ab231ff5bf0417b0",
     "tests/test_jobs.py": "7b4f0b4c602bb93c7340b075885630969756bf9a9fa9e721a6b49003cecb0da1",
-    "tests/test_monitor.py": "9ce848885337ead1050320b18570711e0e60dd779aa1251c195915c8291dc92f",
+    "tests/test_monitor.py": "ec5ec377387d2146726ddb1824fbcf6721955a3d018a9feaa579da9818560c3e",
     "tests/test_prompt_review.py": "848a06931d348b22345ec0ec6bb940c4299cbb06cb33d0210863a56cfd4e7674",
     "tests/test_prompt_runtime.py": "b7c5c246b5f04de9d620abfe4a07689643035931393efbbb2bf2971fe86ce010",
     "tests/test_public_export.py": "b465279fd7183c162c35ec498dd4fc9b4217f92479f686539341ec2fc324cd8d",

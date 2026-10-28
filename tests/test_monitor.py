@@ -279,7 +279,8 @@ class MonitorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'config.json').write_text(json.dumps({'host_id': 'client-host', 'role': 'client'}))
-            result = monitor.probe(root)
+            with patch.object(monitor.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, stdout='', stderr='')):
+                result = monitor.probe(root)
             self.assertFalse((root / 'cycle.lock').exists())
             self.assertIn('cycle lock is missing', result['errors'])
 
