@@ -43,6 +43,10 @@ uv run --no-project python -m unittest discover -s tests
 
 The tests use synthetic fixtures and temporary repositories. Runtime model-based evaluations require separate authentication and may use account quota; the offline suite does not establish that a prompt improves real tasks.
 
+## Contributing and security
+
+See [Contributing](CONTRIBUTING.md) for checks and the export workflow, and [Security policy](SECURITY.md) for private vulnerability reports.
+
 ## License
 
 Original contributions are MIT licensed. Incorporated third-party material retains its own terms and notices; see [Third-party notices](THIRD_PARTY_NOTICES.md). Source attribution and recorded revisions remain alongside the skills.

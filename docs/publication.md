@@ -21,6 +21,12 @@ These checks reduce exposure risk but do not prove that arbitrary content is saf
 
 The exporter manages only its selected paths and its manifest. Other public-owned files are preserved. There are no force pushes. If a managed public file changes independently, publication stops so the change can be imported and reconciled in the private source. Changes to private review records alone do not require a public commit.
 
+## Branch protection and public CI
+
+The history ruleset blocks force pushes and deletion of `main` for everyone, including repository administrators. A separate ruleset requires the public CI checks for ordinary changes, with a repository-admin bypass for the existing owner-operated daily publisher. The publisher uses the same owner SSH credential as before; it is not a separately scoped bot identity. The only current repository administrator is the owner.
+
+The exporter runs its local checks before pushing. Public CI independently runs on pull requests and every push to `main`, checking the final public tree, including public-owned additions. The local exporter executes only the managed snapshot so public-owned tests cannot run with private credentials. Administrators can bypass the required-check ruleset, but cannot bypass the separate history ruleset. The owner should use the passing public checks when reviewing contributions.
+
 ## Contributions
 
 Public contributions are reviewed here. After a change is merged, the maintainer imports the relevant content into the private working source and reconciles the publication baseline before resuming exports. A routine must never overwrite an independent public change merely because its private copy is older.
