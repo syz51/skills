@@ -11,11 +11,13 @@ Agent skills and the tools used to improve them through feedback, source verific
 
 ## Install skills
 
-With Bun installed, run:
+Run the [Skills CLI](https://github.com/vercel-labs/skills) with a package runner you already have:
 
 ```sh
-bunx skills add syz51/skills
+npx skills add syz51/skills
 ```
+
+You can also use `pnpm dlx skills add syz51/skills` or `bunx skills add syz51/skills`. If the CLI is already installed globally, run `skills add syz51/skills` directly.
 
 Choose the skills and agents you want in the installer. Alternatively, copy a selected `skills/<name>/` directory into your agent's skill discovery directory, preserving its references. Tauri also uses frontend-ui.
 
