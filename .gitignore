@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.env
+.env.*
+!.env.example
+config.json
+*-config.json
+*-state.json
+*-status.json
+*.log
+feedback/
+releases/
+current

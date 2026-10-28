@@ -1,0 +1,61 @@
+{
+  "conceptReferences": [
+    {
+      "concept": "Optional independent reader-comprehension checks.",
+      "revision": "683bc88e56f3e09ba94f7055977f3d3aa499f202",
+      "sha256": "2e47d78846faeea4a56e9809c52700087a15a2155a3f293a3efbaded81398ef4",
+      "url": "https://github.com/anthropics/skills/blob/683bc88e56f3e09ba94f7055977f3d3aa499f202/skills/doc-coauthoring/SKILL.md",
+      "verifiedAt": "2026-10-09T06:20:48.032007+00:00"
+    },
+    {
+      "concept": "Focused editorial checks without fixed passes or scoring.",
+      "revision": "1efedbc5148b54b2f0f6c6c9fe0be62e151c7fff",
+      "sha256": "d23184ad62cbe29f64684b934c99d4ae8c7f03dec9c5a5d6bd492d645f5b9719",
+      "url": "https://github.com/coreyhaines31/marketingskills/blob/1efedbc5148b54b2f0f6c6c9fe0be62e151c7fff/skills/copy-editing/SKILL.md",
+      "verifiedAt": "2026-10-09T06:20:48.031418+00:00"
+    },
+    {
+      "concept": "Claim-to-evidence fidelity, uncertainty, and no fabricated facts.",
+      "revision": "92ace75ac21efe19a620434e0ca4e356081fe807",
+      "sha256": "511a2096bebecd8cf0f8212b9d262d37154ae1ba566eb385d93ac968682edbd1",
+      "url": "https://github.com/K-Dense-AI/scientific-agent-skills/blob/92ace75ac21efe19a620434e0ca4e356081fe807/skills/scientific-writing/SKILL.md",
+      "verifiedAt": "2026-10-09T06:20:48.033745+00:00"
+    },
+    {
+      "concept": "Separate bibliographic identity and formatting from claim support.",
+      "revision": "92ace75ac21efe19a620434e0ca4e356081fe807",
+      "sha256": "dc79fe1e8438dcf598040615d5323360c6a7ed0b868fc3ffc82512c871a1e3ff",
+      "url": "https://github.com/K-Dense-AI/scientific-agent-skills/blob/92ace75ac21efe19a620434e0ca4e356081fe807/skills/citation-management/SKILL.md",
+      "verifiedAt": "2026-10-09T06:20:48.026629+00:00"
+    }
+  ],
+  "maintenance": "local",
+  "rewrittenAt": "2026-10-09T06:10:59+00:00",
+  "updatePolicy": "Locally maintained. Review source updates before integrating them; do not overwrite this rewrite with the upstream entrypoint. The skill is intentionally excluded from the upstream-managed skill lock.",
+  "upstreamOriginal": {
+    "entrypoint": "https://github.com/ComposioHQ/awesome-claude-skills/blob/master/content-research-writer/SKILL.md",
+    "sha256": "27eb5c1a0a88a9c1c64f6fcd9c28782e6a6e70d5da43233c4e99ade946f74825",
+    "sourceLockRecord": {
+      "installedAt": "2026-02-10T01:11:14.749Z",
+      "skillFolderHash": "560a65081b1fc097120e95f04ec82b3fff5549e6",
+      "skillPath": "content-research-writer/SKILL.md",
+      "source": "composiohq/awesome-claude-skills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/composiohq/awesome-claude-skills.git",
+      "updatedAt": "2026-02-10T01:11:14.749Z"
+    }
+  },
+  "upstreamReview": [
+    {
+      "id": "content-research-writer",
+      "local": ".",
+      "path": "content-research-writer",
+      "repository": "https://github.com/composiohq/awesome-claude-skills.git",
+      "reviewedAt": "2026-10-09T06:10:59+00:00",
+      "revision": "044d48b594f060c164f3b20fac9ea01374721bca",
+      "tree": "560a65081b1fc097120e95f04ec82b3fff5549e6"
+    }
+  ],
+  "upstreamReviewNote": "The local skill is a rewrite that keeps the upstream purpose, not its text; treat upstream changes as ideas to evaluate rather than text to merge.",
+  "version": 1
+}

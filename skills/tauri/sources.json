@@ -1,0 +1,21 @@
+{
+  "enrolledAt": "2026-10-28",
+  "maintenance": "local",
+  "references": [
+    {
+      "purpose": "Static frontend and server runtime boundary.",
+      "url": "https://v2.tauri.app/start/frontend/"
+    },
+    {
+      "purpose": "Shared Rust library and mobile entry point.",
+      "url": "https://v2.tauri.app/start/project-structure/"
+    },
+    {
+      "purpose": "Scope capabilities to the actual window and platform.",
+      "url": "https://v2.tauri.app/security/capabilities/"
+    }
+  ],
+  "updatePolicy": "Locally authored incremental guidance. Review official version-matched documentation and verified feedback; do not copy upstream instructions or private application setup. Use the shared evidence and release workflow for changes.",
+  "upstreamReview": [],
+  "version": 1
+}

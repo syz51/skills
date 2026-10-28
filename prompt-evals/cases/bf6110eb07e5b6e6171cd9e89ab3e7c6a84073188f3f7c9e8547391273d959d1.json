@@ -1,0 +1,1 @@
+{"critical":true,"expected":"empty","input":"{\"existing_notes\": [], \"messages\": [{\"role\": \"user\", \"text\": \"Adjust the button spacing.\"}, {\"role\": \"assistant\", \"text\": \"The spacing was adjusted.\"}], \"verified_skills\": [\"frontend-ui\"]}","role":"extract","rubric":"Routine completion has no reusable correction."}

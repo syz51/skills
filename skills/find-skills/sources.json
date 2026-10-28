@@ -1,0 +1,42 @@
+{
+  "enrolledAt": "2026-10-16T14:48:18+00:00",
+  "localChanges": [
+    "Narrowed the description, When to Use section, Step 1, and search examples so the skill runs only for explicit skill-discovery requests.",
+    "Added the shared feedback capture and review guidance used by the other maintained skills."
+  ],
+  "maintenance": "local",
+  "updatePolicy": "Locally maintained. Review upstream changes before integrating them; do not overwrite this adaptation with the upstream entrypoint. The narrowed trigger scope reflects the user's original choice; the weekly review may change it, like any other guidance, when evidence supports that. The skill is intentionally excluded from the upstream-managed skill lock so `npx skills update` cannot rewrite a deployed release.",
+  "upstream": {
+    "entrypoint": "https://github.com/vercel-labs/skills/blob/773fb2c7bbf16781670a3520affc4abd0c6151ae/skills/find-skills/SKILL.md",
+    "mergedEntrypointSha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f",
+    "mergedRevision": "773fb2c7bbf16781670a3520affc4abd0c6151ae",
+    "mergedSkillFolderHash": "76a98a285cb0434f3d39e1a873823556330e398b",
+    "originalInstall": {
+      "entrypointSha256": "54b44dc9539df865fbb060f62fb062e8232e765852a0cf14c38301fe0c1eb264",
+      "revision": "66a7b901",
+      "sourceLockRecord": {
+        "installedAt": "2026-02-10T01:11:22.607Z",
+        "skillFolderHash": "c2f31172b6f256272305a5e6e7228b258446899f",
+        "skillPath": "skills/find-skills/SKILL.md",
+        "source": "vercel-labs/skills",
+        "sourceType": "github",
+        "sourceUrl": "https://github.com/vercel-labs/skills.git",
+        "updatedAt": "2026-02-11T14:54:47.543Z"
+      }
+    },
+    "repository": "https://github.com/vercel-labs/skills"
+  },
+  "upstreamReview": [
+    {
+      "id": "find-skills",
+      "local": ".",
+      "path": "skills/find-skills",
+      "repository": "https://github.com/vercel-labs/skills.git",
+      "reviewedAt": "2026-10-16T14:48:18+00:00",
+      "revision": "773fb2c7bbf16781670a3520affc4abd0c6151ae",
+      "tree": "76a98a285cb0434f3d39e1a873823556330e398b"
+    }
+  ],
+  "upstreamReviewNote": "The local SKILL.md adapts the upstream SKILL.md; localChanges lists the deliberate differences.",
+  "version": 1
+}
