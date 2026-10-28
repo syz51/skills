@@ -23,8 +23,13 @@ class SyncTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.remote = self.root / 'remote.git'
         subprocess.run(['git', 'init', '--bare', '--initial-branch=main', str(self.remote)], check=True, capture_output=True)
+        # Auto-maintenance must finish before temporary repositories are removed.
+        for key in ('gc.autoDetach', 'maintenance.autoDetach'):
+            sync.git(self.remote, 'config', key, 'false')
         self.repo = self.root / 'repo'
         subprocess.run(['git', 'clone', str(self.remote), str(self.repo)], check=True, capture_output=True)
+        for key in ('gc.autoDetach', 'maintenance.autoDetach'):
+            sync.git(self.repo, 'config', key, 'false')
         sync.git(self.repo, 'config', 'user.email', 'test@example.invalid')
         sync.git(self.repo, 'config', 'user.name', 'Test')
         (self.repo / 'README.md').write_text('fixture\n')

@@ -607,7 +607,7 @@
     "tests/test_repository_content.py": "1f6fa07183743077cbd290f64f2a12eefd7a368d7e0195db8ac07e066a72bea4",
     "tests/test_rust_license_bundle.py": "108165d592f1d54b338cf00fe2b20ad3a9b0a40ea31d323fb4b3cfbf43ed84d2",
     "tests/test_skill_packages.py": "1273b74beea4967014402755681256ee16603d090b863093b4043a682010f275",
-    "tests/test_sync.py": "1695c16db2d2a1e23f8fcc34bfc20c8a0237a2c107ed230c60b9bd0985ac0b3e",
+    "tests/test_sync.py": "fffbfb0b9560107ec75f335d9c711668507a366b274bcde662abb05b838b4c2c",
     "tests/test_upstream.py": "1b6bc47caca93b7a5b646e830b9b844a2f3394252879493c309e9edd7bac72c9"
   },
   "schema_version": 1
