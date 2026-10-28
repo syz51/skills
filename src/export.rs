@@ -3,6 +3,10 @@ use crate::{
     config::{Config, identity, relative},
 };
 use fs2::FileExt;
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,7 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -22,15 +26,24 @@ pub type Files = BTreeMap<String, Vec<u8>>;
 pub struct Locks {
     _files: Vec<File>,
 }
+impl Drop for Locks {
+    fn drop(&mut self) {
+        // Unlock the shared open-file description before closing it: another
+        // thread may be forking a child which briefly inherits the descriptor.
+        for file in self._files.iter().rev() {
+            let _ = FileExt::unlock(file);
+        }
+    }
+}
 pub fn acquire(paths: &[PathBuf]) -> Result<Locks> {
-    let mut files = Vec::new();
+    let mut locks = Locks { _files: Vec::new() };
     for p in paths {
         let f = OpenOptions::new().create(true).append(true).open(p)?;
         f.try_lock_exclusive()
             .map_err(|_| "Publication deferred: job lock held")?;
-        files.push(f);
+        locks._files.push(f);
     }
-    Ok(Locks { _files: files })
+    Ok(locks)
 }
 pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut f = tempfile::NamedTempFile::new_in(path.parent().ok_or("State parent missing")?)?;
@@ -71,6 +84,11 @@ fn bytes(value: &impl Serialize) -> Result<Vec<u8>> {
 }
 fn hash(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
+}
+fn terminate_group(child: &mut Child) {
+    let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 fn command(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8>)> {
     if crate::cancellation::requested() {
@@ -125,13 +143,7 @@ fn command(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8
             let result = match result {
                 Ok(v) => v,
                 Err(_) => {
-                    let _ = Command::new("/bin/kill")
-                        .args(["-KILL", &format!("-{}", child.id())])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_group(&mut child);
                     return Err("Subprocess output failed or exceeded limit".into());
                 }
             };
@@ -145,13 +157,7 @@ fn command(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8
             break;
         }
         if start.elapsed() > timeout || crate::cancellation::requested() {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_group(&mut child);
             return Err(if crate::cancellation::requested() {
                 "Publication cancelled"
             } else {
@@ -734,12 +740,39 @@ mod tests {
         (t, c, remote)
     }
     #[test]
+    fn dropping_lock_releases_inherited_open_file_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = [temp.path().join("job.lock")];
+        let locks = acquire(&paths).unwrap();
+        let inherited = locks._files[0].try_clone().unwrap();
+        assert!(acquire(&paths).is_err());
+        drop(locks);
+        let next = acquire(&paths).unwrap();
+        drop(inherited);
+        assert!(acquire(&paths).is_err());
+        drop(next);
+        assert!(acquire(&paths).is_ok());
+    }
+    #[test]
     fn command_deadline_covers_exited_leader_with_inherited_pipes() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pid");
         let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "sleep 30 & exit 0"]);
+        cmd.args(["-c", "sleep 30 & echo $! > \"$1\"; exit 0", "sh"])
+            .arg(&pid_file);
         let start = Instant::now();
         assert!(command(cmd, Duration::from_millis(100)).is_err());
         assert!(start.elapsed() < Duration::from_secs(3));
+        let pid = fs::read_to_string(pid_file).unwrap();
+        let status = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(status.stdout).unwrap();
+        assert!(
+            state.trim().is_empty() || state.trim().starts_with('Z'),
+            "Background process still running: {state}"
+        );
     }
     fn message() -> CommitMessage {
         CommitMessage {

@@ -21,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1"
 caseless = "0.2.2"
 signal-hook = "0.3.18"
+nix = { version = "0.31.3", features = ["process", "signal"] }
 codex-commit = "=0.6.0"
 
 [profile.release]

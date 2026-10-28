@@ -216,6 +216,7 @@ dependencies = [
  "clap",
  "codex-commit",
  "fs2",
+ "nix",
  "regex",
  "serde",
  "serde_json",
