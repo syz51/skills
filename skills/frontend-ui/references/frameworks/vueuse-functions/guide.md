@@ -51,6 +51,7 @@ IMPORTANT: Each function entry includes a short `Description` and a detailed `Re
 | [`useDraggable`](references/useDraggable.md) | Make elements draggable | AUTO |
 | [`useDropZone`](references/useDropZone.md) | Create a zone where files can be dropped | AUTO |
 | [`useElementBounding`](references/useElementBounding.md) | Reactive [bounding box](https://developer.mozilla.org/en-US/docs/Web/API/Element/getBoundingClientRect) of an HTML element | AUTO |
+| [`useElementOverflow`](references/useElementOverflow.md) | Reactive element's overflow state | AUTO |
 | [`useElementSize`](references/useElementSize.md) | Reactive size of an HTML element | AUTO |
 | [`useElementVisibility`](references/useElementVisibility.md) | Tracks the visibility of an element within the viewport | AUTO |
 | [`useIntersectionObserver`](references/useIntersectionObserver.md) | Detects changes to a target element's visibility | AUTO |
@@ -84,6 +85,7 @@ IMPORTANT: Each function entry includes a short `Description` and a detailed `Re
 | [`useFullscreen`](references/useFullscreen.md) | Reactive [Fullscreen API](https://developer.mozilla.org/en-US/docs/Web/API/Fullscreen_API) | AUTO |
 | [`useGamepad`](references/useGamepad.md) | Provides reactive bindings for the [Gamepad API](https://developer.mozilla.org/en-US/docs/Web/API/Gamepad_API) | AUTO |
 | [`useImage`](references/useImage.md) | Reactive load an image in the browser | AUTO |
+| [`useLiveAnnouncer`](references/useLiveAnnouncer.md) | Accessible way to announce messages to screen reader users (ARIA live regions) | AUTO |
 | [`useMediaControls`](references/useMediaControls.md) | Reactive media controls for both `audio` and `video` elements | AUTO |
 | [`useMediaQuery`](references/useMediaQuery.md) | Reactive [Media Query](https://developer.mozilla.org/en-US/docs/Web/CSS/Media_Queries/Testing_media_queries) | AUTO |
 | [`useMemory`](references/useMemory.md) | Reactive Memory Info | AUTO |

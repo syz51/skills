@@ -4,7 +4,7 @@ Shared frontend/UI policy: [frontend-ui](../../../SKILL.md) and [framework bound
 
 Pinia is the official state management library for Vue, designed to be intuitive and type-safe. It supports both Options API and Composition API styles, with first-class TypeScript support and devtools integration.
 
-> The skill is based on Pinia v3.0.4, generated at 2026-01-28.
+> Upstream reference snapshot: Pinia v4.0.3, generated at 2026-09-25. Match guidance to the project's installed Pinia version; do not upgrade the project to match this snapshot.
 
 ## Core References
 

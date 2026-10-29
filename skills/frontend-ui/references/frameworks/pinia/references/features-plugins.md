@@ -67,13 +67,16 @@ Add to both `store` and `store.$state` for SSR/devtools:
 import { toRef, ref } from 'vue'
 
 pinia.use(({ store }) => {
-  if (!store.$state.hasOwnProperty('hasError')) {
+  // Guard against overriding an existing value (important for SSR)
+  if (!Object.hasOwn(store.$state, 'hasError')) {
     const hasError = ref(false)
     store.$state.hasError = hasError
   }
   store.hasError = toRef(store.$state, 'hasError')
 })
 ```
+
+`Object.hasOwn` requires ES2022 runtime support and TypeScript library declarations. For older project targets, use `Object.prototype.hasOwnProperty.call(store.$state, 'hasError')` instead.
 
 ## Adding External Properties
 

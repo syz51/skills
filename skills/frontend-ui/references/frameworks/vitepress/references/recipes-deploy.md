@@ -30,6 +30,14 @@ export default {
 }
 ```
 
+### Relocatable Builds (v2)
+
+When the final URL isn't known at build time (IPFS gateways, archives, docs
+bundled into an app, `file://`), set `base: './'`. Every page then references
+assets/pages relative to its own location and the same build works from any
+sub-path without rebuilding. Keep `cleanUrls` off, avoid root-absolute `head`
+paths, and use Markdown link syntax for site-absolute links.
+
 ## GitHub Pages
 
 Create `.github/workflows/deploy.yml`:
@@ -97,7 +105,7 @@ Configure in dashboard:
 |---------|-------|
 | Build Command | `npm run docs:build` |
 | Output Directory | `docs/.vitepress/dist` |
-| Node Version | `20` (or above) |
+| Node Version | `22` (or above) |
 
 **Warning:** Don't enable "Auto Minify" for HTML - it removes Vue hydration comments.
 
@@ -116,7 +124,7 @@ For clean URLs, add `vercel.json`:
 Create `.gitlab-ci.yml`:
 
 ```yaml
-image: node:18
+image: node:24
 
 pages:
   cache:
@@ -227,7 +235,8 @@ Place in `docs/public/_headers`:
 
 ## Key Points
 
-- Set `base` for sub-path deployments
+- Set `base` for sub-path deployments; `base: './'` for relocatable builds (v2)
+- Node.js 22+ required (v2)
 - GitHub Pages requires workflow file and enabling Pages in settings
 - Most platforms: Build `npm run docs:build`, output `docs/.vitepress/dist`
 - Don't enable HTML minification (breaks hydration)

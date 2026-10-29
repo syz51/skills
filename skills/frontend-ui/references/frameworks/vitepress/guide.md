@@ -14,7 +14,9 @@ VitePress is a Static Site Generator (SSG) built on Vite and Vue 3. It takes Mar
 - Look at `.vitepress/theme/` for custom theme extensions
 - The `public/` directory contains static assets served as-is
 
-> The skill is based on VitePress 1.x, generated at 2026-01-28.
+> This reference snapshot is based on VitePress 2.0.0-alpha.20, generated at 2026-09-25. The v2 notes below and in the linked references describe that versioned alpha snapshot. Verify the installed package version, its types, and matching documentation before using these APIs; do not migrate an existing 1.x project merely to match this snapshot.
+
+**VitePress 2.0.0-alpha.20 notes:** requires Node.js 22+. `defineConfigWithTheme` is deprecated — use `defineConfig<ThemeConfig>`. Native RTL support (`dir` option, CSS logical properties) replaces the old PostCSS-plugin approach. Built-in iconify pipeline (`icons` config, `useIcon`/`VPIcon`, `collection:name` social icons). New `assetsBase` (CDN) and `assetsShards` build options; `metaChunk` removed. Markdown `image.lazyLoading` renamed to `image.lazyLoad`.
 
 ## Core
 

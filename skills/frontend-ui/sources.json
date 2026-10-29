@@ -813,9 +813,9 @@
       "local": ".",
       "path": "",
       "repository": "https://github.com/cyxzdev/Uncodixfy.git",
-      "reviewedAt": "2026-10-08T08:49:15.254464+00:00",
-      "revision": "de11774974165ed45a09f1a40b95d13994939992",
-      "tree": "2147b9a8be6f5066bbe72e7199ca1f718537b625"
+      "reviewedAt": "2026-10-29T09:13:25.120108+00:00",
+      "revision": "e0e028058b5259debdd94b78147c6d6c77bf7da2",
+      "tree": "0ca55874d3d00d18bb0b73e6c58d46ea40eec992"
     },
     {
       "id": "make-interfaces-feel-better",
@@ -831,9 +831,9 @@
       "local": ".",
       "path": "skills/antfu-design",
       "repository": "https://github.com/antfu/design.git",
-      "reviewedAt": null,
-      "revision": null,
-      "tree": null
+      "reviewedAt": "2026-10-29T09:12:57.149627+00:00",
+      "revision": "2df66b0830c6e51f0087caeee6ee3de401172199",
+      "tree": "4634b2b2d87e4beb87149e926435cfce1499786d"
     },
     {
       "id": "web-design-guidelines",
@@ -885,9 +885,9 @@
       "local": "references/frameworks/vueuse-functions",
       "path": "skills/vueuse-functions",
       "repository": "https://github.com/vueuse/skills.git",
-      "reviewedAt": "2026-10-08T08:49:15.254464+00:00",
-      "revision": "b6bb79b99fb1f1dba1f907829676a651735bbc10",
-      "tree": "6e179467fae86aa99f3e1fefbd9b5a8274071e2a"
+      "reviewedAt": "2026-10-29T09:12:26.119445+00:00",
+      "revision": "004812b4aa0815f5745ac30a6a7dc4927aec7b3d",
+      "tree": "268ea8c2a9a992125cada7fb9ae9de3421491761"
     },
     {
       "id": "nuxt",
@@ -912,9 +912,9 @@
       "local": "references/frameworks/pinia",
       "path": "skills/pinia",
       "repository": "https://github.com/antfu/skills.git",
-      "reviewedAt": "2026-10-08T08:49:15.254464+00:00",
-      "revision": "5cae97ca87e0dcfb5a192cd2cbf8b83a9f769e8f",
-      "tree": "39d25e6812ea8ec3361fd18c2551629bd1afa344"
+      "reviewedAt": "2026-10-29T08:52:44.900537+00:00",
+      "revision": "8886fe2d385d3644cbb47e46ae9cb1cf09307d3b",
+      "tree": "43859b58fbef122b18eb62689f6c2f6a082ca443"
     },
     {
       "id": "vite",
@@ -930,9 +930,9 @@
       "local": "references/frameworks/vitepress",
       "path": "skills/vitepress",
       "repository": "https://github.com/antfu/skills.git",
-      "reviewedAt": "2026-10-08T08:49:15.254464+00:00",
-      "revision": "5cae97ca87e0dcfb5a192cd2cbf8b83a9f769e8f",
-      "tree": "93ad9feab1c2218b8f42008a28e3a832d0473693"
+      "reviewedAt": "2026-10-29T09:11:54.414524+00:00",
+      "revision": "8886fe2d385d3644cbb47e46ae9cb1cf09307d3b",
+      "tree": "28a2918d702b595e992442fef242d27c9704c38b"
     },
     {
       "id": "vitest",
@@ -966,9 +966,9 @@
       "local": "references/frameworks/tsdown",
       "path": "skills/tsdown",
       "repository": "https://github.com/rolldown/tsdown.git",
-      "reviewedAt": "2026-10-26T00:16:47.721373+00:00",
-      "revision": "3c0c8545c418e4a26f073a3d17a58afad3291263",
-      "tree": "510d3691d793b5851d2c015490131941364a84ae"
+      "reviewedAt": "2026-10-29T08:54:09.620244+00:00",
+      "revision": "17bd0fc1f5ce2331f4e061179594f2447152eb6a",
+      "tree": "ac732104463e4adad543e703bbf84b137dab02d2"
     }
   ],
   "upstreamReviewNote": "Framework entries are snapshots of the upstream folder under `local`: SKILL.md is adapted as guide.md, and GENERATION.md, SYNC.md, README.md and LICENSE.md are not mirrored. Apply reference changes with `git apply --directory=skills/frontend-ui/<local> --exclude='*/SKILL.md' --exclude='*/GENERATION.md' --exclude='*/SYNC.md' --exclude='*/README.md' --exclude='*/LICENSE.md' --include='*.md' <patch>`, adding `--reject` when hunks conflict with `localEdits`; merge rejected hunks into their own files and SKILL.md changes into guide.md by hand, then delete any .rej or .orig files. Design entries (local \".\") were consolidated into SKILL.md and references/*.md; treat their changes as ideas to evaluate rather than files to copy.",

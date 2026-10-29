@@ -6,6 +6,9 @@ category: Browser
 
 Automatically update the height of a textarea depending on the content.
 
+> [!TIP]
+> If your target browsers support it, textarea autosizing can be achieved natively with CSS. Check browser compatibility for [`field-sizing: content`](https://developer.mozilla.org/en-US/docs/Web/CSS/Reference/Properties/field-sizing) for more information.
+
 ## Usage
 
 ### Simple example

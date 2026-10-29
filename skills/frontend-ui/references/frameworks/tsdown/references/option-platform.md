@@ -91,13 +91,23 @@ export default defineConfig({
 
 ## CJS Format Limitation
 
-**CJS format always uses `node` platform** and cannot be changed.
+**CJS output defaults to the `node` platform.** A top-level `platform: 'browser'` is ignored for CJS, with a warning.
 
 ```ts
 export default defineConfig({
   entry: ['src/index.ts'],
   format: ['cjs'],
-  platform: 'browser',  // Ignored for CJS
+  platform: 'browser',  // Ignored for CJS, with a warning
+})
+```
+
+For code that is not browser-only, consider `platform: 'neutral'`. If CJS must use browser resolution, explicitly override the input platform:
+
+```ts
+export default defineConfig({
+  format: ['cjs'],
+  platform: 'browser',
+  inputOptions: { platform: 'browser' },
 })
 ```
 
@@ -245,7 +255,7 @@ export default defineConfig({
 2. **Use `browser`** for front-end applications
 3. **Use `neutral`** for universal libraries
 4. **Configure mainFields** when using neutral platform
-5. **CJS is always node** - use ESM for other platforms
+5. **CJS defaults to node** - browser resolution requires an explicit input override
 6. **Test in target environment** to verify compatibility
 
 ## Related Options
