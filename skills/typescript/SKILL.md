@@ -9,8 +9,11 @@ For saved guidance provenance, use `uv run --script ~/.local/share/codex-skills/
 
 Use this skill for language, type-system, and type-checking decisions. For frontend work, read `frontend-ui` first and retain its UI and framework policy; apply this skill alongside it.
 
+Use Effect by default for new TypeScript application logic and effectful workflows. In existing projects, follow established Effect conventions or adopt it incrementally at clear boundaries, preserving project constraints. Pure utilities, configuration, and type-only changes do not require adding Effect.
+
 Load supporting guidance only when the task needs it:
 
+- Effect implementation, review, or adoption decisions: [Effect](references/effect.md).
 - Compiler configuration, check coverage, declaration output, published packages, or public type contracts: [Tooling and public types](references/tooling-and-public-types.md).
 - Framework, SDK, native, or platform integration: [Skill and reference map](references/skill-map.md), then the relevant owner's guidance.
 

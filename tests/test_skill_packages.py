@@ -29,6 +29,7 @@ class SkillPackageTests(unittest.TestCase):
         reviewed = {
             'skills/typescript/SKILL.md',
             'skills/typescript/sources.json',
+            'skills/typescript/references/effect.md',
             'skills/typescript/references/feedback.md',
             'skills/typescript/references/skill-map.md',
             'skills/typescript/references/tooling-and-public-types.md',
