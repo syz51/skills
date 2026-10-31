@@ -70,9 +70,15 @@ def _without_comments(code):
     return pattern.sub(lambda m: m[0] if m[0][0] in ('"', "'") else ' ', code)
 
 
+def _utility_name(value):
+    """Bound utility contracts to bare names and standard system locations."""
+    name = value.rsplit('/', 1)[-1]
+    return name if '/' not in value or value in ('/bin/' + name, '/usr/bin/' + name) else None
+
+
 def _shell_source(command):
     words = shlex.split(command)
-    if len(words) == 3 and words[0].rsplit('/', 1)[-1] in ('sh', 'bash', 'zsh') and words[1] in ('-c', '-lc'):
+    if len(words) == 3 and _utility_name(words[0]) in ('sh', 'bash', 'zsh') and words[1] in ('-c', '-lc'):
         return words[2]
     return command
 
@@ -85,7 +91,7 @@ def _listing_prefix(words):
     """Only side-effect-free inventory commands may precede a final read."""
     if not words:
         return False
-    name = words[0].rsplit('/', 1)[-1]
+    name = _utility_name(words[0])
     if name == 'pwd':
         return len(words) == 1
     if name == 'ls':
@@ -234,9 +240,9 @@ def _shell_substitution(command):
 def _shell_attempts(command):
     """Find possible consuming operands, excluding clear print/inventory forms.
 
-    Unknown commands with a target operand stay uncertain. This is not an
-    allowlist of reader programs: fold, interpreters and input redirections
-    need the same conservative handling as head, grep or dd.
+    Only bounded literal reader commands can establish disjoint file operands.
+    Unknown executables may compute paths or run embedded source; absence of
+    a literal target operand does not establish that their reads are unrelated.
     """
     lexer = shlex.shlex(_shell_source(command), posix=False, punctuation_chars=';&|()<>\n')
     lexer.whitespace = ' \t\r'
@@ -265,23 +271,39 @@ def _shell_attempts(command):
                 current.append(value)
     if current:
         groups.append(current)
-    operands, inert = list(inputs), not inputs
+    operands, inert, opaque_program = list(inputs), not inputs, False
     for words in groups:
         while words and re.match(r'^[A-Za-z_][\w]*=', words[0]):
             words = words[1:]
         if not words:
             continue
         executable = words[0].rsplit('/', 1)[-1]
-        if executable in ('echo', 'printf', 'pwd', 'true', 'false', ':', 'ls', 'stat',
+        # A custom executable named head/printf need not implement the utility.
+        standard = _utility_name(words[0]) is not None
+        if standard and executable in ('echo', 'printf', 'pwd', 'true', 'false', ':', 'ls', 'stat',
                           'test', '[', 'readlink', 'realpath', 'dirname', 'basename'):
             continue
-        if executable == 'find' and not any(word in ('-exec', '-execdir', '-ok', '-okdir', '-files0-from') for word in words):
+        if standard and executable == 'find' and not any(word in ('-exec', '-execdir', '-ok', '-okdir', '-files0-from') for word in words):
             continue
-        if executable == 'rg' and _listing_prefix(words):
+        if standard and executable == 'rg' and _listing_prefix(words):
             continue
         inert = False
+        # These utilities consume literal operands without interpreting program
+        # source. Everything else is opaque unless it is the shared reader's
+        # validated invocation. In particular, quoting Python/JS/awk source as
+        # one argv value must not turn computed reads into unrelated operands.
+        literal_reader = standard and executable in ('cat', 'head', 'tail', 'nl', 'fold', 'cut')
+        literal_reader |= (standard and executable == 'sed' and len(words) == 4 and words[1] == '-n'
+                           and re.fullmatch(r'\d+,\d+p', words[2]) is not None)
+        if not literal_reader:
+            try:
+                if not standard:
+                    raise ValueError('Untrusted interpreter location')
+                request(shlex.join(words))
+            except ValueError:
+                opaque_program = True
         operands.extend(words[1:])
-    return operands, complex_program, inert
+    return operands, complex_program, inert, opaque_program
 
 
 @dataclass(frozen=True)
@@ -697,6 +719,8 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
             return
         normalized = shlex.join(words)
         try:
+            if not words or _utility_name(words[0]) is None:
+                return
             expected_request = request(normalized)
             envelope = json.loads(output)
             observed(envelope, expected_request, 'activation')
@@ -710,7 +734,9 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
         try:
             if _shell_substitution(command):
                 mark_uncertain(known, index)
-            operands, complex_program, inert = _shell_attempts(command)
+            operands, complex_program, inert, opaque_program = _shell_attempts(command)
+            if opaque_program:
+                mark_uncertain(known, index)
             if complex_program and not inert and _prefixed_read(command) is None:
                 mark_uncertain(known, index)
         except ValueError:

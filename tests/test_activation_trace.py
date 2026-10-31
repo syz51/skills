@@ -337,6 +337,83 @@ class ActivationTraceTests(unittest.TestCase):
             self.assertTrue(score_trace(trace(command('head -c 20 ' + str(unrelated), output)),
                                         targets, (), ('typescript',))['passed'])
 
+    def test_actual_python_computed_paths_stay_uncertain_with_double_quoted_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ts, ui, unrelated = root / 'skills/typescript/SKILL.md', root / 'skills/frontend-ui/SKILL.md', root / 'README.md'
+            for path, content in ((ts, CONTENT), (ui, UI_CONTENT), (unrelated, CONTENT[:20])):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            targets = {'typescript': {'path': str(ts), 'content': CONTENT},
+                       'frontend-ui': {'path': str(ui), 'content': UI_CONTENT}}
+            for length in (20, 0):
+                source = ("from pathlib import Path; print((Path(" + repr(str(root / 'skills'))
+                          + ") / 'typescript' / 'SKILL.md').read_text()[:" + str(length) + "],end='')")
+                # Keep this exact outer double-quote form: shlex.join's quote
+                # concatenation previously hid the gap behind parse uncertainty.
+                quoted = shlex.quote(sys.executable) + ' -c "' + source + '"'
+                for cmd in (quoted, shlex.join([sys.executable, '-c', source])):
+                    output = subprocess.check_output(cmd, shell=True, text=True)
+                    self.assertEqual(output, CONTENT[:length])
+                    for invocation in (cmd, 'pwd && ' + cmd):
+                        item = command(invocation, output)
+                        negative = score_trace(trace(item), targets, (), ('typescript',))
+                        self.assertFalse(negative['passed'], negative)
+                        self.assertEqual(negative['reads'], [])
+                        first = command('cat ' + str(ui), UI_CONTENT)
+                        last = command('cat ' + str(ts))
+                        early = score_trace(trace(item, first, last), targets, ('frontend-ui', 'typescript'),
+                                            before=(('frontend-ui', 'typescript'),))
+                        self.assertFalse(early['passed'], early)
+                        later = score_trace(trace(first, item, last), targets, ('frontend-ui', 'typescript'),
+                                            before=(('frontend-ui', 'typescript'),))
+                        self.assertTrue(later['passed'], later)
+            for reader in ('cat', 'head -c 20', 'tail -c 20', "sed -n '1,1p'"):
+                self.assertTrue(score_trace(trace(command(reader + ' ' + str(unrelated), CONTENT[:20])),
+                                            targets, (), ('typescript',))['passed'])
+
+    def test_opaque_executables_cannot_establish_disjoint_reads_from_argv(self):
+        for cmd in ('python3 -c "print(unknown_path)"', 'custom-reader /fixture/README.md',
+                    'env python3 -c "print(unknown_path)"', 'uv run script.py',
+                    'awk "BEGIN { hidden_read() }" /fixture/README.md',
+                    'sed "1e hidden_read" /fixture/README.md'):
+            for prefix in ('', 'pwd && '):
+                with self.subTest(command=prefix + cmd):
+                    self.assertFalse(self.score(trace(command(prefix + cmd, '')), (), ('typescript',))['passed'])
+        for cmd in ('head -c 20 /fixture/README.md', 'cat /fixture/README.md',
+                    "sed -n '1,4p' /fixture/README.md"):
+            self.assertTrue(self.score(trace(command(cmd, CONTENT[:20])), (), ('typescript',))['passed'])
+
+    def test_custom_utility_names_and_indirect_wc_sources_stay_opaque(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ts = root / 'skills/typescript/SKILL.md'
+            ts.parent.mkdir(parents=True)
+            ts.write_text(CONTENT)
+            unrelated = root / 'README.md'
+            unrelated.write_text('Unrelated input.\n')
+            targets = {'typescript': {'path': str(ts), 'content': CONTENT}}
+            body = ('#!' + sys.executable + '\nfrom pathlib import Path\nprint((Path('
+                    + repr(str(root / 'skills')) + ") / 'typescript' / 'SKILL.md').read_text()[:20],end='')\n")
+            for name in ('head', 'printf', 'find', 'rg', 'ls', 'zsh'):
+                executable = root / name
+                executable.write_text(body)
+                executable.chmod(0o755)
+                output = subprocess.check_output([str(executable), str(unrelated)], text=True)
+                self.assertEqual(output, CONTENT[:20])
+                value = score_trace(trace(command(shlex.join([str(executable), str(unrelated)]), output)),
+                                    targets, (), ('typescript',))
+                self.assertFalse(value['passed'], value)
+                self.assertEqual(value['reads'], [])
+            disguised_shell = str(root / 'zsh') + ' -lc ' + shlex.quote('cat /fixture/README.md')
+            self.assertFalse(score_trace(trace(command(disguised_shell, CONTENT[:20])),
+                                         targets, (), ('typescript',))['passed'])
+            # --files0-from reads names from another file, not just literal argv.
+            self.assertFalse(self.score(trace(command('wc --files0-from=/fixture/names', '')), (), ('typescript',))['passed'])
+            for executable in ('head', '/usr/bin/head', '/bin/head'):
+                self.assertTrue(self.score(trace(command(executable + ' -c 20 /fixture/README.md', CONTENT[:20])),
+                                           (), ('typescript',))['passed'])
+
     def test_partial_shell_uncertainty_covers_aliases_globs_and_wrapped_tools(self):
         commands = ['head -n 4 ' + TS, 'tail -c 1 ' + TS, 'custom-reader ' + TS,
                     'head -n 4 /fixture/skills/type*/SKILL.md',
@@ -355,6 +432,15 @@ class ActivationTraceTests(unittest.TestCase):
                         order = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
                         self.assertFalse(self.score(order, ('frontend-ui', 'typescript'),
                                                     before=(('frontend-ui', 'typescript'),))['passed'])
+
+    def test_unknown_interpreter_cannot_forge_positive_helper_evidence(self):
+        helper = '/scratch/python3 scripts/read_guidance.py ' + TS
+        output = json.dumps(envelope(CONTENT)) + '\n'
+        for cmd in (helper, 'pwd && ' + helper):
+            with self.subTest(cmd=cmd):
+                result = self.score(trace(command(cmd, output)))
+                self.assertFalse(result['passed'], result)
+                self.assertEqual(result['reads'], [])
 
     def test_shell_print_inventory_comments_and_failed_partial_reads_remain_unrelated(self):
         for cmd in ('printf %s ' + shlex.quote(TS), 'echo ' + TS,
