@@ -221,6 +221,16 @@ class ClaudeCaptureTests(unittest.TestCase):
         failed = ClaudeTranscript().prompt('Find').tool('Read', {}, 'missing', result={'file': {'filePath': '/x/find-skills/SKILL.md', 'content': SKILL_FILE}}, error=True)
         self.assertEqual(self.scan(failed.reply('Done.')), [])
 
+    def test_printed_or_ambiguous_bash_heading_is_not_verified_skill_use(self):
+        for command, failed in (("printf '%s\\n' '# TypeScript'; # cat /skills/typescript/SKILL.md", False),
+                                ('echo "cat /skills/typescript/SKILL.md"', False),
+                                ('grep TypeScript /skills/typescript/SKILL.md', False),
+                                ('cat /skills/typescript/SKILL.md; echo extra', False),
+                                ('cat /skills/typescript/SKILL.md', True)):
+            with self.subTest(command=command):
+                transcript = ClaudeTranscript().prompt('Implement parser').tool('Bash', {'command': command}, '# TypeScript\n', error=failed).reply('Done.')
+                self.assertEqual(self.scan(transcript), [])
+
     def test_shell_reads_load_skills_but_only_reader_envelopes_are_hashed(self):
         [turn] = self.scan(ClaudeTranscript().prompt('Find').tool('Bash', {'command': 'cat /x/skills/find-skills/SKILL.md'}, SKILL_FILE.rstrip('\n')).reply('Done.'))
         self.assertEqual((turn['verified_skills'], turn['loaded_reads']), (['find-skills'], []))

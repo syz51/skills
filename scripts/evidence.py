@@ -8,12 +8,16 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
+import capture
+import read_guidance
 
 from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, FIELDS, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
                      completed_turns, message_context, model_response, safe_path, timestamp, validate_notes)
 
 # Source checks need more room than extraction, which also carries duplicate-note context.
+SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 MAX_INPUT = 96000
 ORIGINAL_SCOPE = 'original-turn messages; artifacts and runtime outcomes not replayed'
 FOLLOWUP_SCOPE = 'original-turn and subsequent same-chat messages; artifacts and runtime outcomes not replayed'
@@ -258,8 +262,15 @@ def count_assessment(counts, value):
 
 def checker_fingerprint(config):
     digest = hashlib.sha256()
-    for name in ('evidence.py', 'capture.py', 'prompt_runtime.py'):
-        digest.update(Path(__file__).with_name(name).read_bytes() + b'\0')
+    for module, imported_hash in ((sys.modules[__name__], SOURCE_SHA256),
+                                  (capture, capture.SOURCE_SHA256),
+                                  (prompt_runtime, prompt_runtime.SOURCE_SHA256),
+                                  (read_guidance, read_guidance.SOURCE_SHA256),
+                                  (capture.activation_trace, capture.activation_trace.SOURCE_SHA256)):
+        data = Path(module.__file__).read_bytes()
+        if hashlib.sha256(data).hexdigest() != imported_hash:
+            raise ValueError('Evidence checker source changed; restart with fresh imports')
+        digest.update(data + b'\0')
     for role in ('extract', 'verify', 'correct'):
         digest.update(role.encode() + b'\0' + prompt_runtime.load(role, config).encode() + b'\0')
     return digest.hexdigest()

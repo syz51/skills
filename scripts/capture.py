@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import activation_trace
 from read_guidance import SKILL_PATTERN, SKILLS, guidance_path, observed, request, shell_words
 
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -541,6 +542,25 @@ def creation_matches(raw, output, notes, recorded_at, tool_name='exec_command'):
     return sorted(set(found))
 
 
+def literal_entrypoint(raw):
+    """Identify one unchanged literal cat/sed request; substrings are not reads."""
+    commands = literal_commands(raw)
+    if not commands and re.match(r'^\s*(?:cat|sed)\s', raw):
+        commands = [raw]
+    if len(commands) != 1 or not unchanged_reads(raw, commands):
+        return None
+    try:
+        words = shell_words(commands[0])
+        valid = (len(words) == 2 and words[0] == 'cat') or (
+            len(words) == 4 and words[:2] == ['sed', '-n'] and re.fullmatch(r'\d+,\d+p', words[2]))
+        if not valid:
+            return None
+        path = guidance_path(words[-1])
+        return path.split('/')[0] if path.endswith('/SKILL.md') else None
+    except ValueError:
+        return None
+
+
 def loaded_reads(raw, output, turn):
     if not re.search(r'(?:' + SKILL_PATTERN + r')/', raw):
         return []
@@ -619,7 +639,7 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
     """Stream complete JSONL records; rescanning also handles appended/rollover files."""
     turns = {}
     for path in sorted(paths):
-        meta, current, loaded, calls, reads = {}, None, set(), {}, []
+        meta, current, loaded, calls, reads, node_state = {}, None, set(), {}, [], {}
         with path.open('rb') as stream:
             for line_number, line in enumerate(stream, 1):
                 if not line.endswith(b'\n'):
@@ -678,8 +698,38 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
                         read = bool(re.search(r'\b(?:cat|sed|read_text|readFile|skills\.read|read_mcp_resource|read_guidance\.py)\b', raw))
                         successful = not re.search(r'(?i)(?:exit_code["\s:]+[1-9]|exit code: [1-9]|no such file|isError["\s:]+true)', output)
                         observed_reads = loaded_reads(raw, payload.get('output', ''), current['turn']) if read else []
+                        if name == 'mcp__node_repl__reset' and successful:
+                            node_state.clear()
+                        if name == 'mcp__node_repl__js':
+                            try:
+                                arguments = json.loads(raw)
+                                result = payload.get('output', '')
+                                result = json.loads(result) if isinstance(result, str) else result
+                                if not isinstance(result, dict) or result.get('isError') or result.get('error'):
+                                    raise ValueError('Unsuccessful Node result')
+                                text = '\n'.join(part['text'] for part in result.get('content', [])
+                                                 if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str))
+                                observations = activation_trace.node_read_observations(arguments['code'], text, node_state)
+                                if observations:
+                                    read, successful = True, True
+                                for observation in observations:
+                                    path = guidance_path(observation['path'])
+                                    content = observation['content']
+                                    if '\x00' in content:
+                                        continue
+                                    observed_reads.append({'path': path, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
+                                                           'coverage': observation['coverage'], 'read_turn': current['turn']})
+                            except (ValueError, TypeError, KeyError):
+                                node_state.clear()
                         if read and (successful or observed_reads):
-                            loaded.update(skill for skill in skill_reads if re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', output, re.I))
+                            proven = {entry['path'].split('/')[0] for entry in observed_reads
+                                      if entry['path'].endswith('/SKILL.md')}
+                            # Old shell transcripts sometimes have no exact output envelope.
+                            # Preserve eligibility only for one literal read and explicit success.
+                            legacy = literal_entrypoint(raw)
+                            if legacy and successful and re.match(r'^Exit code: 0\n', output):
+                                proven.add(legacy)
+                            loaded.update(skill for skill in proven if re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', output, re.I))
                             for item in observed_reads:
                                 if not any(all(previous[key] == item[key] for key in ('path', 'sha256', 'coverage')) for previous in reads):
                                     reads.append(item)
@@ -915,7 +965,13 @@ def claude_result(scan, record, results, source_notes):
             skills = [s for s in SKILLS if re.search(r'(?<![\w.-])skills/' + re.escape(s) + r'/SKILL\.md\b', command)]
             skill_read = bool(skills)
             if not failed and re.search(r'\b(?:cat|sed|read_text|read_guidance\.py)\b', command):
-                scan['loaded'].update(s for s in skills if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', output, re.I))
+                entries = loaded_reads(raw, envelope, current['turn'])
+                proven = {entry['path'].split('/')[0] for entry in entries
+                          if entry['path'].endswith('/SKILL.md')}
+                legacy = literal_entrypoint(command)
+                if legacy:
+                    proven.add(legacy)
+                scan['loaded'].update(s for s in proven if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', output, re.I))
                 # Claude Code trims and may wrap shell output, so only self-identifying guidance-reader envelopes are hashed.
                 try:
                     request(command)

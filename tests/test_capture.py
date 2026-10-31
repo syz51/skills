@@ -177,6 +177,75 @@ class CaptureTests(unittest.TestCase):
         self.assertIsNone(result['oldest_pending_at'])
         self.assertEqual(json.loads(state_path.read_text()), state)
 
+    def node_turn(self, calls):
+        text = self.record('event_msg', {'type': 'task_started', 'turn_id': 'node'})
+        text += self.record('event_msg', {'type': 'user_message', 'message': 'Implement the typed parser'})
+        for index, (code, output, failed) in enumerate(calls):
+            text += self.record('response_item', {'type': 'function_call', 'call_id': str(index),
+                'name': 'mcp__node_repl__js', 'arguments': json.dumps({'code': code})})
+            text += self.record('response_item', {'type': 'function_call_output', 'call_id': str(index),
+                'output': json.dumps({'content': [{'type': 'text', 'text': output}], 'isError': failed})})
+        text += self.record('event_msg', {'type': 'task_complete', 'turn_id': 'node'})
+        self.rollout(text)
+        return self.scan()
+
+    def test_actual_node_reads_preserve_complete_bound_and_partial_provenance(self):
+        content = '---\nname: typescript\n---\n# TypeScript\n' + 'Use meaningful type contracts.\n' * 4
+        prelude = "var fs = await import('node:fs/promises'); "
+        read = "await fs.readFile('/skills/typescript/SKILL.md', 'utf8')"
+        for calls, observed, coverage in (
+            ([(prelude + 'nodeRepl.write(' + read + ');', content, False)], content, 'complete'),
+            ([(prelude + 'var policy = ' + read + ';', '', False),
+              ('nodeRepl.write(policy);', content, False)], content, 'complete'),
+            ([(prelude + 'nodeRepl.write((' + read + ').slice(0, 40));', content[:40], False)], content[:40], 'partial')):
+            with self.subTest(calls=calls):
+                [turn] = self.node_turn(calls)
+                self.assertEqual(turn['verified_skills'], ['typescript'])
+                self.assertEqual(turn['loaded_reads'], [{'path': 'typescript/SKILL.md',
+                    'sha256': hashlib.sha256(observed.encode()).hexdigest(), 'coverage': coverage, 'read_turn': 'node'}])
+
+    def test_node_spoofs_failures_and_unknown_transforms_do_not_verify_use(self):
+        for code, failed in (
+            ("nodeRepl.write('# TypeScript'); // fs.readFile('/skills/typescript/SKILL.md','utf8')", False),
+            ("var fs = await import('node:fs/promises'); nodeRepl.write(await fs.readFile('/skills/typescript/SKILL.md','utf8'));", True),
+            ("var fs = await import('node:fs/promises'); nodeRepl.write((await fs.readFile('/skills/typescript/SKILL.md','utf8')).toUpperCase());", False)):
+            with self.subTest(code=code):
+                self.assertEqual(self.node_turn([(code, '# TypeScript\n', failed)]), [])
+
+    def test_node_bindings_survive_turns_but_not_repl_reset_or_other_sessions(self):
+        code = "var fs = await import('node:fs/promises'); var policy = await fs.readFile('/skills/typescript/SKILL.md','utf8');"
+        for reset in (False, True):
+            with self.subTest(reset=reset):
+                self.assertEqual(self.node_turn([(code, '', False)]), [])
+                text = self.record('event_msg', {'type': 'task_started', 'turn_id': 'later'})
+                text += self.record('event_msg', {'type': 'user_message', 'message': 'Implement the parser correction'})
+                if reset:
+                    text += self.record('response_item', {'type': 'function_call', 'call_id': 'reset', 'name': 'mcp__node_repl__reset', 'arguments': '{}'})
+                    text += self.record('response_item', {'type': 'function_call_output', 'call_id': 'reset', 'output': '{"isError":false}'})
+                text += self.record('response_item', {'type': 'function_call', 'call_id': 'later-read', 'name': 'mcp__node_repl__js', 'arguments': json.dumps({'code': 'nodeRepl.write(policy);'})})
+                text += self.record('response_item', {'type': 'function_call_output', 'call_id': 'later-read', 'output': json.dumps({'content': [{'type': 'text', 'text': '# TypeScript\n'}], 'isError': False})})
+                text += self.record('event_msg', {'type': 'task_complete', 'turn_id': 'later'})
+                with (self.sessions / 'rollout.jsonl').open('a') as stream:
+                    stream.write(text)
+                turns = self.scan()
+                self.assertEqual([turn['turn'] for turn in turns], [] if reset else ['later'])
+        self.assertEqual(self.node_turn([('nodeRepl.write(policy);', '# TypeScript\n', False)]), [])
+
+    def test_printed_or_ambiguous_skill_heading_is_not_verified_use(self):
+        for command, status in (("printf '%s\\n' '# TypeScript'; # cat /skills/typescript/SKILL.md", 0),
+                                ('echo "cat /skills/typescript/SKILL.md"', 0),
+                                ('grep TypeScript /skills/typescript/SKILL.md', 0),
+                                ('cat /skills/typescript/SKILL.md; echo extra', 0),
+                                ('cat /skills/typescript/SKILL.md', 1)):
+            with self.subTest(command=command):
+                text = self.record('event_msg', {'type': 'task_started', 'turn_id': 'spoof'})
+                text += self.record('event_msg', {'type': 'user_message', 'message': 'Implement the parser'})
+                text += self.record('response_item', {'type': 'function_call', 'call_id': 'r', 'name': 'exec_command', 'arguments': json.dumps({'cmd': command})})
+                text += self.record('response_item', {'type': 'function_call_output', 'call_id': 'r', 'output': json.dumps({'exit_code': status, 'output': '# TypeScript\n'})})
+                text += self.record('event_msg', {'type': 'task_complete', 'turn_id': 'spoof'})
+                self.rollout(text)
+                self.assertEqual(self.scan(), [])
+
     def test_every_maintained_skill_is_recognized_by_name_or_heading(self):
         for skill, heading in (('find-skills', '# Find Skills'), ('content-research-writer', '# Content Research Writer'), ('tauri', '# Tauri'), ('typescript', '# TypeScript')):
             for output in ('---\nname: ' + skill + '\n---\n', heading + '\n'):

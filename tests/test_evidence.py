@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -205,6 +206,38 @@ class EvidenceTests(unittest.TestCase):
         original.unlink()
         with self.assertRaisesRegex(ValueError, 'predecessor'):
             evidence.assessment_inventory(self.feedback)
+
+    def test_reader_dependency_fingerprint_drift_and_receipt_invalidation(self):
+        baseline = evidence.checker_fingerprint(self.config)
+        original_path = Path(evidence.read_guidance.__file__)
+        changed = original_path.read_text().replace('MAX_BYTES = 6000', 'MAX_BYTES = 6001')
+        alternate_path = self.root / 'read_guidance.py'
+        alternate_path.write_text(changed)
+        spec = importlib.util.spec_from_file_location('changed_reader', alternate_path)
+        alternate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(alternate)
+        self.assertEqual(alternate.MAX_BYTES, 6001)
+        with patch.object(evidence, 'read_guidance', alternate):
+            updated = evidence.checker_fingerprint(self.config)
+        self.assertNotEqual(updated, baseline)
+        real_read = Path.read_bytes
+        def drift(path):
+            return changed.encode() if path == original_path else real_read(path)
+        with patch.object(Path, 'read_bytes', drift):
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                evidence.checker_fingerprint(self.config)
+        responses = [{'status': 'partial', 'summary': 'One attribution remains unresolved.'}, {'notes': []},
+                     {'status': 'supported', 'summary': 'The user correction is faithfully attributed.'}]
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',
+                side_effect=responses) as model:
+            self.assertEqual(evidence.verify(self.config, self.root)['checked'], 1)
+            previous = {p: p.read_bytes() for p in self.feedback.rglob('*.json')}
+            with patch.object(evidence, 'read_guidance', alternate):
+                self.assertEqual(evidence.verify(self.config, self.root)['checked'], 1)
+                self.assertEqual(evidence.verify(self.config, self.root)['checked'], 0)
+            self.assertEqual(model.call_count, 3)
+            for path, data in previous.items():
+                self.assertEqual(path.read_bytes(), data)
 
     def test_explicit_recheck_appends_without_repeating_on_normal_cycles(self):
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',

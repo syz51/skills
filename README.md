@@ -61,6 +61,8 @@ cargo test --locked
 
 The tests use synthetic fixtures and temporary repositories. Runtime model-based evaluations require separate authentication and may use account quota; the offline suite does not establish that a prompt improves real tasks.
 
+See [Skill testing](docs/testing.md) for the opt-in live activation matrix, trace evidence, negative controls, composition checks and verification limits.
+
 ## Contributing and security
 
 See [Contributing](CONTRIBUTING.md) for checks and the export workflow, and [Security policy](SECURITY.md) for private vulnerability reports.

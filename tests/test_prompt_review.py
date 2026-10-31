@@ -117,6 +117,58 @@ class PromptReviewTests(unittest.TestCase):
         self.assertFalse(review.improves({key: [True, False]}, {key: [False, True]}, [case]))
         self.assertFalse(review.improves({key: [True, True]}, {key: [True, True]}, [case]))
 
+    def test_extraction_and_correction_respect_each_registered_skill(self):
+        templates = review.load_cases(self.repo)
+        for role in ('extract', 'correct'):
+            for skill in review.capture.SKILLS:
+                with self.subTest(role=role, skill=skill):
+                    case = dict(next(c for c in templates if c['role'] == role and c['expected'] == 'note'))
+                    source = json.loads(case['input'])
+                    if role == 'extract':
+                        source['verified_skills'] = [skill]
+                    else:
+                        source['skill'] = skill
+                        source['note'] = dict(NOTE, skill=skill)
+                    case['input'] = json.dumps(source)
+                    review.validate_case(case)
+                    path = self.repo / 'prompt-evals/cases' / (review.digest(case) + '.json')
+                    path.write_bytes(review.encoded(case))
+                    self.assertIn(case, review.load_cases(self.repo))
+                    path.unlink()
+                    output = {'notes': [dict(NOTE, skill=skill)]}
+                    self.assertEqual(review.validate_output(case, output), output)
+                    self.assertTrue(review.output_passes(case, output))
+                    data = review.task_input(case)
+                    self.assertEqual(data['turn']['verified_skills'] if role == 'extract' else data['skill'],
+                                     [skill] if role == 'extract' else skill)
+                    other = next(value for value in review.capture.SKILLS if value != skill)
+                    wrong = {'notes': [dict(NOTE, skill=other)]}
+                    with self.assertRaises(ValueError):
+                        review.validate_output(case, wrong)
+                    self.assertFalse(review.output_passes(case, wrong))
+
+    def test_invalid_evaluation_scope_fails_closed(self):
+        template = next(c for c in review.load_cases(self.repo) if c['role'] == 'extract')
+        for scope in ('typescript', ['unknown'], ['typescript', 'typescript'], [None]):
+            source = json.loads(template['input'])
+            source['verified_skills'] = scope
+            case = dict(template, input=json.dumps(source), expected='empty')
+            with self.subTest(scope=scope), self.assertRaises(ValueError):
+                review.validate_case(case)
+            with self.subTest(scope=scope), self.assertRaises(ValueError):
+                review.validate_output(case, {'notes': []})
+            self.assertFalse(review.output_passes(case, {'notes': []}))
+
+    def test_reader_source_drift_stops_prompt_review(self):
+        original = Path.read_bytes
+        for module in (review.read_guidance, review.capture.activation_trace):
+            path = Path(module.__file__)
+            def changed(value):
+                data = original(value)
+                return data + b'\n# changed parser\n' if value == path else data
+            with self.subTest(module=module.__name__), patch.object(Path, 'read_bytes', changed), self.assertRaises(review.SourceChanged):
+                review.assert_sources_current()
+
     def test_cases_are_immutable_hash_addressed_and_private_cases_rejected(self):
         cases = review.load_cases(self.repo)
         coverage = {'extract': {'empty', 'note'}, 'correct': {'empty', 'note'},
@@ -226,6 +278,8 @@ class PromptReviewTests(unittest.TestCase):
         self.assertEqual(record['evaluator_hash'], review.SOURCE_SHA256)
         self.assertEqual(record['runtime_policy_code_hash'], review.prompt_runtime.SOURCE_SHA256)
         self.assertEqual(record['capture_adapter_code_hash'], review.capture.SOURCE_SHA256)
+        self.assertEqual(record['guidance_reader_code_hash'], review.read_guidance.SOURCE_SHA256)
+        self.assertEqual(record['activation_trace_code_hash'], review.capture.activation_trace.SOURCE_SHA256)
 
     def test_recovery_rejects_content_addressed_tampered_proof_and_extra_scope(self):
         original = review.git

@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import capture
 import prompt_runtime
+import read_guidance
 
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 ROLES = tuple(prompt_runtime.PROMPT_PATHS)
@@ -120,12 +121,16 @@ def validate_case(case):
         for message in messages:
             if not isinstance(message, dict) or set(message) != {'role', 'text'} or message['role'] not in ('user', 'assistant') or not isinstance(message['text'], str):
                 raise ValueError('Invalid synthetic message')
-        if case['role'] == 'extract' and (source.get('verified_skills') != ['frontend-ui'] or not isinstance(source.get('existing_notes'), list)):
-            raise ValueError('Invalid synthetic extraction scope')
+        if case['role'] == 'extract':
+            case_turn(source, 'extract')
+            if not isinstance(source.get('existing_notes'), list):
+                raise ValueError('Invalid synthetic extraction scope')
         if case['role'] in ('verify', 'correct') and not isinstance(source.get('note'), (str, dict)):
             raise ValueError('Missing synthetic note')
-        if case['role'] == 'correct' and (source.get('skill') != 'frontend-ui' or source.get('follow_ups') != []):
-            raise ValueError('Invalid synthetic correction scope')
+        if case['role'] == 'correct':
+            case_turn(source, 'correct')
+            if source.get('follow_ups') != []:
+                raise ValueError('Invalid synthetic correction scope')
     return case
 
 
@@ -184,12 +189,20 @@ def model(config, state, prompt, data, schema, deadline):
     return value
 
 
+def case_turn(source, role):
+    skills = source.get('verified_skills') if role == 'extract' else [source.get('skill')]
+    if (not isinstance(skills, list) or any(not isinstance(skill, str) or skill not in capture.SKILLS for skill in skills)
+            or len(set(skills)) != len(skills)):
+        raise ValueError('Invalid evaluation skill scope')
+    return {'verified_skills': skills, 'messages': source.get('messages', [])}
+
+
 def validate_output(case, output):
     """Protocol/validator failures are not measured behavioral improvement."""
     role = case['role']
     if role in ('extract', 'correct'):
         source = json.loads(case['input'])
-        notes = capture.validate_notes(output, {'verified_skills': ['frontend-ui'], 'messages': source.get('messages', [])})
+        notes = capture.validate_notes(output, case_turn(source, role))
         if role == 'correct' and len(notes) > 1:
             raise ValueError('Malformed correction output')
     elif role == 'verify':
@@ -211,7 +224,7 @@ def output_passes(case, output):
         role, expected = case['role'], case['expected']
         if role in ('extract', 'correct'):
             source = json.loads(case['input'])
-            notes = capture.validate_notes(output, {'verified_skills': ['frontend-ui'], 'messages': source.get('messages', [])})
+            notes = capture.validate_notes(output, case_turn(source, role))
             if role == 'correct' and len(notes) > 1:
                 return False
             return len(notes) == 0 if expected == 'empty' else len(notes) == 1
@@ -235,7 +248,7 @@ def task_input(case):
         return {**source, 'simulation_contract': 'Decision simulation only: return no_change, defer, or change; never execute tools. This is not runtime proof.'}
     messages = capture.message_context(source.get('messages', []))
     if role == 'extract':
-        return {'turn': {'verified_skills': source.get('verified_skills', ['frontend-ui']), **messages, 'calls': []},
+        return {'turn': {'verified_skills': case_turn(source, role)['verified_skills'], **messages, 'calls': []},
                 'existing_notes': source.get('existing_notes', [])}
     note = source['note']
     if isinstance(note, dict):
@@ -246,7 +259,7 @@ def task_input(case):
         data['follow_ups'] = source['follow_ups']
         data['omitted_follow_up_turns'] = 0
     if role == 'correct':
-        data['skill'] = source.get('skill', 'frontend-ui')
+        data['skill'] = case_turn(source, role)['verified_skills'][0]
         data['assessment'] = source.get('assessment', {'status': 'partial', 'summary': 'The note needs a source-supported correction within the same lesson.'})
     return data
 
@@ -319,6 +332,8 @@ class SourceChanged(RuntimeError):
 def assert_sources_current():
     for module_path, imported_hash in ((Path(__file__), SOURCE_SHA256),
                                         (Path(capture.__file__), capture.SOURCE_SHA256),
+                                        (Path(read_guidance.__file__), read_guidance.SOURCE_SHA256),
+                                        (Path(capture.activation_trace.__file__), capture.activation_trace.SOURCE_SHA256),
                                         (Path(prompt_runtime.__file__), prompt_runtime.SOURCE_SHA256)):
         try:
             current_hash = digest(module_path.read_bytes())
@@ -368,6 +383,8 @@ def recover_publication(root, base, remote, due, role, deadline):
                 'base_commit': base, 'base_hash': digest(old), 'candidate_hash': digest(candidate),
                 'evaluator_hash': SOURCE_SHA256, 'runtime_policy_code_hash': prompt_runtime.SOURCE_SHA256,
                 'capture_adapter_code_hash': capture.SOURCE_SHA256,
+                'guidance_reader_code_hash': read_guidance.SOURCE_SHA256,
+                'activation_trace_code_hash': capture.activation_trace.SOURCE_SHA256,
                 'schema_hash': digest({'proposal': PROPOSAL_SCHEMA, 'review': REVIEW_SCHEMA, 'case': CASE_SCHEMA, 'grade': GRADE_SCHEMA}),
                 'grader_policy_hash': digest(GRADE_PROMPT.encode()),
                 'policy_hash': digest(prompt_runtime.render(role, old.decode('utf-8'), root).encode()),
@@ -593,7 +610,7 @@ def review(config, state, root, base, role, due, deadline):
     assert_sources_current()
     audit = {'schema_version': 1, 'policy': POLICY, 'model': MODEL, 'due': due, 'target': role,
              'base_commit': base, 'base_hash': base_hash, 'candidate_hash': digest(candidate.encode()),
-             'dataset_hash': digest(cases), 'evaluator_hash': SOURCE_SHA256, 'runtime_policy_code_hash': prompt_runtime.SOURCE_SHA256, 'capture_adapter_code_hash': capture.SOURCE_SHA256, 'schema_hash': digest({'proposal': PROPOSAL_SCHEMA, 'review': REVIEW_SCHEMA, 'case': CASE_SCHEMA, 'grade': GRADE_SCHEMA}), 'grader_policy_hash': digest(GRADE_PROMPT.encode()), 'policy_hash': digest(prompt_runtime.render(role, text, root).encode()),
+             'dataset_hash': digest(cases), 'evaluator_hash': SOURCE_SHA256, 'runtime_policy_code_hash': prompt_runtime.SOURCE_SHA256, 'capture_adapter_code_hash': capture.SOURCE_SHA256, 'guidance_reader_code_hash': read_guidance.SOURCE_SHA256, 'activation_trace_code_hash': capture.activation_trace.SOURCE_SHA256, 'schema_hash': digest({'proposal': PROPOSAL_SCHEMA, 'review': REVIEW_SCHEMA, 'case': CASE_SCHEMA, 'grade': GRADE_SCHEMA}), 'grader_policy_hash': digest(GRADE_PROMPT.encode()), 'policy_hash': digest(prompt_runtime.render(role, text, root).encode()),
              'baseline': baseline, 'candidate': candidate_results, 'approval_hashes': [first, final],
              'status': 'provisional_synthetic_gain_pending_publication', 'evaluation_scope': 'synthetic_regression_only_no_runtime_success_claim', 'maintenance_evaluation': 'decision_proxy_only'}
     commit = publish(root, base, role, candidate, new_case, audit, deadline)

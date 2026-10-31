@@ -1,0 +1,296 @@
+[
+  {
+    "id": "typescript-explicit",
+    "suite": "typescript",
+    "invocation": "explicit",
+    "prompt": "Use $typescript to review src/parser.ts for runtime correctness.",
+    "files": {
+      "package.json": "{\"private\": true, \"type\": \"module\", \"scripts\": {\"check\": \"tsc --noEmit\"}}",
+      "tsconfig.json": "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+      "src/parser.ts": "export function name(value: unknown): string { return (value as {name: string}).name.trim(); }\n"
+    },
+    "required": [
+      "typescript"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "typescript-unnamed-ts",
+    "suite": "typescript",
+    "invocation": "configured",
+    "prompt": "Review src/parser.ts for runtime correctness and give the smallest fix.",
+    "files": {
+      "package.json": "{\"private\": true, \"type\": \"module\", \"scripts\": {\"check\": \"tsc --noEmit\"}}",
+      "tsconfig.json": "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+      "src/parser.ts": "export function name(value: unknown): string { return (value as {name: string}).name.trim(); }\n"
+    },
+    "required": [
+      "typescript"
+    ],
+    "forbidden": [
+      "frontend-ui"
+    ],
+    "before": []
+  },
+  {
+    "id": "typescript-module-extensions",
+    "suite": "typescript",
+    "invocation": "configured",
+    "prompt": "Review both src/module.mts and src/config.cts for unsafe assumptions.",
+    "files": {
+      "package.json": "{\"private\": true, \"type\": \"module\", \"scripts\": {\"check\": \"tsc --noEmit\"}}",
+      "tsconfig.json": "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+      "src/module.mts": "export function name(value: unknown): string { return (value as {name: string}).name.trim(); }\n",
+      "src/config.cts": "const raw: unknown = null; export const name = (raw as {name:string}).name;\n"
+    },
+    "required": [
+      "typescript"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "typescript-config-coverage",
+    "suite": "typescript",
+    "invocation": "configured",
+    "prompt": "Does this backend package check script establish type safety? Inspect its configuration and source.",
+    "files": {
+      "package.json": "{\"private\":true,\"scripts\":{\"check\":\"bun build src/index.ts --outdir dist\"}}",
+      "tsconfig.json": "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+      "src/index.ts": "const count: number = \"one\";\n"
+    },
+    "required": [
+      "typescript",
+      "typescript/tooling"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "typescript-public-contract",
+    "suite": "typescript",
+    "invocation": "configured",
+    "prompt": "Review this library public package types and whether its type tests actually check the consumer contract.",
+    "files": {
+      "package.json": "{\"name\":\"sample-library\",\"type\":\"module\",\"exports\":{\".\":{\"types\":\"./dist/index.d.ts\",\"import\":\"./dist/index.js\"}},\"scripts\":{\"check\":\"tsc --noEmit -p tsconfig.json\"}}",
+      "tsconfig.json": "{\"compilerOptions\":{\"strict\":true,\"module\":\"NodeNext\",\"moduleResolution\":\"NodeNext\"},\"include\":[\"src\"],\"exclude\":[\"type-tests\"]}",
+      "src/index.ts": "export function label(value: string): string { return value.trim(); }",
+      "dist/index.d.ts": "export declare function label(value: any): any;",
+      "dist/index.js": "export function label(value) { return value.trim(); }",
+      "type-tests/index.test-d.ts": "import {label} from \"../src/index.js\";\n// @ts-expect-error numbers rejected\nlabel(42);"
+    },
+    "required": [
+      "typescript",
+      "typescript/tooling"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "typescript-tsx-composition",
+    "suite": "typescript",
+    "invocation": "configured",
+    "prompt": "Review src/Editor.tsx for saving before typing and give the smallest correct fix.",
+    "files": {
+      "package.json": "{\"private\": true, \"type\": \"module\", \"scripts\": {\"check\": \"tsc --noEmit\"}}",
+      "tsconfig.json": "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+      "src/Editor.tsx": "import {useState} from \"react\";\nexport function Editor({save}:{save:(value:string)=>Promise<void>}) { const [value,setValue]=useState<string|null>(null); return <><input aria-label=\"Title\" value={value??\"\"} onChange={e=>setValue(e.target.value)}/><button onClick={()=>save(value!)}>Save</button></>; }"
+    },
+    "required": [
+      "frontend-ui",
+      "typescript"
+    ],
+    "forbidden": [],
+    "before": [
+      [
+        "frontend-ui",
+        "typescript"
+      ]
+    ]
+  },
+  {
+    "id": "typescript-vue-template",
+    "suite": "typescript",
+    "invocation": "configured",
+    "prompt": "Does this Vue app check script cover src/App.vue templates? Does successful framework preparation establish that coverage? Versions are unspecified; do not infer compatibility or recommend upgrades.",
+    "files": {
+      "package.json": "{\"private\":true,\"scripts\":{\"check\":\"tsc --noEmit -p tsconfig.json\",\"prepare\":\"nuxt prepare\"},\"dependencies\":{\"vue\":\"*\",\"nuxt\":\"*\"}}",
+      "tsconfig.json": "{\"compilerOptions\":{\"strict\":true},\"include\":[\"src/**/*.ts\"]}",
+      "src/state.ts": "export const count: number = 1;",
+      "src/App.vue": "<script setup lang=\"ts\">const count: number = 1</script>\n<template>{{count.toUpperCase()}}</template>"
+    },
+    "required": [
+      "frontend-ui",
+      "typescript",
+      "typescript/map",
+      "frontend-ui/vue-tooling"
+    ],
+    "forbidden": [],
+    "before": [
+      [
+        "frontend-ui",
+        "typescript"
+      ]
+    ]
+  },
+  {
+    "id": "typescript-negative-lua",
+    "suite": "typescript",
+    "invocation": "negative",
+    "prompt": "Explain how greeting.lua exports greet.",
+    "files": {
+      "greeting.lua": "local M = {}\nfunction M.greet(name) return \"hello, \" .. name end\nreturn M"
+    },
+    "required": [],
+    "forbidden": [
+      "frontend-ui",
+      "content-research-writer",
+      "find-skills",
+      "tauri",
+      "typescript"
+    ],
+    "before": []
+  },
+  {
+    "id": "typescript-negative-readme",
+    "suite": "typescript",
+    "invocation": "negative",
+    "prompt": "Fix only the spelling in README.md by returning corrected prose. Do not review application code.",
+    "files": {
+      "package.json": "{\"private\": true, \"type\": \"module\", \"scripts\": {\"check\": \"tsc --noEmit\"}}",
+      "tsconfig.json": "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}, \"include\": [\"src\"]}",
+      "README.md": "This project provdes an offline task list.",
+      "src/index.ts": "export const name = \"app\";"
+    },
+    "required": [],
+    "forbidden": [
+      "frontend-ui",
+      "content-research-writer",
+      "find-skills",
+      "tauri",
+      "typescript"
+    ],
+    "before": []
+  },
+  {
+    "id": "frontend-accessibility",
+    "suite": "managed",
+    "invocation": "explicit",
+    "prompt": "Use $frontend-ui to review the local HTML/CSS for keyboard accessibility. Explain findings only.",
+    "files": {
+      "index.html": "<div onclick=\"save()\">Save</div><style>div {outline:none;color:#aaa;background:#fff}</style>"
+    },
+    "required": [
+      "frontend-ui"
+    ],
+    "forbidden": [
+      "typescript"
+    ],
+    "before": []
+  },
+  {
+    "id": "tauri-boundary",
+    "suite": "managed",
+    "invocation": "explicit",
+    "prompt": "Use $tauri to review whether this local native configuration points to a distributable static frontend. Explain the boundary issue.",
+    "files": {
+      "tauri.conf.json": "{\"build\":{\"frontendDist\":\"../apps/web/.output/server\",\"devUrl\":\"http://localhost:3000\"}}",
+      "README.md": "The web frontend requires a server process at runtime. The native package must work offline."
+    },
+    "required": [
+      "tauri",
+      "frontend-ui"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "writer-local-review",
+    "suite": "managed",
+    "invocation": "explicit",
+    "prompt": "Use $content-research-writer to review draft.txt for argument coherence and preserve the author voice. Base your review only on the provided draft; no external factual research is needed.",
+    "files": {
+      "draft.txt": "We tested our local queue with two volunteers. Both finished the workflow. Therefore everyone will find the product easy to use. I want our team to make the queue easier to navigate, because I got lost when the filters changed. The test proves the interface is perfect."
+    },
+    "required": [
+      "content-research-writer"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "find-skills-feedback-review",
+    "suite": "managed",
+    "invocation": "explicit",
+    "prompt": "Use $find-skills to review this prior recommendation for a guidance defect: the user asked only to fix spelling, but the assistant recommended installing a writing skill. Assess scope and recommend a correction to the recommendation; do not search or install anything.",
+    "files": {
+      "exchange.txt": "User: Correct the spelling of this sentence. Assistant: Install a writing agent skill first."
+    },
+    "required": [
+      "find-skills"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "frontend-inferred",
+    "suite": "managed",
+    "invocation": "configured",
+    "prompt": "Review index.html and its CSS for keyboard accessibility. Explain actionable findings only.",
+    "files": {
+      "index.html": "<div onclick=\"save()\">Save</div><style>div {outline:none;color:#aaa;background:#fff}</style>"
+    },
+    "required": [
+      "frontend-ui"
+    ],
+    "forbidden": [
+      "typescript"
+    ],
+    "before": []
+  },
+  {
+    "id": "tauri-inferred",
+    "suite": "managed",
+    "invocation": "configured",
+    "prompt": "Review tauri.conf.json and README.md to determine whether this native configuration points to a distributable static frontend.",
+    "files": {
+      "tauri.conf.json": "{\"build\":{\"frontendDist\":\"../apps/web/.output/server\",\"devUrl\":\"http://localhost:3000\"}}",
+      "README.md": "The web frontend requires a server process at runtime. The native package must work offline."
+    },
+    "required": [
+      "tauri",
+      "frontend-ui"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "writer-inferred",
+    "suite": "managed",
+    "invocation": "configured",
+    "prompt": "Review draft.txt for argument coherence, unsupported conclusions and preservation of the author's voice. Use the provided draft only; no external factual research is needed.",
+    "files": {
+      "draft.txt": "We tested our local queue with two volunteers. Both finished the workflow. Therefore everyone will find the product easy to use. I want our team to make the queue easier to navigate, because I got lost when the filters changed. The test proves the interface is perfect."
+    },
+    "required": [
+      "content-research-writer"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "find-skills-inferred",
+    "suite": "managed",
+    "invocation": "configured",
+    "prompt": "Recommend an agent skill for reviewing an article from the two local options in catalog.json. Use only this supplied catalog, explain what remains unverified, and do not search or install anything.",
+    "files": {
+      "catalog.json": "[{\"name\": \"content-research-writer\", \"description\": \"Review substantive articles and arguments; this is supplied catalog metadata, not verified publisher evidence.\"}, {\"name\": \"frontend-ui\", \"description\": \"Build and review web interfaces; this is supplied catalog metadata, not verified publisher evidence.\"}]"
+    },
+    "required": [
+      "find-skills"
+    ],
+    "forbidden": [],
+    "before": []
+  }
+]
