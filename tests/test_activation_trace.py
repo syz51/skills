@@ -3,6 +3,9 @@ import hashlib
 import json
 from pathlib import Path
 import shlex
+import shutil
+import subprocess
+import tempfile
 import sys
 import unittest
 
@@ -292,6 +295,227 @@ class ActivationTraceTests(unittest.TestCase):
         self.assertTrue(self.score(trace(command('head -n 3 /fixture/README.md', 'An unrelated file.')), (), ('typescript',))['passed'])
         mention = trace(command('printf %s ' + shlex.quote(TS), TS + '\n# TypeScript'))
         self.assertTrue(self.score(mention, (), ('typescript',))['passed'])
+
+    def test_real_partial_shell_reads_defeat_forbidden_and_earlier_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ts, ui, unrelated = root / 'skills/typescript/SKILL.md', root / 'skills/frontend-ui/SKILL.md', root / 'README.md'
+            for path, content in ((ts, CONTENT), (ui, UI_CONTENT), (unrelated, CONTENT[:20] + 'Other local data.\n')):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            targets = {'typescript': {'path': str(ts), 'content': CONTENT},
+                       'frontend-ui': {'path': str(ui), 'content': UI_CONTENT}}
+            ui_read = command('cat ' + str(ui), subprocess.check_output(['cat', str(ui)], text=True))
+            ts_read = command('cat ' + str(ts), subprocess.check_output(['cat', str(ts)], text=True))
+            readers = [
+                ['head', '-n', '4', str(ts)], ['tail', '-n', '1', str(ts)],
+                ['awk', 'NR <= 4', str(ts)], ['fold', '-w', '20', str(ts)],
+                ['dd', 'if=' + str(ts), 'bs=1', 'count=1'],
+                [sys.executable, '-c', 'print(open(' + repr(str(ts)) + ').read()[:1], end="")'],
+                ['sh', '-c', 'head -c 1 < ' + shlex.quote(str(ts))],
+                ['find', str(ts), '-exec', 'head', '-c', '20', '{}', '+'],
+                ['sh', '-c', "printf '%s' \"$(head -c 20 " + shlex.quote(str(ts)) + ")\""],
+                ['sh', '-c', "printf '%s' \"`head -c 20 " + shlex.quote(str(ts)) + "`\""],
+                ['sh', '-c', 'printf example\nhead -c 20 ' + shlex.quote(str(ts))],
+                ['sh', '-c', 'printf example # inert comment\nhead -c 20 ' + shlex.quote(str(ts))],
+            ]
+            for argv in readers:
+                with self.subTest(argv=argv):
+                    result = subprocess.run(argv, text=True, capture_output=True, check=True)
+                    excerpt = command(shlex.join(argv), result.stdout)
+                    negative = score_trace(trace(excerpt), targets, (), ('typescript',))
+                    self.assertFalse(negative['passed'], negative)
+                    self.assertEqual(negative['reads'], [])
+                    early = score_trace(trace(excerpt, ui_read, ts_read), targets,
+                                        ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))
+                    self.assertFalse(early['passed'], early)
+                    later = score_trace(trace(ui_read, excerpt, ts_read), targets,
+                                        ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))
+                    self.assertTrue(later['passed'], later)
+            output = subprocess.check_output(['head', '-c', '20', str(unrelated)], text=True)
+            self.assertEqual(output, CONTENT[:20])
+            self.assertTrue(score_trace(trace(command('head -c 20 ' + str(unrelated), output)),
+                                        targets, (), ('typescript',))['passed'])
+
+    def test_partial_shell_uncertainty_covers_aliases_globs_and_wrapped_tools(self):
+        commands = ['head -n 4 ' + TS, 'tail -c 1 ' + TS, 'custom-reader ' + TS,
+                    'head -n 4 /fixture/skills/type*/SKILL.md',
+                    'head -n 4 ~/.codex/skills/typescript/SKILL.md',
+                    'head -n 4 skills/typescript/SKILL.md', 'head -c 0 ' + TS]
+        for cmd in commands:
+            for output in ('', '-', CONTENT[:20]):
+                result = {'content': [{'type': 'text', 'text': json.dumps({'exit_code': 0, 'output': output})}]}
+                direct = {'type': 'mcp_tool_call', 'server': 'functions', 'tool': 'exec_command', 'status': 'completed',
+                          'arguments': {'cmd': cmd}, 'result': result, 'error': None}
+                wrapped = {**direct, 'tool': 'exec', 'arguments': {'code':
+                           'text(await tools.exec_command({cmd:' + json.dumps(cmd) + '}));'}}
+                for item in (command(cmd, output), direct, wrapped):
+                    with self.subTest(cmd=cmd, output=output, tool=item['type']):
+                        self.assertFalse(self.score(trace(item), (), ('typescript',))['passed'])
+                        order = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+                        self.assertFalse(self.score(order, ('frontend-ui', 'typescript'),
+                                                    before=(('frontend-ui', 'typescript'),))['passed'])
+
+    def test_shell_print_inventory_comments_and_failed_partial_reads_remain_unrelated(self):
+        for cmd in ('printf %s ' + shlex.quote(TS), 'echo ' + TS,
+                    'rg --files ' + TS, 'ls ' + TS, 'stat ' + TS,
+                    'printf example; # head -n 4 ' + TS,
+                    'printf %s ' + shlex.quote('$(head -c 20 ' + TS + ')'),
+                    'printf %s ' + shlex.quote('`head -c 20 ' + TS + '`'),
+                    'find ' + TS + ' -print'):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(self.score(trace(command(cmd, CONTENT[:20])), (), ('typescript',))['passed'])
+        self.assertTrue(self.score(trace(command('head -n 4 ' + TS, CONTENT[:20], exit_code=1)), (), ('typescript',))['passed'])
+
+    def test_unknown_node_paths_cannot_prove_absence_or_order_from_any_excerpt_length(self):
+        forms = [
+            "var folder='/fixture/skills/typescript'; nodeRepl.write((await fs.readFile(folder + '/' + ['SKILL','md'].join('.'),'utf8')).slice(0,20));",
+            "nodeRepl.write((await fs.readFile(computedPath,'utf8')).slice(0,1));",
+            "var p='/fixture/README.md'; p='" + TS + "'; nodeRepl.write((await fs.readFile(p,'utf8')).slice(0,20));",
+            "var p='/fixture/README.md'; if(true){p='" + TS + "';} nodeRepl.write((await fs.readFile(p,'utf8')).slice(0,20));",
+            "fs.readFile=async p=>'" + TS + "'; nodeRepl.write(await fs.readFile('/fixture/README.md','utf8'));",
+            "var p=custom.join('/fixture','README.md'); nodeRepl.write(await fs.readFile(p,'utf8'));",
+            "nodeRepl.write((await fs['readFile']('" + TS + "','utf8')).slice(0,20));",
+            "var reader=fs.readFile; nodeRepl.write((await reader('" + TS + "','utf8')).slice(0,20));",
+            "nodeRepl.write((await fs.readFile('skills/typescript/SKILL.md','utf8')).slice(0,20));",
+        ]
+        for expression in forms:
+            code = "var fs=await import('node:fs/promises'); " + expression
+            for output in ('', '-', '---\n', CONTENT[:20]):
+                with self.subTest(code=code, output=output):
+                    item = node(code, output)
+                    negative = self.score(trace(item), (), ('typescript',))
+                    self.assertFalse(negative['passed'], negative)
+                    self.assertEqual(negative['reads'], [])
+                    early = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+                    self.assertFalse(self.score(early, ('frontend-ui', 'typescript'),
+                                                before=(('frontend-ui', 'typescript'),))['passed'])
+                    later = trace(command('cat ' + UI, UI_CONTENT), item, command('cat ' + TS))
+                    self.assertTrue(self.score(later, ('frontend-ui', 'typescript'),
+                                               before=(('frontend-ui', 'typescript'),))['passed'])
+
+    def test_real_computed_node_excerpt_cannot_pass_a_negative(self):
+        runtime = shutil.which('bun') or shutil.which('node')
+        if runtime is None:
+            self.skipTest('Optional actual-read smoke needs Bun or Node; synthetic regression is mandatory')
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / 'skills/typescript/SKILL.md'
+            entry.parent.mkdir(parents=True)
+            entry.write_text(CONTENT)
+            prefix = "var fs=await import('node:fs/promises'); "
+            programs = [
+                prefix + 'var folder=' + json.dumps(str(entry.parent)) +
+                "; nodeRepl.write((await fs.readFile(folder + '/' + ['SKILL','md'].join('.'),'utf8')).slice(0,20));",
+                prefix + 'nodeRepl.write((await fs["readFile"](' + json.dumps(str(entry)) + ",'utf8')).slice(0,20));",
+                prefix + 'var reader=fs.readFile; nodeRepl.write((await reader(' + json.dumps(str(entry)) + ",'utf8')).slice(0,20));",
+            ]
+            for code in programs:
+                with self.subTest(code=code):
+                    shim = 'globalThis.nodeRepl={write:value=>process.stdout.write(value)}; '
+                    argv = [runtime, '-e', shim + code] if Path(runtime).name == 'bun' else [runtime, '--input-type=module', '-e', shim + code]
+                    output = subprocess.check_output(argv, text=True)
+                    self.assertEqual(output, CONTENT[:20])
+                    result = score_trace(trace(node(code, output)), {'typescript': {'path': str(entry), 'content': CONTENT}}, (), ('typescript',))
+                    self.assertFalse(result['passed'], result)
+                    self.assertEqual(result['reads'], [])
+
+    def test_proven_unrelated_node_paths_preserve_controls_with_shared_prefixes(self):
+        prefix = "var fs=await import('node:fs/promises'); "
+        for code in ("nodeRepl.write((await fs.readFile('/fixture/README.md','utf8')).slice(0,20));",
+                     "var p='/fixture/README.md'; nodeRepl.write((await fs.readFile(p,'utf8')).slice(0,20));",
+                     "if(true){nodeRepl.write(await fs.readFile('/fixture/README.md','utf8'));}"):
+            for output in ('', '---\n', CONTENT[:20]):
+                with self.subTest(code=code, output=output):
+                    self.assertTrue(self.score(trace(node(prefix + code, output)), (), ('typescript',))['passed'])
+        for code in ("nodeRepl.write(\"fs['readFile']\");", "// fs['readFile']('example');\nnodeRepl.write('example');"):
+            self.assertTrue(self.score(trace(node(code, CONTENT[:20])), (), ('typescript',))['passed'])
+        failed = node(prefix + "nodeRepl.write(await fs.readFile(computedPath,'utf8'));", CONTENT[:20], error='failed')
+        self.assertTrue(self.score(trace(failed), (), ('typescript',))['passed'])
+
+    def test_unsupported_real_exec_wrappers_fail_constraints_without_counting_printed_calls(self):
+        code = "var cmd='head -n 4 '+path; text(await tools.exec_command({cmd}));"
+        result = {'content': [{'type': 'text', 'text': json.dumps({'exit_code': 0, 'output': CONTENT[:20]})}]}
+        item = {'type': 'mcp_tool_call', 'server': 'functions', 'tool': 'exec', 'status': 'completed',
+                'arguments': {'code': code}, 'result': result, 'error': None}
+        self.assertFalse(self.score(trace(item), (), ('typescript',))['passed'])
+        events = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+        self.assertFalse(self.score(events, ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+        for code in ("text(await tools['exec_command']({cmd:'head -n 4 '+path}));",
+                     "var run=tools.exec_command; text(await run({cmd:'head -n 4 '+path}));"):
+            alias = {**item, 'arguments': {'code': code}}
+            self.assertFalse(self.score(trace(alias), (), ('typescript',))['passed'])
+            events = trace(alias, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+            self.assertFalse(self.score(events, ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+        for output in ('unattributed result', ''):
+            unknown = {**item, 'result': {'content': [{'type': 'text', 'text': output}]}}
+            self.assertFalse(self.score(trace(unknown), (), ('typescript',))['passed'])
+        for code in ('text(' + json.dumps(code) + ');', '// ' + code + '\ntext("example");'):
+            printed = {**item, 'arguments': {'code': code}}
+            self.assertTrue(self.score(trace(printed), (), ('typescript',))['passed'])
+        failure = {**item, 'result': {'content': [{'type': 'text', 'text': json.dumps({'exit_code': 1, 'output': CONTENT[:20]})}]}}
+        self.assertFalse(self.score(trace(failure), (), ('typescript',))['passed'])
+        attributable_failure = {**failure, 'arguments': {'code': 'text(await tools.exec_command({cmd:' + json.dumps('head -n 4 ' + TS) + '}));'}}
+        self.assertTrue(self.score(trace(attributable_failure), (), ('typescript',))['passed'])
+
+    def test_truncated_supported_node_reads_and_unattributed_batches_stay_uncertain(self):
+        code = "var fs=await import('node:fs/promises'); nodeRepl.write(await fs.readFile('" + TS + "','utf8'));"
+        truncated = node(code, 'Warning: truncated output\n' + CONTENT[:20])
+        self.assertFalse(self.score(trace(truncated), (), ('typescript',))['passed'])
+        events = trace(truncated, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+        self.assertFalse(self.score(events, ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+        batch = 'const reads=await Promise.all([tools.exec_command({cmd:' + json.dumps('head -n 4 ' + TS) + '}),tools.exec_command({cmd:"pwd"})]); reads.forEach(text);'
+        result = {'content': [{'type': 'text', 'text': json.dumps([{'exit_code': 0, 'output': CONTENT[:20]}, {'exit_code': 0, 'output': '/fixture'}])}]}
+        item = {'type': 'mcp_tool_call', 'server': 'functions', 'tool': 'exec', 'status': 'completed',
+                'arguments': {'code': batch}, 'result': result, 'error': None}
+        self.assertFalse(self.score(trace(item), (), ('typescript',))['passed'])
+
+    def test_unknown_completed_mcp_formats_cannot_establish_absence_or_order(self):
+        base = {'type': 'mcp_tool_call', 'server': 'unknown-reader', 'tool': 'read', 'status': 'completed',
+                'arguments': {'path': TS}, 'result': {'content': [{'type': 'text', 'text': CONTENT[:20]}]}, 'error': None}
+        variants = [base, {**base, 'server': 'functions', 'tool': 'exec_command', 'arguments': {}},
+                    {**base, 'arguments': '{malformed'}, {**base, 'result': {'unrecognized': CONTENT[:20]}},
+                    {**base, 'server': 'node_repl', 'tool': 'js', 'arguments': {'code': None}}]
+        for item in variants:
+            with self.subTest(item=item):
+                self.assertFalse(self.score(trace(item), (), ('typescript',))['passed'])
+                events = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+                self.assertFalse(self.score(events, ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+        for item in ({**base, 'status': 'failed'}, {**base, 'error': 'failed'},
+                     {**base, 'result': {'isError': True, 'content': [{'type': 'text', 'text': CONTENT[:20]}]}}):
+            self.assertTrue(self.score(trace(item), (), ('typescript',))['passed'])
+        self.assertTrue(self.score(trace({'type': 'item.started', 'item': base}), (), ('typescript',))['passed'])
+
+    def test_known_mcp_shell_unknown_result_preserves_possible_reads_and_unrelated_commands(self):
+        base = {'type': 'mcp_tool_call', 'server': 'functions', 'tool': 'exec_command', 'status': 'completed',
+                'arguments': {'cmd': 'head -c 20 ' + TS}, 'error': None}
+        for output in (CONTENT[:20], '', json.dumps({'exit_code': None, 'output': CONTENT[:20]})):
+            with self.subTest(output=output):
+                item = {**base, 'result': {'content': [{'type': 'text', 'text': output}]}}
+                self.assertFalse(self.score(trace(item), (), ('typescript',))['passed'])
+                self.assertEqual(self.score(trace(item))['reads'], [])
+                events = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+                self.assertFalse(self.score(events, ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+                for cmd in ('head -c 20 /fixture/README.md', 'printf example', 'rg --files .'):
+                    unrelated = {**item, 'arguments': {'cmd': cmd}}
+                    self.assertTrue(self.score(trace(unrelated), (), ('typescript',))['passed'])
+
+    def test_unknown_command_execution_metadata_cannot_establish_absence_or_order(self):
+        base = command('head -c 20 ' + TS, CONTENT[:20])
+        variants = [{key: value for key, value in base.items() if key != 'exit_code'},
+                    {**base, 'exit_code': None}, {**base, 'exit_code': '0'},
+                    {**base, 'exit_code': True}, {**base, 'aggregated_output': None},
+                    {**base, 'command': None}, {**base, 'command': ''}]
+        for item in variants:
+            with self.subTest(item=item):
+                negative = self.score(trace(item), (), ('typescript',))
+                self.assertFalse(negative['passed'], negative)
+                self.assertEqual(negative['reads'], [])
+                events = trace(item, command('cat ' + UI, UI_CONTENT), command('cat ' + TS))
+                self.assertFalse(self.score(events, ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+        missing = {key: value for key, value in base.items() if key != 'exit_code'}
+        for cmd in ('printf example', 'head -c 20 /fixture/README.md'):
+            self.assertTrue(self.score(trace({**missing, 'command': cmd}), (), ('typescript',))['passed'])
+        self.assertTrue(self.score(trace({**base, 'exit_code': 1}), (), ('typescript',))['passed'])
 
     def test_production_node_adapter_preserves_observed_bytes_and_session_bindings(self):
         state = {}

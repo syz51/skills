@@ -7,6 +7,7 @@ Unknown tool formats remain unverified rather than being inferred from prose.
 import ast
 from dataclasses import dataclass
 import hashlib
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -144,32 +145,143 @@ def _tool_text(result):
     return '\n'.join(texts)
 
 
-def _node_attempts(code, bindings):
-    """Identify uncertain reads for negative controls, without granting proof."""
+def _node_attempts(code, state):
+    """Identify possible read paths without evaluating code or granting proof.
+
+    Unknown programs cannot establish absence or ordering. Literal bindings
+    narrow paths only when the surrounding program preserves supported
+    filesystem contracts; this never extends accepted positive evidence.
+    """
     code = _without_comments(code)
-    # Keep offsets intact while removing string payloads from executable text.
-    # A printed path or a comment containing readFile is not a read attempt.
-    bare = re.sub(_STRING, lambda m: ' ' * len(m[0]), code)
-    calls = list(re.finditer(r'\breadFile(?:Sync)?\s*\(', bare))
-    values = set()
-    for call in calls:
-        depth, end = 1, call.end()
-        while end < len(bare) and depth:
-            if bare[end] == '(':
-                depth += 1
-            elif bare[end] == ')':
-                depth -= 1
-            end += 1
-        if depth:
+    try:
+        statements = _split(code)
+    except ValueError:
+        statements = [code]
+    bindings, values, unresolved = dict(state['bindings']), set(), False
+    for statement in statements:
+        declaration = re.fullmatch(r'(?:var|let|const)\s+(\w+)\s*=\s*([\s\S]+)', statement)
+        if declaration:
+            try:
+                bindings[declaration[1]] = _value(declaration[2], bindings)
+            except (ValueError, SyntaxError, RecursionError):
+                bindings.pop(declaration[1], None)
+        # Keep offsets while removing strings so printed copies are not calls.
+        bare = re.sub(_STRING, lambda m: ' ' * len(m[0]), statement)
+        calls = list(re.finditer(r'\breadFile(?:Sync)?\s*\(', bare))
+        for call in calls:
+            depth, end = 1, call.end()
+            while end < len(bare) and depth:
+                if bare[end] == '(':
+                    depth += 1
+                elif bare[end] == ')':
+                    depth -= 1
+                end += 1
+            value = None
+            if not depth:
+                try:
+                    arguments = _split(statement[call.end():end - 1], ',')
+                    value = _value(arguments[0], bindings) if arguments else None
+                except (ValueError, SyntaxError, RecursionError):
+                    pass
+            if isinstance(value, str):
+                values.add(value)
+                if not value.startswith('/') and value.endswith('SKILL.md'):
+                    unresolved = True
+            else:
+                unresolved = True
+    # Narrow to unrelated literal paths only when the surrounding program
+    # preserves the supported filesystem bindings. An arbitrary mutation
+    # could redirect readFile even when its apparent operand is unrelated.
+    # Literal conditionals are safe to unwrap for *possible* reads only;
+    # this never grants positive evidence or claims the branch executed.
+    narrowed = []
+    for statement in statements:
+        conditional = re.fullmatch(r'if\s*\(\s*(?:true|false)\s*\)\s*\{([\s\S]*)\}', statement)
+        narrowed.append(conditional[1] if conditional else statement)
+    try:
+        _node(';'.join(narrowed), '', {'bindings': dict(state['bindings']), 'modules': set(state['modules'])})
+    except (ValueError, SyntaxError, RecursionError):
+        unresolved = True
+    return values, unresolved
+
+
+def _shell_substitution(command):
+    """Recognize executable substitutions, excluding quotes and comments."""
+    source = _shell_source(command)
+    quote, index = None, 0
+    while index < len(source):
+        char = source[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == '\\':
+            index += 1
+        elif char == "'" and quote is None:
+            quote = "'"
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == '#' and quote is None and (index == 0 or source[index - 1].isspace() or source[index - 1] in ';&|()'):
+            end = source.find('\n', index)
+            if end < 0:
+                return False
+            index = end
+        elif char == '`' or char == '$' and source[index + 1:index + 2] == '(':
+            return True
+        index += 1
+    return False
+
+
+def _shell_attempts(command):
+    """Find possible consuming operands, excluding clear print/inventory forms.
+
+    Unknown commands with a target operand stay uncertain. This is not an
+    allowlist of reader programs: fold, interpreters and input redirections
+    need the same conservative handling as head, grep or dd.
+    """
+    lexer = shlex.shlex(_shell_source(command), posix=False, punctuation_chars=';&|()<>\n')
+    lexer.whitespace = ' \t\r'
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    groups, current, inputs, input_next, comment, complex_program = [], [], [], False, False, False
+    for token in lexer:
+        if token.startswith('#'):
+            comment = True
+        if comment and '\n' not in token:
             continue
-        try:
-            arguments = _split(code[call.end():end - 1], ',')
-            value = _value(arguments[0], bindings) if arguments else None
-        except (ValueError, SyntaxError, RecursionError):
+        if token and all(char in ';&|()<>\n' for char in token):
+            complex_program = True
+            comment = False
+            if current:
+                groups.append(current)
+            current = []
+            input_next = token in ('<', '<>')
+        else:
+            value = shlex.split(token)
+            value = value[0] if len(value) == 1 else token
+            if input_next:
+                inputs.append(value)
+                input_next = False
+            else:
+                current.append(value)
+    if current:
+        groups.append(current)
+    operands, inert = list(inputs), not inputs
+    for words in groups:
+        while words and re.match(r'^[A-Za-z_][\w]*=', words[0]):
+            words = words[1:]
+        if not words:
             continue
-        if isinstance(value, str):
-            values.add(value)
-    return values, bool(calls)
+        executable = words[0].rsplit('/', 1)[-1]
+        if executable in ('echo', 'printf', 'pwd', 'true', 'false', ':', 'ls', 'stat',
+                          'test', '[', 'readlink', 'realpath', 'dirname', 'basename'):
+            continue
+        if executable == 'find' and not any(word in ('-exec', '-execdir', '-ok', '-okdir', '-files0-from') for word in words):
+            continue
+        if executable == 'rg' and _listing_prefix(words):
+            continue
+        inert = False
+        operands.extend(words[1:])
+    return operands, complex_program, inert
 
 
 @dataclass(frozen=True)
@@ -360,6 +472,22 @@ def _exec_commands(code):
     if not indexed and not re.fullmatch(variable + r'(?:\.reverse\(\))?\.forEach\(text\);?', tail):
         raise ValueError('Unknown exec batch output transformation')
     return commands, indexed
+
+
+def _inert_exec(code):
+    """Recognize only literal text outputs; unknown orchestration is not inert."""
+    try:
+        for statement in _split(_without_comments(code)):
+            call = re.fullmatch(r'text\(([\s\S]*)\)', statement)
+            if not call:
+                return False
+            parser = _Inspect(call[1])
+            parser.value()
+            if parser.text[parser.pos:].strip():
+                return False
+        return True
+    except (ValueError, SyntaxError, RecursionError):
+        return False
 
 
 def _node(code, text, state):
@@ -580,22 +708,35 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
     def shell(command, output, index):
         shell_evidence(command, output, index)
         try:
-            words = _shell(command)
+            if _shell_substitution(command):
+                mark_uncertain(known, index)
+            operands, complex_program, inert = _shell_attempts(command)
+            if complex_program and not inert and _prefixed_read(command) is None:
+                mark_uncertain(known, index)
         except ValueError:
+            mark_uncertain(known, index)
             return
-        executable = words[0].rsplit('/', 1)[-1] if words else ''
-        read_command = executable in ('cat', 'sed') or (executable in ('uv', 'python', 'python3') and any(word.endswith('read_guidance.py') for word in words))
-        if read_command:
-            for path, names in paths.items():
-                if path in words or any(word.startswith(path) and word[len(path):len(path) + 1] in (';', '&', '|') for word in words):
-                    for name in names:
-                        if name in forbidden and name not in first:
-                            mark_uncertain([name], index)
+        uncertain = {name for path, names in paths.items() if any(
+            re.search(r"(?<![\w./-])" + re.escape(path) + r"(?=$|[\s\x27\"),;])", operand)
+            or fnmatch.fnmatchcase(path, operand.split('=', 1)[-1])
+            for operand in operands) for name in names}
+        # Substitution and a basename-only skill read have no attributable path.
+        # A successful reader can expose a forbidden guide even with no output.
+        if any(re.search(r'\$(?:[A-Za-z_{]|\()|`', operand) or re.search(
+                r'(?:^|/)SKILL\.md(?:$|[\s\x27\"),;])', operand)
+                and not operand.startswith('/') for operand in operands):
+            uncertain.update(known)
+        mark_uncertain((name for name in uncertain if not any(
+            read['target'] == name and read['event'] == index for read in reads)), index)
 
     def wrapped_shell(code, output, index):
         try:
             commands, indexed = _exec_commands(code)
         except (ValueError, SyntaxError, RecursionError):
+            # Unknown orchestration may hide computed or aliased tool calls.
+            # Only bounded literal output programs can establish no read.
+            if not _inert_exec(code):
+                mark_uncertain(known, index)
             return
         results = _results(output)
         if len(commands) == len(results) == 1:
@@ -607,6 +748,9 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
                 if type(result.get('exit_code')) is int and result['exit_code'] == 0:
                     shell(command, result['output'], index)
         else:
+            if not results or any(type(result.get('exit_code')) is not int or result['exit_code'] == 0 for result in results):
+                for command in commands:
+                    shell(command, '', index)
             # Only self-identifying helper results can be attributed without
             # array indices. shell() validates their literal path/start pair.
             for command in commands:
@@ -657,10 +801,19 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
                 continue
             seen[identity] = item
         if item['type'] == 'command_execution':
-            if type(item.get('exit_code')) is int and item['exit_code'] == 0 and isinstance(item.get('command'), str) and isinstance(item.get('aggregated_output'), str):
-                shell(item['command'], item['aggregated_output'], index)
+            exit_code = item.get('exit_code')
+            if type(exit_code) is int and exit_code != 0:
+                continue
+            command = item.get('command')
+            if isinstance(command, str) and command.strip():
+                output = item.get('aggregated_output')
+                shell(command, output if type(exit_code) is int and isinstance(output, str) else '', index)
+            else:
+                mark_uncertain(known, index)
             continue
         if item.get('status') != 'completed' or item.get('error'):
+            continue
+        if isinstance(item.get('result'), dict) and item['result'].get('isError'):
             continue
         output = _tool_text(item.get('result'))
         arguments = item.get('arguments')
@@ -670,6 +823,7 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
             except ValueError:
                 arguments = None
         if output is None or not isinstance(arguments, dict):
+            mark_uncertain(known, index)
             continue
         if item.get('server') in ('functions', 'exec', 'shell', 'codex') and item.get('tool') == 'exec_command' and isinstance(arguments.get('cmd'), str):
             # Only the visible result payload is loading evidence. Hidden
@@ -677,25 +831,29 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
             results = _results(output)
             if len(results) == 1 and type(results[0].get('exit_code')) is int and results[0]['exit_code'] == 0:
                 shell(arguments['cmd'], results[0]['output'], index)
+            elif len(results) != 1 or type(results[0].get('exit_code')) is not int:
+                shell(arguments['cmd'], '', index)
             continue
         if item.get('server') in ('functions', 'exec') and item.get('tool') == 'exec' and isinstance(arguments.get('code'), str):
             wrapped_shell(arguments['code'], output, index)
             continue
         if item.get('server') not in ('node_repl', 'mcp__node_repl') or item.get('tool') not in ('js', 'node_repl') or not isinstance(arguments.get('code'), str):
+            mark_uncertain(known, index)
             continue
-        attempts, has_read = _node_attempts(arguments['code'], node_state['bindings'])
+        attempts, unresolved = _node_attempts(arguments['code'], node_state)
         try:
             writes, labelled, candidates = _node(arguments['code'], output, node_state)
         except (ValueError, SyntaxError, RecursionError):
             node_state = {'bindings': {}, 'modules': set()}
             uncertain = {name for path in attempts for name in paths.get(path, [])}
-            if has_read:
-                # Unknown transformations must not make a negative pass when
-                # the actual result contains complete forbidden guidance.
-                uncertain.update(name for name in known if any(targets[name]['content'] in text for value in _rendered_values(output) for text in _strings_in_data(value)))
+            if unresolved:
+                # No output length can prove absence when the read path is
+                # unresolved. Do not infer safety from a short or empty slice.
+                uncertain.update(known)
             mark_uncertain(uncertain, index)
             continue
         if _TRUNCATED.search(output) and not any(output == target['content'] for target in targets.values()):
+            mark_uncertain(known if unresolved else (name for path in attempts for name in paths.get(path, [])), index)
             continue
         sequence, sequence_reads = [], []
         for value in writes:
@@ -736,6 +894,8 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
                 content = expected[start:end]
                 if content and content == value:
                     add(read.path, content, index, start, end)
+        if unresolved:
+            mark_uncertain(known, index)
         for path in attempts:
             for name in paths.get(path, []):
                 if not any(read['target'] == name and read['event'] == index for read in reads):
