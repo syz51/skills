@@ -141,8 +141,8 @@ def _prefixed_read(command):
     return commands[-1]
 
 
-def _tool_text(result):
-    if not isinstance(result, dict) or result.get('isError'):
+def _tool_text(result, include_error=False):
+    if not isinstance(result, dict) or (result.get('isError') and not include_error):
         return None
     content = result.get('content')
     if not isinstance(content, list):
@@ -729,8 +729,17 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
         except (ValueError, TypeError, KeyError, RecursionError, UnicodeError):
             return
 
-    def shell(command, output, index):
-        shell_evidence(command, output, index)
+    def failed_output_uncertainty(output):
+        # Merged diagnostics and decorated output cannot establish absence.
+        # File identity/disjointness comes from the read analysis, not matching
+        # rendered text against snapshot lines. This never grants positive proof.
+        return set(known) if isinstance(output, str) and output.strip() else set()
+
+    def shell(command, output, index, successful=True):
+        if successful:
+            shell_evidence(command, output, index)
+        elif not failed_output_uncertainty(output):
+            return
         try:
             if _shell_substitution(command):
                 mark_uncertain(known, index)
@@ -755,6 +764,14 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
         mark_uncertain((name for name in uncertain if not any(
             read['target'] == name and read['event'] == index for read in reads)), index)
 
+    def shell_result(command, result, index):
+        exit_code = result.get('exit_code')
+        if type(exit_code) is int:
+            shell(command, result['output'], index, exit_code == 0)
+        else:
+            # Unknown success metadata may constrain absence, never prove a read.
+            shell(command, '', index)
+
     def wrapped_shell(code, output, index):
         try:
             commands, indexed = _exec_commands(code)
@@ -767,14 +784,12 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
         results = _results(output)
         if len(commands) == len(results) == 1:
             result = results[0]
-            if type(result.get('exit_code')) is int and result['exit_code'] == 0:
-                shell(commands[0], result['output'], index)
+            shell_result(commands[0], result, index)
         elif indexed and len(commands) == len(results) and {r.get('source_index') for r in results} == set(range(len(commands))):
             for command, result in zip(commands, sorted(results, key=lambda r: r['source_index'])):
-                if type(result.get('exit_code')) is int and result['exit_code'] == 0:
-                    shell(command, result['output'], index)
+                shell_result(command, result, index)
         else:
-            if not results or any(type(result.get('exit_code')) is not int or result['exit_code'] == 0 for result in results):
+            if not results or any(type(result.get('exit_code')) is not int or result['exit_code'] == 0 or failed_output_uncertainty(result.get('output', '')) for result in results):
                 for command in commands:
                     shell(command, '', index)
             # Only self-identifying helper results can be attributed without
@@ -828,18 +843,36 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
             seen[identity] = item
         if item['type'] == 'command_execution':
             exit_code = item.get('exit_code')
-            if type(exit_code) is int and exit_code != 0:
-                continue
             command = item.get('command')
             if isinstance(command, str) and command.strip():
                 output = item.get('aggregated_output')
-                shell(command, output if type(exit_code) is int and isinstance(output, str) else '', index)
+                shell(command, output if type(exit_code) is int and isinstance(output, str) else '', index,
+                      not (type(exit_code) is int and exit_code != 0))
             else:
                 mark_uncertain(known, index)
             continue
-        if item.get('status') != 'completed' or item.get('error'):
-            continue
-        if isinstance(item.get('result'), dict) and item['result'].get('isError'):
+        if item.get('status') != 'completed' or item.get('error') or (isinstance(item.get('result'), dict) and item['result'].get('isError')):
+            result = item.get('result')
+            if isinstance(result, dict):
+                visible = _tool_text(result, include_error=True) or ''
+                arguments = item.get('arguments')
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        arguments = None
+                if isinstance(arguments, dict) and item.get('tool') == 'exec_command' and isinstance(arguments.get('cmd'), str):
+                    shell(arguments['cmd'], visible, index, False)
+                elif (isinstance(arguments, dict) and item.get('server') in ('node_repl', 'mcp__node_repl')
+                      and isinstance(arguments.get('code'), str)):
+                    attempts, unresolved = _node_attempts(arguments['code'], node_state)
+                    possible = known if unresolved else {name for path in attempts for name in paths.get(path, [])}
+                    mark_uncertain(failed_output_uncertainty(visible) & set(possible), index)
+                    node_state = {'bindings': {}, 'modules': set()}
+                else:
+                    mark_uncertain(failed_output_uncertainty(visible), index)
+            if item.get('server') in ('node_repl', 'mcp__node_repl'):
+                node_state = {'bindings': {}, 'modules': set()}
             continue
         output = _tool_text(item.get('result'))
         arguments = item.get('arguments')
@@ -855,8 +888,8 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
             # Only the visible result payload is loading evidence. Hidden
             # transport metadata containing stdout is not a substitute.
             results = _results(output)
-            if len(results) == 1 and type(results[0].get('exit_code')) is int and results[0]['exit_code'] == 0:
-                shell(arguments['cmd'], results[0]['output'], index)
+            if len(results) == 1 and type(results[0].get('exit_code')) is int:
+                shell_result(arguments['cmd'], results[0], index)
             elif len(results) != 1 or type(results[0].get('exit_code')) is not int:
                 shell(arguments['cmd'], '', index)
             continue
