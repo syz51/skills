@@ -7,15 +7,19 @@ from pathlib import Path
 import re
 import shlex
 
-SKILLS = ('frontend-ui', 'content-research-writer', 'find-skills', 'tauri')
+SKILLS = ('frontend-ui', 'content-research-writer', 'find-skills', 'tauri', 'typescript')
 SKILL_PATTERN = '|'.join(map(re.escape, SKILLS))
 PROTOCOL = 'codex-guidance-read/v1'
 MAX_BYTES = 6000
 
 
 def guidance_path(value):
-    match = re.search(r'(?:^|/)((?:' + SKILL_PATTERN + r')/(?:SKILL\.md|references/[\w./-]+\.(?:md|json)))$', value)
-    if not match or '..' in Path(match[1]).parts:
+    # Supporting text may be documentation, code, templates or metadata. Match
+    # literal components before Path can normalize traversal or empty segments.
+    # The skills/ owner boundary excludes compiler packages and project folders.
+    component = r'[\w-][\w.-]*'
+    match = re.search(r'(?:^|/)skills/((?:' + SKILL_PATTERN + r')/' + component + r'(?:/' + component + r')*)$', value)
+    if not match:
         raise ValueError('Expected a maintained skill or reference path')
     return match[1]
 
@@ -58,6 +62,8 @@ def read(path, start=0):
     if guidance_path(str(path.expanduser().resolve(strict=True))) != relative:
         raise ValueError('Guidance target differs from its requested path')
     content = path.expanduser().read_bytes().decode('utf-8')
+    if '\x00' in content:
+        raise ValueError('Guidance must be UTF-8 text without binary NUL bytes')
     if start < 0 or start > len(content) or (start == len(content) and start != 0):
         raise ValueError('Excerpt offset is outside the guidance text')
     excerpt = content[start:].encode('utf-8')[:MAX_BYTES].decode('utf-8', errors='ignore')
@@ -74,7 +80,7 @@ def observed(record, expected, turn):
     if record['protocol'] != PROTOCOL or (record['path'], record['start']) != expected:
         raise ValueError('Guidance envelope differs from its command')
     content, start, following = record['content'], record['start'], record['next_start']
-    if not isinstance(content, str) or len(content.encode('utf-8')) > MAX_BYTES or type(start) is not int or start < 0:
+    if not isinstance(content, str) or '\x00' in content or len(content.encode('utf-8')) > MAX_BYTES or type(start) is not int or start < 0:
         raise ValueError('Invalid guidance content or offset')
     if not content and (start or following is not None):
         raise ValueError('Empty partial guidance read')

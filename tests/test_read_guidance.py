@@ -16,7 +16,7 @@ class GuidanceReads(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / 'frontend-ui/references/guide.md'
+        self.path = Path(self.temp.name) / 'skills/frontend-ui/references/guide.md'
         self.path.parent.mkdir(parents=True)
 
     def command(self, start=0):
@@ -62,11 +62,56 @@ class GuidanceReads(unittest.TestCase):
     def test_every_maintained_skill_path_is_accepted_and_others_are_rejected(self):
         for skill in reader.SKILLS:
             with self.subTest(skill=skill):
-                self.assertEqual(reader.guidance_path('/installed/' + skill + '/SKILL.md'), skill + '/SKILL.md')
-                self.assertEqual(reader.guidance_path(skill + '/references/feedback.md'), skill + '/references/feedback.md')
+                self.assertEqual(reader.guidance_path('/installed/skills/' + skill + '/SKILL.md'), skill + '/SKILL.md')
+                self.assertEqual(reader.guidance_path('skills/' + skill + '/references/feedback.md'), skill + '/references/feedback.md')
         for path in ('/installed/other-skill/SKILL.md', '/installed/xfind-skills/SKILL.md', 'find-skills/references/../SKILL.md'):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 reader.guidance_path(path)
+
+    def test_typescript_supporting_text_reads_preserve_historical_evidence(self):
+        for relative in ('SKILL.md', 'references/tooling-and-public-types.md',
+                         'references/skill-map.md', 'references/nested/guide.md',
+                         'scripts/check.ts', 'assets/templates/example.html',
+                         'agents/openai.yaml', 'sources.json'):
+            with self.subTest(relative=relative):
+                path = Path(self.temp.name) / 'skills/typescript' / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = '# Historical text\n中文\n'
+                path.write_text(content)
+                envelope = reader.read(path)
+                command = 'uv run --script scripts/read_guidance.py ' + str(path)
+                path.write_text('Current text must not replace saved evidence.')
+                reads = capture.loaded_reads(command, json.dumps({'exit_code': 0, 'output': json.dumps(envelope)}), 'past-turn')
+                self.assertEqual(reads, [{'path': 'typescript/' + relative,
+                                         'sha256': hashlib.sha256(content.encode()).hexdigest(),
+                                         'coverage': 'complete', 'read_turn': 'past-turn'}])
+
+    def test_supporting_paths_and_binary_files_fail_closed(self):
+        for relative in ('references/../SKILL.md', 'scripts/./check.ts',
+                         'assets//template.html', '.private', 'scripts/.private',
+                         'scripts/check.ts;echo', '../SKILL.md'):
+            with self.subTest(relative=relative), self.assertRaises(ValueError):
+                reader.guidance_path('/installed/skills/typescript/' + relative)
+        path = Path(self.temp.name) / 'skills/typescript/assets/data.bin'
+        path.parent.mkdir(parents=True)
+        for data in (b'\xff\xfe', b'valid\x00binary'):
+            path.write_bytes(data)
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                reader.read(path)
+
+    def test_package_and_project_files_are_not_owned_skill_guidance(self):
+        for path in ('/project/node_modules/typescript/lib/typescript.js',
+                     '/project/node_modules/typescript/package.json',
+                     '/project/typescript/customer-notes.md',
+                     '/project/typescript/SKILL.md',
+                     'typescript/references/skill-map.md'):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    reader.guidance_path(path)
+                with self.assertRaises(ValueError):
+                    reader.request('uv run --script scripts/read_guidance.py ' + path)
+                with self.assertRaises(ValueError):
+                    reader.read(Path(path))
 
     def test_invalid_failed_ambiguous_and_truncated_envelopes_remain_unknown(self):
         self.path.write_text('# Guide\n')

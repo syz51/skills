@@ -1,0 +1,7 @@
+{
+  "enrolledAt": "2026-10-31",
+  "maintenance": "local",
+  "updatePolicy": "Locally authored TypeScript guidance synthesized from audited maintained skills. Evidence-supported evolution covers the complete skill tree: description, entrypoint, all nested references, owned supporting scripts, agent metadata, templates and assets. Preserve original source provenance and existing privacy, authorization and tool/runtime contracts; update provenance only through its reviewed policy. Use the shared feedback, review, validation and release workflow. Framework and SDK manuals remain with their maintained owners; no copied upstream snapshot is claimed.",
+  "upstreamReview": [],
+  "version": 1
+}

@@ -10,6 +10,7 @@ Agent skills and the tools used to improve them through feedback, source verific
 | [content-research-writer](skills/content-research-writer/SKILL.md) | Evidence-grounded research, drafting, editing, and review |
 | [find-skills](skills/find-skills/SKILL.md) | Discover skills when explicitly requested |
 | [tauri](skills/tauri/SKILL.md) | Tauri guidance alongside frontend-ui |
+| [typescript](skills/typescript/SKILL.md) | Shared TypeScript language, tooling, public-type checks, and integration references |
 
 ## Install skills
 
@@ -21,7 +22,7 @@ npx skills add syz51/skills
 
 You can also use `pnpm dlx skills add syz51/skills` or `bunx skills add syz51/skills`. If the CLI is already installed globally, run `skills add syz51/skills` directly.
 
-Choose the skills and agents you want in the installer. Alternatively, copy a selected `skills/<name>/` directory into your agent's skill discovery directory, preserving its references. Tauri also uses frontend-ui.
+Choose the skills and agents you want in the installer. Alternatively, copy a selected `skills/<name>/` directory into your agent's skill discovery directory, preserving its references. Tauri also uses frontend-ui; TypeScript work on frontends applies both typescript and frontend-ui.
 
 Installing skill files does not configure background jobs or start transcript capture. The optional guidance reader and feedback integration use the separate maintenance setup described below.
 

@@ -113,6 +113,67 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         self.assertTrue((previous / 'skills/frontend-ui/SKILL.md').is_file())
         self.assertEqual((self.args.feedback_dir / 'tauri/reviews/enrollment.md').read_bytes(), review.read_bytes())
 
+    def test_typescript_enrollment_and_supporting_file_evolution(self):
+        old_registry = tuple(skill for skill in sync.SKILLS if skill != 'typescript')
+        with patch.object(sync, 'SKILLS', old_registry):
+            self.release()
+            self.assertTrue(sync.deploy(self.args))
+        previous = (self.args.install_root / 'current').resolve()
+        previous_entrypoint = (previous / 'skills/frontend-ui/SKILL.md').read_bytes()
+        folder = self.repo / 'skills/typescript'
+        files = {
+            'SKILL.md': b'---\nname: typescript\ndescription: TypeScript guidance\n---\n# TypeScript\n',
+            'references/tooling-and-public-types.md': b'# Consumer checks\n',
+            'references/nested/coverage.md': b'# Check scope\n',
+            'scripts/check-types.py': b'print("check types")\n',
+            'assets/templates/consumer.ts': b'export const name: string = "fixture";\n',
+            'agents/openai.yaml': b'policy:\n  allow_implicit_invocation: true\n',
+        }
+        for name, content in files.items():
+            path = folder / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        review = self.repo / 'feedback/typescript/reviews/enrollment.md'
+        review.parent.mkdir(parents=True)
+        review.write_text('Reviewed the complete TypeScript skill tree.\n')
+        self.commit('Enroll TypeScript with supporting files')
+        self.assertTrue(sync.publish(self.args))
+        self.assertTrue(sync.deploy(self.args))
+        current = self.args.install_root / 'current'
+        enrolled = current.resolve()
+        self.assertNotEqual(enrolled, previous)
+        for name, content in files.items():
+            with self.subTest(enrollment=name):
+                self.assertEqual((current / 'skills/typescript' / name).read_bytes(), content)
+        self.assertEqual((previous / 'skills/frontend-ui/SKILL.md').read_bytes(), previous_entrypoint)
+        self.assertFalse((previous / 'skills/typescript').exists())
+        self.assertEqual((self.args.feedback_dir / 'typescript/reviews/enrollment.md').read_bytes(), review.read_bytes())
+
+        # References and owned code can evolve without changing the entrypoint,
+        # but still need the same per-skill review as an entrypoint edit.
+        updated = {
+            'references/nested/coverage.md': b'# Check scope\nVerify the affected consumer.\n',
+            'scripts/check-types.py': b'print("check the affected package")\n',
+        }
+        for name, content in updated.items():
+            (folder / name).write_bytes(content)
+        self.commit('Revise TypeScript reference and owned helper')
+        with self.assertRaisesRegex(sync.SyncError, 'review record'):
+            sync.publish(self.args)
+        self.assertEqual(current.resolve(), enrolled)
+        evolution_review = review.with_name('supporting-files.md')
+        evolution_review.write_text('Reviewed nested reference and authored helper changes.\n')
+        self.commit('Review TypeScript supporting-file changes')
+        self.assertTrue(sync.publish(self.args))
+        self.assertTrue(sync.deploy(self.args))
+        self.assertNotEqual(current.resolve(), enrolled)
+        for name, content in {**files, **updated}.items():
+            with self.subTest(evolution=name):
+                self.assertEqual((current / 'skills/typescript' / name).read_bytes(), content)
+        for name in updated:
+            self.assertEqual((enrolled / 'skills/typescript' / name).read_bytes(), files[name])
+        self.assertEqual((self.args.feedback_dir / 'typescript/reviews/supporting-files.md').read_bytes(), evolution_review.read_bytes())
+
     def test_deploy_propagates_prompt_bundle_and_refuses_installed_edits(self):
         self.release()
         self.prompt_release()

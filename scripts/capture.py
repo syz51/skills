@@ -20,12 +20,12 @@ import sys
 import tempfile
 import threading
 import time
-from read_guidance import SKILL_PATTERN, SKILLS, observed, request, shell_words
+from read_guidance import SKILL_PATTERN, SKILLS, guidance_path, observed, request, shell_words
 
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 # Distinctive headings that identify each loaded SKILL.md besides its frontmatter name.
-HEADINGS = {'frontend-ui': 'Frontend', 'content-research-writer': 'Content|Research', 'find-skills': 'Find Skills', 'tauri': 'Tauri'}
+HEADINGS = {'frontend-ui': 'Frontend', 'content-research-writer': 'Content|Research', 'find-skills': 'Find Skills', 'tauri': 'Tauri', 'typescript': 'TypeScript'}
 SINCE = '2026-10-09T14:45:00+00:00'
 # Claude Code records no turn-complete event; the newest finished reply waits this long for follow-on records.
 CLAUDE_QUIET = timedelta(minutes=15)
@@ -542,7 +542,7 @@ def creation_matches(raw, output, notes, recorded_at, tool_name='exec_command'):
 
 
 def loaded_reads(raw, output, turn):
-    if not re.search(r'(?:' + SKILL_PATTERN + r')/(?:SKILL\.md|references/)', raw):
+    if not re.search(r'(?:' + SKILL_PATTERN + r')/', raw):
         return []
     commands = literal_commands(raw)
     if not commands:
@@ -598,11 +598,14 @@ def loaded_reads(raw, output, turn):
         if (not (complete or partial) or result.get('exit_code') != 0
                 or words[-1].startswith('-')):
             continue
-        match = re.search(r'(?<![^/])(' + SKILL_PATTERN + r')/(SKILL\.md|references/[\w./-]+\.(?:md|json))$', words[-1])
-        content = result['output']
-        if not match or '..' in Path(match[2]).parts or re.search(r'(?i)(?:output.*truncated|tokens truncated|lines omitted)', content):
+        try:
+            path = guidance_path(words[-1])
+        except ValueError:
             continue
-        reads.append({'path': match[0], 'sha256': hashlib.sha256(content.encode()).hexdigest(),
+        content = result['output']
+        if '\x00' in content or re.search(r'(?i)(?:output.*truncated|tokens truncated|lines omitted)', content):
+            continue
+        reads.append({'path': path, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
                       'coverage': 'complete' if complete else 'partial', 'read_turn': turn})
     return reads
 
@@ -662,7 +665,7 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
                         arguments = payload.get('arguments', payload.get('input', ''))
                         raw = arguments if isinstance(arguments, str) else json.dumps(arguments)
                         name = payload.get('name', '')
-                        skills = [s for s in SKILLS if re.search(r'(?<![\w.-])' + re.escape(s) + r'/SKILL\.md\b', raw)]
+                        skills = [s for s in SKILLS if re.search(r'(?<![\w.-])skills/' + re.escape(s) + r'/SKILL\.md\b', raw)]
                         calls[payload.get('call_id')] = (skills, name, raw)
                         current['calls'].append({'name': name})
                     elif item_type in ('function_call_output', 'custom_tool_call_output'):
@@ -894,18 +897,22 @@ def claude_result(scan, record, results, source_notes):
         skill_read, created = False, []
         if name == 'Read' and not failed and isinstance(result, dict) and isinstance(result.get('file'), dict):
             read = result['file']
-            match = re.search(r'(?<![^/])(' + SKILL_PATTERN + r')/(SKILL\.md|references/[\w./-]+\.(?:md|json))$', str(read.get('filePath', '')))
-            if match and '..' not in Path(match[2]).parts and isinstance(read.get('content'), str):
+            try:
+                path = guidance_path(str(read.get('filePath', '')))
+            except ValueError:
+                path = None
+            if path and isinstance(read.get('content'), str) and '\x00' not in read['content']:
                 skill_read = True
                 complete = read.get('startLine') == 1 and read.get('numLines') == read.get('totalLines')
-                add_read(scan, {'path': match[0], 'sha256': hashlib.sha256(read['content'].encode()).hexdigest(),
+                add_read(scan, {'path': path, 'sha256': hashlib.sha256(read['content'].encode()).hexdigest(),
                                 'coverage': 'complete' if complete else 'partial', 'read_turn': current['turn']})
-                if match[2] == 'SKILL.md' and re.search(r'(?:name:\s*' + re.escape(match[1]) + r'\b|#\s*' + HEADINGS[match[1]] + ')', read['content'], re.I):
-                    scan['loaded'].add(match[1])
+                skill, relative = path.split('/', 1)
+                if relative == 'SKILL.md' and re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', read['content'], re.I):
+                    scan['loaded'].add(skill)
         elif name == 'Bash' and isinstance(arguments.get('command'), str):
             command = arguments['command']
             raw, envelope = json.dumps({'cmd': command}), json.dumps({'exit_code': 1 if failed else 0, 'output': output})
-            skills = [s for s in SKILLS if re.search(r'(?<![\w.-])' + re.escape(s) + r'/SKILL\.md\b', command)]
+            skills = [s for s in SKILLS if re.search(r'(?<![\w.-])skills/' + re.escape(s) + r'/SKILL\.md\b', command)]
             skill_read = bool(skills)
             if not failed and re.search(r'\b(?:cat|sed|read_text|read_guidance\.py)\b', command):
                 scan['loaded'].update(s for s in skills if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', output, re.I))
@@ -1021,13 +1028,13 @@ def extract(config, state_root, turn, existing, *, deadline=None):
     relevant = []
     for skill in turn['verified_skills']:
         matching = sorted((note for note in existing if note['skill'] == skill), key=lambda note: note.get('order', 0))
-        relevant.extend(matching[-max(1, 8 // len(turn['verified_skills'])):])
+        relevant.extend(matching[-max(2, 8 // len(turn['verified_skills'])):])
     existing = relevant
     compact = dict(turn)
     compact.update(message_context(turn.get('messages', [])))
     compact['calls'] = turn.get('calls', [])[-60:]
     compact['truncated'] |= len(compact['calls']) != len(turn.get('calls', []))
-    data = json.dumps({'turn': compact, 'existing_notes': existing[-8:]}, ensure_ascii=False)
+    data = json.dumps({'turn': compact, 'existing_notes': existing}, ensure_ascii=False)
     if len(data) > MAX_INPUT:
         compact.update(message_context(turn.get('messages', []), compact=True))
         compact['truncated'] = True

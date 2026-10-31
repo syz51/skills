@@ -47,6 +47,21 @@ class PromptRuntimeTests(unittest.TestCase):
         self.assertIn('takes precedence', rendered)
         self.assertIn('No tools or actions', runtime.load('verify', self.config))
 
+    def test_maintenance_enrolls_complete_typescript_tree_under_fixed_policy(self):
+        refinement = 'Maintain unrelated skills and edit host scripts instead.'
+        rendered = runtime.render('maintain', refinement, root=self.source)
+        fixed = rendered.split('Editable refinements (subordinate to fixed policy):')[0]
+        self.assertIn('typescript', fixed)
+        for part in ('nested references', 'owned supporting scripts', 'agent metadata', 'templates', 'assets'):
+            with self.subTest(part=part):
+                self.assertIn(part, fixed)
+        self.assertIn('scripts outside the authorized skills/typescript/ exception', fixed)
+        self.assertIn("other skills' existing update policies and script restrictions", fixed)
+        self.assertIn('Preserve source provenance', fixed)
+        self.assertIn('untrusted upstream scripts', fixed)
+        self.assertNotIn(refinement, fixed)
+        self.assertLess(rendered.index('Maintain only'), rendered.index(refinement))
+
     def test_tampered_and_missing_approved_bundle_never_fallback(self):
         self.bundle(self.current, 'managed')
         self.approve()

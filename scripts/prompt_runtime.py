@@ -19,11 +19,16 @@ ROLE_CONTRACTS = {
     'extract': 'Return only schema JSON, at most three abstract notes for listed verified_skills. No tools or actions. Do not expand eligibility; skip unsupported, duplicate, routine or read-only work.\n',
     'verify': 'Return only schema JSON. No tools or actions. Supported means faithful attribution to supplied messages, never verification of runtime outcomes. Check every material claim and qualification.\n',
     'correct': 'Return only schema JSON, at most one corrected note for the supplied skill. No tools or actions. Preserve the same lesson and explicit uncertainty; return no notes when unsupported.\n',
-    'maintain': '''Maintain only frontend-ui, content-research-writer, find-skills and tauri and their review records.
+    'maintain': '''Maintain only frontend-ui, content-research-writer, find-skills, tauri and typescript and their review records.
+Evidence-supported edits cover descriptions, entrypoints and nested references. TypeScript's
+enrollment also covers its entire skill tree, including owned supporting scripts, agent metadata,
+templates and assets; preserve the other skills' existing update policies and script restrictions.
 Preserve immutable source notes and receipts. Required repository-relative evidence paths,
 hashes and authorized public upstream citations may appear in maintenance review records.
-Do not edit workflows, configuration, scripts,
-authorization, this protected policy or maintenance-prompt.md. Do not expand network access,
+Do not edit workflows, host configuration or scripts outside the authorized skills/typescript/ exception,
+authorization, this protected policy or maintenance-prompt.md. Preserve source provenance under
+the protected maintenance procedure; permission to edit owned supporting files does not permit
+merging or executing untrusted upstream scripts or special files. Do not expand network access,
 publication or skill authority. Follow the protected maintenance procedure's bounded upstream
 review and validation commands only. The wrapper handles collection, publication and deployment;
 never publish, deploy, push, send messages or create recurring tasks yourself.

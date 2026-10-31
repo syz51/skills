@@ -224,9 +224,56 @@ class ClaudeCaptureTests(unittest.TestCase):
     def test_shell_reads_load_skills_but_only_reader_envelopes_are_hashed(self):
         [turn] = self.scan(ClaudeTranscript().prompt('Find').tool('Bash', {'command': 'cat /x/skills/find-skills/SKILL.md'}, SKILL_FILE.rstrip('\n')).reply('Done.'))
         self.assertEqual((turn['verified_skills'], turn['loaded_reads']), (['find-skills'], []))
+
+    def test_typescript_native_read_tracks_all_text_supporting_parts(self):
+        root = '---\nname: typescript\n---\n# TypeScript\n'
+        transcript = ClaudeTranscript().prompt('Implement the typed parser')
+        paths = [('SKILL.md', root), ('references/skill-map.md', '# Map\n'),
+                 ('references/tooling-and-public-types.md', '# Public types\n'),
+                 ('scripts/check.ts', 'export const check = true;\n'),
+                 ('assets/templates/example.html', '<main>Example</main>\n')]
+        for index, (relative, content) in enumerate(paths):
+            path = '/x/.codex/skills/typescript/' + relative
+            result = {'file': {'filePath': path, 'content': content, 'startLine': 1, 'numLines': 1, 'totalLines': 1}}
+            transcript.tool('Read', {'file_path': path}, content, result=result, use='read-' + str(index))
+        [turn] = self.scan(transcript.reply('Implemented and checked.'))
+        self.assertEqual(turn['verified_skills'], ['typescript'])
+        self.assertEqual([item['path'] for item in turn['loaded_reads']], ['typescript/' + relative for relative, _ in paths])
+        self.assertEqual([item['sha256'] for item in turn['loaded_reads']],
+                         [hashlib.sha256(content.encode()).hexdigest() for _, content in paths])
+
+    def test_typescript_package_and_project_native_reads_are_not_skill_evidence(self):
+        for path in ('/project/node_modules/typescript/lib/typescript.js',
+                     '/project/node_modules/typescript/package.json',
+                     '/project/typescript/customer-notes.md', '/project/typescript/SKILL.md'):
+            with self.subTest(path=path):
+                transcript = ClaudeTranscript().prompt('Implement the typed parser').skill()
+                content = '# TypeScript\n'
+                result = {'file': {'filePath': path, 'content': content, 'startLine': 1, 'numLines': 1, 'totalLines': 1}}
+                transcript.tool('Read', {'file_path': path}, content, result=result, use='not-a-skill')
+                [turn] = self.scan(transcript.reply('Implemented.'))
+                self.assertEqual(turn['verified_skills'], ['find-skills'])
+                self.assertEqual([r['path'] for r in turn['loaded_reads']], ['find-skills/SKILL.md'])
+
+    def test_relative_typescript_bash_cat_and_helper_are_eligible(self):
+        content = '---\nname: typescript\n---\n# TypeScript\n'
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        envelope = {'protocol': read_guidance.PROTOCOL, 'path': 'typescript/SKILL.md', 'start': 0,
+                    'next_start': None, 'coverage': 'complete', 'sha256': digest, 'content': content}
+        for command, output, hashed in (
+                ('cat skills/typescript/SKILL.md', content, False),
+                ('uv run --script scripts/read_guidance.py skills/typescript/SKILL.md', json.dumps(envelope), True)):
+            with self.subTest(command=command):
+                transcript = ClaudeTranscript().prompt('Implement the typed parser').tool('Bash', {'command': command}, output)
+                [turn] = self.scan(transcript.reply('Implemented.'))
+                self.assertEqual(turn['verified_skills'], ['typescript'])
+                self.assertEqual(turn['loaded_reads'], [{'path': 'typescript/SKILL.md', 'sha256': digest,
+                                                       'coverage': 'complete', 'read_turn': 'prompt-1'}] if hashed else [])
+
+    def test_shell_reader_envelopes_require_complete_unwrapped_results(self):
         failed = ClaudeTranscript().prompt('Find').tool('Bash', {'command': 'cat /x/skills/find-skills/SKILL.md'}, 'No such file', error=True)
         self.assertEqual(self.scan(failed.reply('Done.')), [])
-        guide = self.root / 'installed/find-skills/SKILL.md'
+        guide = self.root / 'installed/skills/find-skills/SKILL.md'
         guide.parent.mkdir(parents=True)
         guide.write_text(SKILL_FILE)
         command = 'uv run --script scripts/read_guidance.py ' + str(guide)
@@ -257,7 +304,7 @@ class ClaudeCaptureTests(unittest.TestCase):
         codex = [{'type': 'session_meta', 'payload': {'id': 'codex-session', 'source': 'desktop'}},
                  {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'codex-turn'}},
                  {'type': 'event_msg', 'payload': {'type': 'user_message', 'message': 'Build a page'}},
-                 {'type': 'response_item', 'payload': {'type': 'function_call', 'call_id': 'r', 'name': 'exec_command', 'arguments': 'cat /s/frontend-ui/SKILL.md'}},
+                 {'type': 'response_item', 'payload': {'type': 'function_call', 'call_id': 'r', 'name': 'exec_command', 'arguments': 'cat /s/skills/frontend-ui/SKILL.md'}},
                  {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'r', 'output': 'Exit code: 0\n# Frontend UI\n'}},
                  {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': 'codex-turn'}, 'timestamp': '2026-10-16T02:00:00Z'}]
         (sessions / 'rollout.jsonl').write_text(''.join(json.dumps(record) + '\n' for record in codex))

@@ -178,7 +178,7 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(json.loads(state_path.read_text()), state)
 
     def test_every_maintained_skill_is_recognized_by_name_or_heading(self):
-        for skill, heading in (('find-skills', '# Find Skills'), ('content-research-writer', '# Content Research Writer'), ('tauri', '# Tauri')):
+        for skill, heading in (('find-skills', '# Find Skills'), ('content-research-writer', '# Content Research Writer'), ('tauri', '# Tauri'), ('typescript', '# TypeScript')):
             for output in ('---\nname: ' + skill + '\n---\n', heading + '\n'):
                 with self.subTest(skill=skill, output=output):
                     text = self.transcript().replace('/skills/frontend-ui/SKILL.md', '/skills/' + skill + '/SKILL.md')
@@ -219,6 +219,49 @@ class CaptureTests(unittest.TestCase):
         text = self.transcript().replace('Exit code: 0', 'Exit code: 1')
         self.rollout(text)
         self.assertEqual(self.scan(), [])
+
+    def test_supporting_code_and_asset_shell_reads_have_exact_fingerprints(self):
+        for relative in ('scripts/check.ts', 'assets/templates/example.html', 'agents/openai.yaml'):
+            with self.subTest(relative=relative):
+                content = 'Historical supporting text\n'
+                result = json.dumps({'exit_code': 0, 'output': content})
+                self.assertEqual(capture.loaded_reads('cat /skills/typescript/' + relative, result, 'turn'),
+                                 [{'path': 'typescript/' + relative, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
+                                   'coverage': 'complete', 'read_turn': 'turn'}])
+        result = json.dumps({'exit_code': 0, 'output': 'data\x00binary'})
+        self.assertEqual(capture.loaded_reads('cat /skills/typescript/assets/data.bin', result, 'turn'), [])
+
+    def test_typescript_package_or_project_reads_are_not_skill_evidence(self):
+        result = json.dumps({'exit_code': 0, 'output': '# TypeScript\n'})
+        for path in ('/project/node_modules/typescript/lib/typescript.js',
+                     '/project/node_modules/typescript/package.json',
+                     '/project/typescript/customer-notes.md', '/project/typescript/SKILL.md'):
+            with self.subTest(path=path):
+                self.assertEqual(capture.loaded_reads('cat ' + path, result, 'turn'), [])
+                text = self.transcript().replace('/skills/frontend-ui/SKILL.md', path)
+                self.rollout(text.replace(json.dumps('# Frontend UI\n')[1:-1], json.dumps('# TypeScript\n')[1:-1]))
+                self.assertEqual(self.scan(), [])
+
+    def test_relative_typescript_entrypoint_cat_and_helper_are_eligible(self):
+        content = '---\nname: typescript\n---\n# TypeScript\n'
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        envelope = {'protocol': read_guidance.PROTOCOL, 'path': 'typescript/SKILL.md', 'start': 0,
+                    'next_start': None, 'coverage': 'complete', 'sha256': digest, 'content': content}
+        for command, output in (
+                ('cat skills/typescript/SKILL.md', content),
+                ('uv run --script scripts/read_guidance.py skills/typescript/SKILL.md', json.dumps(envelope))):
+            for arguments in (command, json.dumps({'cmd': command})):
+                with self.subTest(command=command, arguments=arguments):
+                    text = self.record('event_msg', {'type': 'task_started', 'turn_id': 'relative'})
+                    text += self.record('event_msg', {'type': 'user_message', 'message': 'Implement the typed parser'})
+                    text += self.record('response_item', {'type': 'function_call', 'call_id': 'r', 'name': 'exec_command', 'arguments': arguments})
+                    text += self.record('response_item', {'type': 'function_call_output', 'call_id': 'r', 'output': json.dumps({'exit_code': 0, 'output': output})})
+                    text += self.record('event_msg', {'type': 'task_complete', 'turn_id': 'relative'})
+                    self.rollout(text)
+                    [turn] = self.scan()
+                    self.assertEqual(turn['verified_skills'], ['typescript'])
+                    self.assertEqual(turn['loaded_reads'], [{'path': 'typescript/SKILL.md', 'sha256': digest,
+                                                            'coverage': 'complete', 'read_turn': 'relative'}])
 
     def test_hashes_observed_skill_and_reference_reads_across_turns(self):
         skill = '---\nname: frontend-ui\n---\n# Frontend and UI\nActual historical policy.\n'
@@ -636,6 +679,16 @@ class CaptureTests(unittest.TestCase):
             return Result()
         with patch.object(capture, 'MAX_INPUT', 20000 + 2000 * len(capture.SKILLS)), patch.object(capture, 'run_extractor', side_effect=run):
             self.assertEqual(capture.extract(self.config, self.state, turn, existing), [])
+
+    def test_multi_skill_context_does_not_drop_the_first_enrolled_skill(self):
+        turn = {'verified_skills': list(capture.SKILLS), 'calls': [], 'messages': []}
+        existing = [{'skill': skill, 'text': 'Relevant history', 'order': index}
+                    for skill in capture.SKILLS for index in range(4)]
+        with patch.object(capture, 'model_response', return_value={'notes': []}) as model:
+            self.assertEqual(capture.extract(self.config, self.state, turn, existing), [])
+        notes = json.loads(model.call_args.args[3])['existing_notes']
+        self.assertEqual({note['skill'] for note in notes}, set(capture.SKILLS))
+        self.assertTrue(all(sum(n['skill'] == skill for n in notes) >= 2 for skill in capture.SKILLS))
 
     def test_nonfatal_error_metadata_does_not_imply_tool_execution(self):
         self.state.mkdir()
