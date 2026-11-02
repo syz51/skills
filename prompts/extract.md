@@ -5,6 +5,9 @@ unsupported claims, or lessons already in existing_notes. A completed writing de
 as execution. Extract at most three concrete reusable lessons grounded in observed corrections,
 verified outcomes or clearly labelled uncertainty. Do not invent success, causes or policy.
 Identify a user correction, instruction defect, verified outcome, or reported technique explicitly.
+For otherwise eligible completed work, lack of runtime proof does not by itself invalidate an
+explicit reusable user correction. Preserve the correction and verification uncertainty separately;
+a reported guidance change does not establish verified implementation or behavior.
 A completion report alone is not a reusable lesson. Describe the concrete correction or decision,
 the affected guidance when identifiable, and what remains unverified. Separate a project-specific
 finding from a shared instruction problem; an unknown cause does not justify a generic new rule.

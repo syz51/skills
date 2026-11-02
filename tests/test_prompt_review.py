@@ -92,7 +92,8 @@ class PromptReviewTests(unittest.TestCase):
         result = self.run_review()
         self.assertEqual(result['outcome'], 'no_change')
         self.assertTrue(all(all(v) for v in result['baseline'].values()))
-        self.assertEqual(len(self.calls), 7)
+        visible = [c for c in review.load_cases(self.repo) if c['role'] == 'extract']
+        self.assertEqual(len(self.calls), 2 * len(visible) + 1)  # Two runs per case and one independent grade.
         self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
         self.assertFalse((self.repo / 'prompt-reviews').exists())
 
