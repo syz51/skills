@@ -31,6 +31,8 @@ uv run --no-project python scripts/skill_evals.py run --suite all --output-dir "
 
 Live evaluation needs an authenticated Codex CLI and uses account quota. It inherits the configured model unless the caller supplies `--model`. The runner requires ephemeral sessions, JSONL traces and a read-only sandbox. Prompts prohibit editing, dependency installation, browsing, project commands, delegation and account actions. The runner checks fixture and skill-source immutability, bounds concurrency and time, and terminates timed-out process groups.
 
+These self-contained evaluations request literal single-file project inspection rather than content searches, whose directory and execution scope the trace format may not establish. Filename listing remains allowed. This bounds negative read evidence; it is an evaluation protocol, not a restriction on ordinary project work. Unsupported or computed reads remain unverified rather than being treated as safe.
+
 Installed mode tests the six maintained skills in the user's existing discovery directories and instruction configuration. Cases without a skill name exercise that complete configuration, including AGENTS.md dispatch; they do not isolate metadata-only selection. Public users need to configure the same dispatch behavior they intend to verify. No user configuration is changed.
 
 To evaluate a candidate skill tree, add `--skills-root skills`. Candidate mode creates temporary project discovery links and project-local Rust/TypeScript/frontend dispatch pointing to that tree. Results identify this configuration separately from installed mode.

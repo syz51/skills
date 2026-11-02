@@ -77,6 +77,107 @@ class ActivationTraceTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self.assertFalse(self.score(trace(command(prefix + ' && cat ' + TS, CONTENT)))['passed'])
 
+    def test_literal_project_inspection_sequences_preserve_absence_and_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'src').mkdir()
+            (root / 'Cargo.toml').write_text('[package]\nname="fixture"\n')
+            (root / 'src/lib.rs').write_text('pub fn value() -> u8 { 1 }\n')
+            scripts = (
+                'cat Cargo.toml\nnl -ba src/lib.rs',
+                '/bin/cat Cargo.toml && /usr/bin/nl -ba src/lib.rs',
+                'cat Cargo.toml; nl -ba src/lib.rs',
+            )
+            first, last = command('cat ' + UI, UI_CONTENT), command('cat ' + TS)
+            for source in scripts:
+                # Execute authored fixture inspections, never a saved transcript.
+                actual = subprocess.run(['/bin/sh', '-c', source], cwd=root,
+                                        text=True, capture_output=True, check=True)
+                for cmd in (source, '/bin/zsh -lc ' + shlex.quote(source)):
+                    with self.subTest(command=cmd):
+                        inspection = command(cmd, actual.stdout)
+                        negative = self.score(trace(inspection), (), ('typescript',))
+                        self.assertTrue(negative['passed'], negative)
+                        self.assertEqual(negative['reads'], [])
+                        ordered = self.score(trace(inspection, first, last),
+                            ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))
+                        self.assertTrue(ordered['passed'], ordered)
+            inventory = "pwd\nrg --files --hidden -g '!target' -g '!.git'"
+            value = self.score(trace(command('/bin/zsh -lc ' + shlex.quote(inventory),
+                                            '/fixture\nCargo.toml\nsrc/lib.rs\n')), (), ('typescript',))
+            self.assertTrue(value['passed'], value)
+
+    def test_bounded_inspection_sequences_still_constrain_real_guidance_reads(self):
+        for reader in ('cat ' + TS, 'nl -ba ' + TS,
+                       "cat /fixture/skills/type'script'/SKILL.md"):
+            for exit_code in (0, 1):
+                with self.subTest(reader=reader, exit_code=exit_code):
+                    inspection = command('cat Cargo.toml\n' + reader, CONTENT[:20], exit_code)
+                    required = self.score(trace(inspection))
+                    self.assertFalse(required['passed'], required)
+                    self.assertEqual(required['reads'], [])
+                    negative = self.score(trace(inspection), (), ('typescript',))
+                    self.assertFalse(negative['passed'], negative)
+                    # A known literal read of one target does not make every
+                    # other target uncertain merely because it is in a batch.
+                    unrelated = self.score(trace(inspection), (), ('frontend-ui',))
+                    self.assertTrue(unrelated['passed'], unrelated)
+                    first, last = command('cat ' + UI, UI_CONTENT), command('cat ' + TS)
+                    self.assertFalse(self.score(trace(inspection, first, last),
+                        ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+                    self.assertTrue(self.score(trace(first, inspection, last),
+                        ('frontend-ui', 'typescript'), before=(('frontend-ui', 'typescript'),))['passed'])
+
+    def test_unsupported_inspection_sequences_cannot_establish_absence(self):
+        for suffix in ('python3 -c "read_unknown()"', 'custom-reader /fixture/README.md',
+                       '/scratch/cat /fixture/README.md', 'cat "$p"',
+                       'cat "$(computed_path)"', 'cat /fixture/skills/type*/SKILL.md',
+                       'cat ../skills/typescript/SKILL.md', 'cat /fixture/{a,b}',
+                       'rg pattern .', 'rg pattern Cargo.lock',
+                       'rg --files --pre malicious .', 'nl -ba src/lib.rs || hidden-read',
+                       'cat < /fixture/README.md', 'cat /fixture/README.md | hidden-read',
+                       'PATH=/scratch cat /fixture/README.md'):
+            for exit_code, output in ((0, ''), (1, 'an error or partial output')):
+                with self.subTest(suffix=suffix, exit_code=exit_code):
+                    cmd = '/bin/zsh -lc ' + shlex.quote('cat Cargo.toml\n' + suffix)
+                    value = self.score(trace(command(cmd, output, exit_code)), (), ('typescript',))
+                    self.assertFalse(value['passed'], value)
+                    self.assertEqual(value['reads'], [])
+
+    def test_quoted_operators_do_not_disguise_reader_operands_as_inventory(self):
+        for source in ('cat Cargo.toml "&&" pwd "&&" rg --files ' + TS,
+                       "cat Cargo.toml ';' pwd ';' rg --files " + TS,
+                       'cat Cargo.toml "\n" pwd "\n" rg --files ' + TS):
+            for exit_code in (0, 1):
+                with self.subTest(source=source, exit_code=exit_code):
+                    item = command('/bin/zsh -lc ' + shlex.quote(source), CONTENT[:20], exit_code)
+                    value = self.score(trace(item), (), ('typescript',))
+                    self.assertFalse(value['passed'], value)
+                    self.assertEqual(value['reads'], [])
+        copied = command('cat Cargo.toml\nnl -ba src/lib.rs', CONTENT)
+        self.assertFalse(self.score(trace(copied), (), ('typescript',))['passed'])
+        self.assertEqual(self.score(trace(copied))['reads'], [])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'Cargo.toml').write_text('[package]\nname="fixture"\n')
+            skill = root / 'skills/typescript/SKILL.md'
+            skill.parent.mkdir(parents=True)
+            skill.write_text(CONTENT)
+            targets = {'typescript': {'path': str(skill), 'content': CONTENT}}
+            for operator in (';', '&&'):
+                # These are literal cat operands, not shell operators. cat
+                # still reads the final guide after reporting missing files.
+                argv = ['cat', '-n', 'Cargo.toml', operator, 'ls', str(skill)]
+                actual = subprocess.run(argv, cwd=root, text=True, capture_output=True)
+                self.assertNotEqual(actual.returncode, 0)
+                self.assertIn('Unknown inputs:', actual.stdout)
+                self.assertNotIn(CONTENT, actual.stdout)
+                cmd = '/bin/zsh -lc ' + shlex.quote(shlex.join(argv))
+                value = score_trace(trace(command(cmd, actual.stdout + actual.stderr, actual.returncode)),
+                                    targets, (), ('typescript',))
+                self.assertFalse(value['passed'], value)
+                self.assertEqual(value['reads'], [])
+
     def test_quoted_unicode_paths_and_explicit_aliases(self):
         alias = '/archived/skills/类型 script/SKILL.md'
         self.targets['typescript']['aliases'] = [alias]

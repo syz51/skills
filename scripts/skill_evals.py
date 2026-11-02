@@ -38,6 +38,9 @@ reads with complete visible output. Do not change permissions, install tools or
 claim loading from a failed read. Do not combine guidance reads
 with project-file reads or inventory commands. Preserve the configured skill
 selection and frontend-before-language order; loading is not runtime proof.
+For project-file inspection in this bounded evaluation, use literal single-file
+reads rather than content searches; filename listing is allowed. This keeps
+negative read-scope evidence attributable and does not constrain ordinary work.
 '''
 
 

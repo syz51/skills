@@ -141,6 +141,75 @@ def _prefixed_read(command):
     return commands[-1]
 
 
+def _inspection_reads(command):
+    """Bound possible reads in a literal inspection sequence, never loading.
+
+    Newlines, semicolons and && may join standard inventory, cat and nl
+    commands. No command changes shell state or interprets source. Keeping
+    this grammar narrow lets disjoint project inspections establish absence
+    without treating arbitrary compound programs as understood.
+    """
+    source = _shell_source(command)
+    if any(char in source for char in '$`#'):
+        return None
+    # Split source before decoding argv: shlex's POSIX tokenization removes
+    # the distinction between a real && operator and a quoted "&&" filename.
+    groups, start, index, quote = [], 0, 0, None
+    while index < len(source):
+        char = source[index]
+        if char == '\\' and quote != "'":
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char in '|()<>':
+            return None
+        elif char in ';&\n':
+            width = 2 if source[index:index + 2] == '&&' else 1
+            if char == '&' and width != 2:
+                return None
+            part = source[start:index].strip()
+            if not part:
+                return None
+            groups.append(shlex.split(part))
+            start = index + width
+            index += width
+            continue
+        index += 1
+    if quote or source.rstrip().endswith('&&'):
+        return None
+    if source[start:].strip():
+        groups.append(shlex.split(source[start:]))
+    if not groups:
+        return None
+    operands = []
+    for words in groups:
+        if _listing_prefix(words):
+            continue
+        name = _utility_name(words[0])
+        if name not in ('cat', 'nl'):
+            return None
+        index = 1
+        while index < len(words) and words[index].startswith('-'):
+            option = words[index]
+            index += 1
+            if option == '--':
+                break
+            if not ((name == 'cat' and re.fullmatch(r'-[AbEenstTuv]+', option))
+                    or (name == 'nl' and option in ('-ba', '-bt', '-bn'))):
+                return None
+        files = words[index:]
+        if not files or any(not re.fullmatch(r'[\w ./,:@%+=-]+', path)
+                            or path == '-' or any(part in ('.', '..') for part in path.split('/'))
+                            for path in files):
+            return None
+        operands.extend(files)
+    return operands
+
+
 def _tool_text(result, include_error=False):
     if not isinstance(result, dict) or (result.get('isError') and not include_error):
         return None
@@ -743,11 +812,13 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
         try:
             if _shell_substitution(command):
                 mark_uncertain(known, index)
-            operands, complex_program, inert, opaque_program = _shell_attempts(command)
-            if opaque_program:
-                mark_uncertain(known, index)
-            if complex_program and not inert and _prefixed_read(command) is None:
-                mark_uncertain(known, index)
+            operands = _inspection_reads(command)
+            if operands is None:
+                operands, complex_program, inert, opaque_program = _shell_attempts(command)
+                if opaque_program:
+                    mark_uncertain(known, index)
+                if complex_program and not inert and _prefixed_read(command) is None:
+                    mark_uncertain(known, index)
         except ValueError:
             mark_uncertain(known, index)
             return
