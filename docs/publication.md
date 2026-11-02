@@ -64,6 +64,6 @@ The Rust configuration retains the existing schema-1 inventory and state paths. 
 
 Merge those fields into your reviewed configuration; this fragment is not a complete inventory. The Codex executable must resolve to an absolute existing file after expanding `~`, and the explicit auth home must already contain valid authentication. Generation uses an isolated authentication context, not that home's instructions or plugins. Expired authentication stops publication; authenticate the configured source home with the normal Codex CLI and retry. No generic message is substituted. `plan`, unchanged publication, and a satisfied daily deadline do not call the model.
 
-## Weekly investigation boundary
+## Daily investigation boundary
 
-Private weekly publication follows isolated review and a machine-readable investigation gate. All six owned skill trees may change, including first-party fixtures; source identities, root policy and immutable notes/receipts remain protected. Sanitized investigation events are append-only private evidence and are excluded from this public export. New public fixture and tool files still require explicit inventory enrollment. Reverting guidance means a reviewed forward commit, never a force push or history rewrite.
+Private daily publication follows isolated review and a machine-readable investigation gate. All six owned skill trees may change, including first-party fixtures; source identities, root policy and immutable notes/receipts remain protected. Sanitized investigation events are append-only private evidence and are excluded from this public export. New public fixture and tool files still require explicit inventory enrollment. Reverting guidance means a reviewed forward commit, never a force push or history rewrite.

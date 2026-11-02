@@ -87,11 +87,23 @@ def due_key(value=None):
             local = date.fromisoformat(raw)
         else:
             return due_key(datetime.fromisoformat(raw.replace('Z', '+00:00')))
-    return (local - timedelta(days=local.weekday())).strftime('%Y-%m-%d')
+    if isinstance(local, datetime):
+        deadline = local.replace(hour=9, minute=0, second=0, microsecond=0)
+        if local < deadline:
+            local -= timedelta(days=1)
+    return local.strftime('%Y-%m-%d')
 
 
 def target_role(due):
-    return ROLES[((date.fromisoformat(due) - date(2026, 1, 5)).days // 7) % len(ROLES)]
+    day = date.fromisoformat(due)
+    # Keep historical weekly targets and the migration day's target intact.
+    # Subsequent daily reviews rotate one role per day, within the same budget.
+    transition = date(2026, 11, 2)
+    if day < transition:
+        index = (day - date(2026, 1, 5)).days // 7
+    else:
+        index = (transition - date(2026, 1, 5)).days // 7 + (day - transition).days
+    return ROLES[index % len(ROLES)]
 
 
 def validate_case(case):

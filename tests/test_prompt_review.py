@@ -683,9 +683,38 @@ class PromptReviewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             review.published_record(self.repo, self.due, 'extract')
 
-    def test_due_is_tokyo_monday(self):
-        self.assertEqual(review.due_key('2026-10-25T16:00:00+00:00'), '2026-10-26')
-        self.assertEqual(review.due_key('2026-10-28'), '2026-10-26')
+    def test_due_tracks_daily_tokyo_deadline_and_explicit_date(self):
+        self.assertEqual(review.due_key('2026-11-02T23:59:59Z'), '2026-11-02')
+        self.assertEqual(review.due_key('2026-11-03T00:00:00Z'), '2026-11-03')
+        self.assertEqual(review.due_key('2026-11-07T12:00:00+09:00'), '2026-11-07')
+        self.assertEqual(review.due_key('2026-10-28'), '2026-10-28')
+        with self.assertRaises(ValueError):
+            review.due_key('2026-11-03T09:00:00')
+        with self.assertRaises(ValueError):
+            review.due_key('2026-02-30')
+
+    def test_daily_rotation_preserves_historical_and_migration_targets(self):
+        self.assertEqual(review.target_role('2026-10-26'), review.ROLES[42 % len(review.ROLES)])
+        self.assertEqual(review.target_role('2026-11-02'), review.ROLES[43 % len(review.ROLES)])
+        roles = [review.target_role('2026-11-' + str(n).zfill(2)) for n in range(3, 7)]
+        self.assertEqual(len(set(roles)), len(review.ROLES))
+        self.assertEqual(review.target_role('2026-11-07'), review.target_role('2026-11-03'))
+
+    def test_saved_weekly_completion_suppresses_today_but_not_next_day(self):
+        saved = {'completed_due': '2026-11-02', 'result': {'outcome': 'no_change'}}
+        path = self.state / 'prompt-review-state.json'
+        path.write_text(json.dumps(saved))
+        with patch.object(review, 'review', return_value={'outcome': 'no_change'}) as work:
+            result = review.run(self.config, self.state, due='2026-11-02T09:00:00+09:00')
+            self.assertEqual(result['outcome'], 'already_reviewed')
+            work.assert_not_called()
+            review.run(self.config, self.state, due='2026-11-03T09:00:00+09:00')
+            work.assert_called_once()
+            self.assertEqual(work.call_args.args[4], review.target_role('2026-11-03'))
+            self.assertEqual(json.loads(path.read_text())['completed_due'], '2026-11-03')
+            review.run(self.config, self.state, due='2026-11-03T23:00:00+09:00')
+            work.assert_called_once()
+
 
     def test_regression_growth_cannot_exceed_evaluation_budget(self):
         case = next(c for c in review.load_cases(self.repo) if c['role'] == 'extract')

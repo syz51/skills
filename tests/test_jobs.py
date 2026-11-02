@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 from datetime import datetime, timezone
 import fcntl
 import importlib.util
@@ -18,6 +20,35 @@ sys.path.insert(0, str(scripts))
 spec = importlib.util.spec_from_file_location('jobs', scripts / 'jobs.py')
 jobs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(jobs)
+
+
+class DailyCadenceTests(unittest.TestCase):
+    def test_daily_deadline_boundaries_and_timezone(self):
+        cases = (
+            ('2026-11-03T08:59:59+09:00', '2026-11-02T09:00:00+09:00'),
+            ('2026-11-03T09:00:00+09:00', '2026-11-03T09:00:00+09:00'),
+            ('2026-11-03T23:59:59+09:00', '2026-11-03T09:00:00+09:00'),
+            ('2026-11-07T13:00:00+09:00', '2026-11-07T09:00:00+09:00'),
+            ('2027-01-01T08:00:00+09:00', '2026-12-31T09:00:00+09:00'),
+            ('2026-11-02T19:00:00-05:00', '2026-11-03T09:00:00+09:00'),
+        )
+        for now, expected in cases:
+            with self.subTest(now=now):
+                self.assertEqual(jobs.latest_due(datetime.fromisoformat(now)).isoformat(), expected)
+
+    def test_existing_weekly_state_suppresses_today_then_allows_tomorrow(self):
+        state = {'setup_started_at': '2026-10-09T14:26:04.220935+00:00',
+                 'completed_due': '2026-11-02T09:00:00+09:00'}
+        original = dict(state)
+        for now, expected in (('2026-11-02T15:00:00+09:00', False),
+                              ('2026-11-03T08:59:59+09:00', False),
+                              ('2026-11-03T09:00:00+09:00', True),
+                              ('2026-11-08T12:00:00+09:00', True)):
+            with self.subTest(now=now):
+                self.assertEqual(jobs.weekly_due(datetime.fromisoformat(now), state), expected)
+        self.assertEqual(state, original)
+        state['setup_started_at'] = '2026-11-03T10:00:00+09:00'
+        self.assertFalse(jobs.weekly_due(datetime.fromisoformat('2026-11-03T12:00:00+09:00'), state))
 
 
 class JobsTests(unittest.TestCase):
@@ -145,7 +176,7 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
         def improve(config, state_root, **kwargs):
             self.assertEqual(self.trace.read_text().splitlines()[-1], 'deploy')
             self.assertEqual(state_root, self.state.resolve())
-            self.assertEqual(kwargs['due'], '2026-10-12T09:00:00+09:00')
+            self.assertEqual(kwargs['due'], '2026-10-13T09:00:00+09:00')
             self.assertGreater(kwargs['timeout'], 0)
             self.assertLessEqual(kwargs['timeout'], 900)
             return {'outcome': 'no_change'}
@@ -263,11 +294,28 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
                 patch.object(jobs, 'review_prompts', side_effect=improve):
             self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 13, 3, tzinfo=timezone.utc)), 0)
 
-    def test_first_run_does_not_catch_up_previous_week(self):
+    def test_daily_check_keeps_legacy_state_and_reports_next_day_without_work(self):
+        self.initialize()
+        saved = {'setup_started_at': '2026-10-09T14:26:04.220935+00:00',
+                 'completed_due': '2026-11-02T09:00:00+09:00'}
+        path = self.state / 'weekly-state.json'
+        path.write_text(json.dumps(saved))
+        before = path.read_bytes()
+        self.args.check = True
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(jobs.execute(self.args, datetime.fromisoformat('2026-11-02T15:00:00+09:00')), 0)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result['weekly_due'])
+        self.assertEqual(result['next_due'], '2026-11-03T09:00:00+09:00')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(self.trace.exists())
+
+    def test_first_run_does_not_catch_up_previous_day(self):
         self.initialize()
         self.assertNotIn('completed_due', self.state_data())
 
-    def test_suspended_monday_catches_up_tuesday_once(self):
+    def test_missed_days_catch_up_latest_daily_deadline_once(self):
         self.initialize()
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
@@ -276,7 +324,7 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
         self.assertEqual(status['stages'], {name: {'success': True} for name in
                          ('capture', 'evidence', 'upload', 'collect', 'review', 'publish', 'deploy')})
         self.assertNotIn('error', status)
-        self.assertEqual(self.state_data()['completed_due'], '2026-10-12T09:00:00+09:00')
+        self.assertEqual(self.state_data()['completed_due'], '2026-10-13T09:00:00+09:00')
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
         self.assertEqual(len(self.trace.read_text().splitlines()), 7)
 

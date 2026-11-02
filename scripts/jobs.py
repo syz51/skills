@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-local synchronization and a single weekly maintenance cycle."""
+"""Daily maintenance and host sync; retain legacy weekly command/state names."""
 import argparse
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -20,11 +20,12 @@ TOKYO = ZoneInfo('Asia/Tokyo')
 
 def latest_due(now):
     local = now.astimezone(TOKYO)
-    due = (local - timedelta(days=local.weekday())).replace(hour=9, minute=0, second=0, microsecond=0)
-    return due if due <= local else due - timedelta(days=7)
+    due = local.replace(hour=9, minute=0, second=0, microsecond=0)
+    return due if due <= local else due - timedelta(days=1)
 
 
 def weekly_due(now, state):
+    """Daily eligibility using the existing persisted-state/command contract."""
     due = latest_due(now)
     started = datetime.fromisoformat(state['setup_started_at'])
     completed = state.get('completed_due')
@@ -308,7 +309,7 @@ def execute(args, now=None):
     if config['host_id'] not in ('client-host', 'maintainer-host') or config['role'] not in ('client', 'maintainer'):
         raise ValueError('Invalid host or role')
     if args.command == 'weekly' and (config['role'] != 'maintainer' or config['host_id'] != 'maintainer-host'):
-        raise ValueError('Weekly maintenance is restricted to the remote maintainer')
+        raise ValueError('Daily maintenance is restricted to the remote maintainer')
     repo = Path(config['repo_path']).expanduser().resolve()
     for key in ('python_path', 'uv_path', 'codex_path', 'validator_path'):
         if not Path(config[key]).is_file():
@@ -321,7 +322,7 @@ def execute(args, now=None):
     if args.check:
         print(json.dumps({'host_id': config['host_id'], 'role': config['role'], 'repo_path': str(repo),
                           'weekly_due': weekly_due(now, state), 'latest_due': due.isoformat(),
-                          'next_due': (due + timedelta(days=7)).isoformat()}, indent=2))
+                          'next_due': (due + timedelta(days=1)).isoformat()}, indent=2))
         return 0
     with (state_root / 'cycle.lock').open('a') as lock:
         try:
@@ -383,9 +384,9 @@ def execute(args, now=None):
 
             try:
                 stage('capture', capture, 'Feedback capture failed',
-                      backlog_message='Feedback capture backlog remains; weekly review deferred', defer=True)
+                      backlog_message='Feedback capture backlog remains; daily review deferred', defer=True)
                 stage('evidence', evidence, 'Source feedback verification failed',
-                      backlog_message='Source verification backlog remains; weekly review deferred', defer=True)
+                      backlog_message='Source verification backlog remains; daily review deferred', defer=True)
                 stage('upload', lambda: step('upload'), 'Feedback upload failed')
                 if args.command == 'weekly' and not errors:
                     dirty = subprocess.run(['git', '-C', str(repo), 'status', '--porcelain'], capture_output=True, check=True).stdout
@@ -408,7 +409,7 @@ def execute(args, now=None):
                             prompt = maintenance_prompt(repo, config)
                             review(config['codex_path'], repo, state_root, prompt, log, env, timeout=remaining)
                     stage('review', run_review,
-                          'Weekly review failed; CLI adaptation failed, execution failed, or a valid fresh report was unavailable')
+                          'Maintenance review failed; CLI adaptation failed, execution failed, or a valid fresh report was unavailable')
                     stage('publish', lambda: step('publish'), 'Feedback publication failed')
                 stage('deploy', lambda: step('deploy'), 'Release deployment failed')
                 if args.command == 'weekly' and not errors and prompt_workflow(repo):
@@ -457,7 +458,7 @@ def main():
     parser.add_argument('--run-now', action='store_true')
     args = parser.parse_args()
     if args.run_now and args.command != 'weekly':
-        parser.error('--run-now is only for weekly maintenance')
+        parser.error('--run-now is only for daily maintenance')
     try:
         return execute(args)
     except (OSError, ValueError, KeyError) as error:

@@ -4,7 +4,7 @@ The scripts separate evidence collection from policy changes. Use an independent
 
 ## Incremental Rust migration
 
-The public publisher and its daily runner now live in the Rust `codex-skills` executable. They directly use the `codex-commit` library for generation-only messages from public diffs. The source-feedback, verification, retry, prompt-evaluation and weekly private-release contracts remain in their existing Python modules. A broader migration should preserve those contracts component by component; this release does not replace the entire maintenance pipeline.
+The public publisher and its daily runner now live in the Rust `codex-skills` executable. They directly use the `codex-commit` library for generation-only messages from public diffs. The source-feedback, verification, retry, prompt-evaluation and daily private-release contracts remain in their existing Python modules. A broader migration should preserve those contracts component by component; this release does not replace the entire maintenance pipeline.
 
 The old `scripts/public_export.py` and `scripts/public_export_job.py` remain regression references. Use the Rust commands in [Public publication](publication.md) for deployed publishing. Python remains a prerequisite for the current validation suite and maintenance commands below.
 
@@ -17,8 +17,8 @@ The Python CLI wrappers honor an explicit `CODEX_SKILLS_BIN`, then a managed `~/
 - `evidence.py` checks notes against originating completed turns and retains immutable assessments; eligible corrections receive a separate check.
 - `upstream.py` compares recorded upstream revisions with current source repositories for review.
 - `sync.py` transports immutable feedback and validates, publishes, and installs approved skill releases.
-- `jobs.py` coordinates synchronization and weekly maintenance in isolated recoverable checkouts.
-- `investigations.py` freezes evidence and reproduction plans, records actual runs and append-only dispositions, and gates weekly completion.
+- `jobs.py` coordinates synchronization and daily maintenance in isolated recoverable checkouts.
+- `investigations.py` freezes evidence and reproduction plans, records actual runs and append-only dispositions, and gates daily completion.
 - `prompt_runtime.py` loads bounded editable prompts beneath fixed policies and checks approved bundles.
 - `prompt_review.py` compares proposed prompt changes against immutable synthetic cases before a controlled promotion.
 
@@ -30,10 +30,10 @@ All guidance within the six registered skills can be reconsidered: descriptions,
 
 | Material | Update path |
 | --- | --- |
-| Registered skill Markdown | Evidence-supported weekly maintenance, with a review record, validation and link checks |
-| All six skills' owned supporting files and evaluation fixtures | Evidence-supported weekly investigation, including relevant execution checks |
-| Original source provenance and registered project roots | Explicit workflow maintenance; weekly review cannot repoint sources or expand access |
-| Source metadata `upstreamReview` records | Update existing revision/tree/review dates; source identities, enrollment and other historical metadata stay fixed during weekly maintenance |
+| Registered skill Markdown | Evidence-supported daily maintenance, with a review record, validation and link checks |
+| All six skills' owned supporting files and evaluation fixtures | Evidence-supported daily investigation, including relevant execution checks |
+| Original source provenance and registered project roots | Explicit workflow maintenance; daily review cannot repoint sources or expand access |
+| Source metadata `upstreamReview` records | Update existing revision/tree/review dates; source identities, enrollment and other historical metadata stay fixed during daily maintenance |
 | Four editable `prompts/*.md` files | Separate regression, held-out evaluation and controlled promotion |
 | Original feedback notes and verification receipts | Immutable; append new notes or linked assessments |
 | Feedback review records | New dispositions and evidence-based reassessment |
@@ -81,7 +81,9 @@ uv run --no-project python scripts/prompt_review.py review --config /path/to/pri
 
 `sync.py` exposes `upload`, `collect`, `publish`, and `deploy`; these can change Git branches or installations. `jobs.py sync` runs capture, verification, upload, and deployment stages, while `jobs.py weekly` may review and publish changes. They are not inspection commands. Read the configuration and authorization boundaries before invoking them.
 
-## Weekly reproduction and revision
+## Daily reproduction and revision
+
+The review is due daily at 09:00 Asia/Tokyo, with startup/hourly catchup for the latest missed deadline. The `weekly` command and state/log/report identifiers retain their legacy names; existing completion timestamps remain valid.
 
 The wrapper creates an isolated recoverable checkout after collection. Its provided `SKILL_INVESTIGATION_CONFIG` and `SKILL_INVESTIGATION_CYCLE` identify a frozen evidence inventory and due investigations. Start with:
 

@@ -43,7 +43,7 @@ The publisher requires Git, Python for candidate validation, authenticated Codex
 
 ## How the skills evolve
 
-The existing Python maintenance scripts implement a feedback loop: completed session → abstract feedback → source verification → reviewed skill change → validated release. The public exporter and daily deadline runner are implemented in Rust, using the released `codex-commit` library to generate informative messages from public diffs. Capture, source verification and weekly skill maintenance remain Python. Additional tools compare upstream references and evaluate bounded changes to the extraction, verification, correction, and maintenance prompts.
+The existing Python maintenance scripts implement a feedback loop: completed session → abstract feedback → source verification → reviewed skill change → validated release. The public exporter and daily deadline runner are implemented in Rust, using the released `codex-commit` library to generate informative messages from public diffs. Capture, source verification and daily skill maintenance remain Python. Additional tools compare upstream references and evaluate bounded changes to the extraction, verification, correction, and maintenance prompts.
 
 The source and tests are published as a reference implementation of a macOS/Unix, two-host maintenance workflow. It retains fixed `client-host` and `maintainer-host` roles and expects explicit configuration, Git repositories, a separate skill validator, and an authenticated Codex CLI. It is not a turnkey service. No real feedback history, transcript evidence, deployment approval marker, machine configuration, or operational logs are included.
 

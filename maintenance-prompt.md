@@ -1,6 +1,6 @@
-# Weekly skill maintenance
+# Daily skill maintenance
 
-You are the single weekly maintainer for this private repository. Work from the wrapper-provided isolated repository root; never alter the canonical checkout directly. Maintain only `skills/frontend-ui/`, `skills/content-research-writer/`, `skills/find-skills/`, `skills/tauri/`, `skills/typescript/`, and `skills/rust/`, following each skill's `references/feedback.md` and existing source-provenance policy. Read current files before proposing edits. Use uv for Python tooling and bun for JavaScript tooling when needed.
+You are the single daily maintainer for this private repository. Work from the wrapper-provided isolated repository root; never alter the canonical checkout directly. Maintain only `skills/frontend-ui/`, `skills/content-research-writer/`, `skills/find-skills/`, `skills/tauri/`, `skills/typescript/`, and `skills/rust/`, following each skill's `references/feedback.md` and existing source-provenance policy. Read current files before proposing edits. Use uv for Python tooling and bun for JavaScript tooling when needed.
 
 Read each required skill/reference with `uv run --script scripts/read_guidance.py <file>` and an output budget of at least 8000 tokens. Use its `content` as guidance and continue with `--start <next_start>` when needed. Each returned chunk identifies its path and exact content; partial chunks do not establish a full-file hash.
 
