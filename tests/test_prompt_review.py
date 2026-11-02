@@ -129,6 +129,179 @@ class PromptReviewTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'held_out_regression')
         self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
         self.assertEqual(len([c for c in self.calls if c[0] == review.REVIEW_PROMPT]), 1)
+        events = review.attempt_events(self.state)
+        terminal = next(v for v in events.values() if v['kind'] == 'terminal')
+        self.assertEqual(terminal['reason'], 'held_out_regression')
+        self.assertEqual(terminal['holdout_candidate'], result['holdout_candidate'])
+
+    def manual_rejection(self):
+        text = (self.repo / 'prompts/extract.md').read_text() + '\nREFINED\n'
+        visible = [c for c in review.load_cases(self.repo) if c['role'] == 'extract']
+        hidden = [c for c in review.load_cases(self.repo, holdouts=True) if c['role'] == 'extract']
+        identity = review.register_rejected_candidate(self.repo, self.state, 'extract', text,
+            'held_out_regression', baseline={review.digest(c): [False, False] for c in visible},
+            candidate_results={review.digest(c): [True, True] for c in visible},
+            holdout_baseline={review.digest(c): [True, True] for c in hidden},
+            holdout_candidate={review.digest(c): [True, False] for c in hidden})
+        return identity, visible, hidden
+
+    def test_prior_rejection_feedback_excludes_every_heldout_field(self):
+        identity, visible, hidden = self.manual_rejection()
+        self.run_review()
+        proposal = next(data for _, data, _ in self.calls if 'current_text' in data)
+        feedback = proposal['prior_attempts']
+        self.assertEqual(len(feedback['visible_lessons']), 1)
+        lesson = feedback['visible_lessons'][0]
+        self.assertIn('REFINED', lesson['candidate_text'])
+        self.assertEqual(set(lesson['baseline']), {review.digest(c) for c in visible})
+        serialized = json.dumps(feedback)
+        for case in hidden:
+            self.assertNotIn(review.digest(case), serialized)
+            self.assertNotIn(case['rubric'], serialized)
+            for message in json.loads(case['input']).get('messages', []):
+                self.assertNotIn(message['text'], serialized)
+        self.assertNotIn('holdout', serialized)
+        self.assertNotIn('held_out_regression', serialized)
+        self.assertNotIn('reason', serialized)
+        self.assertEqual(len(review.attempt_events(self.state)), 2)
+
+    def test_exact_rejected_candidate_skips_oracle_and_candidate_evaluation(self):
+        self.manual_rejection()
+        with patch.object(review, 'evaluate', wraps=review.evaluate) as evaluate:
+            result = self.run_review()
+        self.assertEqual(result['reason'], 'previously_rejected_candidate')
+        self.assertEqual(evaluate.call_count, 1)  # Current visible baseline only.
+        self.assertFalse(any(prompt == review.REVIEW_PROMPT for prompt, _, _ in self.calls))
+        self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
+
+    def test_rehashed_terminal_cannot_forward_heldout_measurements_as_visible(self):
+        _, _, hidden = self.manual_rejection()
+        events = review.attempt_events(self.state)
+        identity, terminal = next((h, v) for h, v in events.items() if v['kind'] == 'terminal')
+        terminal['baseline'] = {review.digest(c): [True, False] for c in hidden}
+        (self.state/'prompt-attempts'/(identity+'.json')).unlink()
+        (self.state/'prompt-attempts'/(review.digest(terminal)+'.json')).write_bytes(review.encoded(terminal))
+        with self.assertRaisesRegex(ValueError, 'measurements'):
+            review.prior_attempt_feedback(self.repo, self.state, 'extract')
+
+    def test_rehashed_case_inventories_cannot_relabel_heldouts_as_visible(self):
+        identity, _, hidden = self.manual_rejection()
+        events = review.attempt_events(self.state); pending = events[identity]
+        terminal_id, terminal = next((h, v) for h, v in events.items() if v['kind'] == 'terminal')
+        pending['visible_ids'] = [review.digest(c) for c in hidden]
+        pending['holdout_ids'] = ['a'*64, 'b'*64]
+        terminal['attempt'] = review.digest(pending)
+        terminal['baseline'] = terminal['candidate'] = {h: [True, False] for h in pending['visible_ids']}
+        terminal['holdout_baseline'] = terminal['holdout_candidate'] = None
+        for old in (identity, terminal_id): (self.state/'prompt-attempts'/(old+'.json')).unlink()
+        for value in (pending, terminal):
+            (self.state/'prompt-attempts'/(review.digest(value)+'.json')).write_bytes(review.encoded(value))
+        with self.assertRaisesRegex(ValueError, 'visible inventory mismatch'):
+            review.prior_attempt_feedback(self.repo, self.state, 'extract')
+
+    def test_interrupted_atomic_attempt_write_leaves_no_partial_event(self):
+        candidate = (self.repo/'prompts/extract.md').read_text()+'\nClarify correction attribution.\n'
+        with patch.object(review.capture.os, 'link', side_effect=OSError('interrupted before publication')):
+            with self.assertRaises(OSError): review.freeze_attempt(self.repo, self.state, 'extract', candidate)
+        self.assertEqual(review.attempt_events(self.state), {})
+        self.assertEqual(list((self.state/'prompt-attempts').iterdir()), [])
+
+    def test_model_decision_and_request_are_retained_locally(self):
+        with patch.object(review.capture, 'model_response', return_value={'notes': []}):
+            result = review.model(self.config, self.state, 'Synthetic check', {'case': 'abstract'}, review.capture.SCHEMA, time.monotonic()+30)
+        self.assertEqual(result, {'notes': []})
+        directory = self.state/'prompt-evaluation-calls'
+        request = next(directory.glob('*.request.json')); response = next(directory.glob('*.response.json'))
+        self.assertEqual(request.name.split('.')[0], response.name.split('.')[0])
+        self.assertEqual(json.loads(response.read_text())['response'], result)
+        self.assertEqual(json.loads(request.read_text())['evaluator_hash'], review.SOURCE_SHA256)
+        self.assertEqual(request.stat().st_mode & 0o777, 0o600)
+
+    def test_model_failure_preserves_request_without_exception_secrets(self):
+        with patch.object(review.capture, 'model_response', side_effect=RuntimeError('private credentials in diagnostic')):
+            with self.assertRaises(RuntimeError):
+                review.model(self.config, self.state, 'Synthetic check', {}, review.capture.SCHEMA, time.monotonic()+30)
+        directory = self.state/'prompt-evaluation-calls'
+        failure = json.loads(next(directory.glob('*.failure.json')).read_text())
+        self.assertEqual(failure['failure_class'], 'RuntimeError')
+        self.assertNotIn('credentials', json.dumps(failure))
+        self.assertEqual(len(list(directory.glob('*.request.json'))), 1)
+        self.assertFalse(list(directory.glob('*.response.json')))
+
+    def test_manual_case_budget_failure_cannot_poison_ledger(self):
+        visible = [c for c in review.load_cases(self.repo) if c['role'] == 'extract']
+        case = dict(next(c for c in visible if c['expected'] == 'empty'))
+        for index in range(review.MAX_CASES_PER_ROLE - len(visible)):
+            extra = dict(case)
+            data = json.loads(case['input']); data['messages'] = [{'role': 'user', 'text': 'Adjust ordinary spacing '+str(index)+'.'}]
+            extra['input'] = json.dumps(data)
+            (self.repo/'prompt-evals/cases'/(review.digest(extra)+'.json')).write_bytes(review.encoded(extra))
+        data = json.loads(case['input']); data['messages'] = [{'role': 'user', 'text': 'Adjust ordinary text spacing.'}]
+        case['input'] = json.dumps(data)
+        candidate = (self.repo/'prompts/extract.md').read_text()+'\nClarify bounded attribution.\n'
+        with self.assertRaisesRegex(ValueError, 'case inventory'):
+            review.register_rejected_candidate(self.repo, self.state, 'extract', candidate, 'oracle_rejected', new_case=case)
+        self.assertEqual(review.attempt_events(self.state), {})
+
+    def test_changed_evaluation_context_can_reconsider_same_candidate(self):
+        self.manual_rejection()
+        with patch.object(review, 'MODEL', 'updated-fixed-evaluator'):
+            result = self.run_review()
+        self.assertEqual(result['outcome'], 'promoted')
+        self.assertEqual(len(review.attempt_events(self.state)), 4)
+
+    def test_historical_evaluator_identity_is_preserved_without_new_context_rejection(self):
+        candidate = (self.repo / 'prompts/extract.md').read_text() + '\nREFINED\n'
+        visible = [c for c in review.load_cases(self.repo) if c['role'] == 'extract']
+        observed = 'a' * 64
+        identity = review.register_rejected_candidate(self.repo, self.state, 'extract', candidate,
+            'no_consistent_gain', baseline={review.digest(c): [False, False] for c in visible},
+            candidate_results={review.digest(c): [True, False] for c in visible},
+            observed_evaluator_hash=observed)
+        self.assertEqual(review.attempt_events(self.state)[identity]['context']['evaluator_hash'], observed)
+        feedback = review.prior_attempt_feedback(self.repo, self.state, 'extract')
+        self.assertEqual(feedback['visible_lessons'][0]['observed_evaluator_hash'], observed)
+        self.assertEqual(feedback['rejected_hashes'], [])
+        self.assertFalse(review.previously_rejected(self.repo, self.state, 'extract', candidate))
+
+    def test_oracle_rejection_is_immutable_local_evidence(self):
+        self.approval = False
+        self.run_review()
+        events = review.attempt_events(self.state)
+        terminal = next(v for v in events.values() if v['kind'] == 'terminal')
+        self.assertEqual(terminal['reason'], 'oracle_rejected')
+        self.assertIsNone(terminal['candidate'])
+        path = self.state / 'prompt-attempts' / (review.digest(terminal) + '.json')
+        path.write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+            review.attempt_events(self.state)
+
+    def test_interrupted_candidate_is_frozen_before_evaluation_and_retryable(self):
+        evaluate = review.evaluate
+        def interrupt(config, state, root, role, text, cases, deadline):
+            if 'REFINED' in text:
+                raise TimeoutError('evaluation interrupted')
+            return evaluate(config, state, root, role, text, cases, deadline)
+        with patch.object(review, 'evaluate', side_effect=interrupt):
+            with self.assertRaises(RuntimeError):
+                self.run_review()
+        events = review.attempt_events(self.state)
+        self.assertEqual(len(events), 1)
+        pending = next(iter(events.values()))
+        self.assertEqual(pending['kind'], 'pending')
+        self.assertIn('REFINED', pending['candidate'])
+        self.assertFalse(review.previously_rejected(self.repo, self.state, 'extract', pending['candidate']))
+        self.assertEqual(self.run_review()['outcome'], 'promoted')
+
+    def test_attempt_ledger_and_feedback_budgets_are_enforced(self):
+        for index in range(review.MAX_PRIOR_LESSONS + 2):
+            text = (self.repo / 'prompts/extract.md').read_text() + '\nRefinement ' + str(index)
+            review.register_rejected_candidate(self.repo, self.state, 'extract', text, 'oracle_rejected')
+        feedback = review.prior_attempt_feedback(self.repo, self.state, 'extract')
+        self.assertEqual(len(feedback['visible_lessons']), review.MAX_PRIOR_LESSONS)
+        with patch.object(review, 'MAX_ATTEMPT_EVENTS', len(review.attempt_events(self.state))):
+            with self.assertRaisesRegex(ValueError, 'explicit archival'):
+                review.register_rejected_candidate(self.repo, self.state, 'extract', text + ' next', 'oracle_rejected')
 
     def test_heldout_gate_requires_complete_consistent_critical_results(self):
         cases = [c for c in review.load_cases(self.repo, holdouts=True) if c['role'] == 'extract']

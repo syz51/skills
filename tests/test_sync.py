@@ -92,7 +92,7 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         self.commit('Add bounded prompt bundle')
         sync.git(self.repo, 'push', 'origin', 'main')
 
-    def test_non_typescript_supporting_files_cannot_publish(self):
+    def test_owned_frontend_supporting_files_publish_and_deploy(self):
         self.release()
         path = self.repo / 'skills/frontend-ui/scripts/new-helper.sh'
         path.parent.mkdir()
@@ -102,8 +102,36 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         review.parent.mkdir(parents=True)
         review.write_text('Reviewed fixture change.\n')
         self.commit()
-        with self.assertRaisesRegex(sync.SyncError, 'Supporting file|non-executable'):
-            sync.publish(self.args)
+        self.assertTrue(sync.publish(self.args))
+        self.assertTrue(sync.deploy(self.args))
+        self.assertEqual((self.args.install_root / 'current/skills/frontend-ui/scripts/new-helper.sh').read_text(), 'exit 0\n')
+
+    def test_scope_check_is_pure_and_accepts_reviewed_owned_files(self):
+        base = sync.git(self.repo, 'rev-parse', 'HEAD').decode().strip()
+        path = self.repo/'skills/find-skills/evaluations/check.py'; path.parent.mkdir(parents=True); path.write_text('print("fixture")')
+        review = self.repo/'feedback/find-skills/reviews/case.md'; review.parent.mkdir(parents=True); review.write_text('Reviewed owned fixture')
+        self.commit()
+        before = sync.git(self.repo, 'status', '--porcelain')
+        with patch.object(sync, 'fetch', side_effect=AssertionError('must not contact remote')):
+            scope = sync.publication_scope(self.repo, base, 'HEAD')
+        self.assertEqual(scope['changed_skills'], ['find-skills'])
+        self.assertEqual(sync.git(self.repo, 'status', '--porcelain'), before)
+        self.assertEqual(sync.git(self.repo, 'rev-parse', 'origin/main').decode().strip(), base)
+
+    def test_scope_rejects_gitlink_inside_owned_skill(self):
+        base = sync.git(self.repo, 'rev-parse', 'HEAD').decode().strip()
+        sync.git(self.repo, 'update-index', '--add', '--cacheinfo', '160000,'+base+',skills/frontend-ui/vendor')
+        sync.git(self.repo, 'commit', '-m', 'Unsafe submodule fixture')
+        with self.assertRaisesRegex(sync.SyncError, 'regular file'):
+            sync.publication_scope(self.repo, base, 'HEAD')
+
+    def test_scope_preserves_immutable_investigation_events(self):
+        path = self.repo/('feedback/frontend-ui/investigations/focus--'+'a'*64+'.json')
+        path.parent.mkdir(parents=True); path.write_text('{}'); self.commit()
+        base = sync.git(self.repo, 'rev-parse', 'HEAD').decode().strip()
+        path.write_text('{"rewritten":true}'); self.commit()
+        with self.assertRaisesRegex(sync.SyncError, 'events are immutable'):
+            sync.publication_scope(self.repo, base, 'HEAD')
 
     def test_typescript_supporting_files_publish_and_deploy(self):
         self.release()

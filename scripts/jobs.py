@@ -10,9 +10,10 @@ import signal
 import subprocess
 import tempfile
 import time
+import uuid
 from zoneinfo import ZoneInfo
 
-from capture import cli_text, help_command, help_flag, help_options
+from capture import cli_text, help_command, help_flag, help_options, redact
 
 TOKYO = ZoneInfo('Asia/Tokyo')
 
@@ -140,6 +141,157 @@ def maintenance_prompt(repo, config):
     return load('maintain', config=config)
 
 
+def review_learning_cycle(config, state_root, due, log, env, timeout):
+    """Review in a recoverable private checkout; only validated commits reach main."""
+    import investigations
+    import sync
+
+    began = time.monotonic()
+    repo = Path(config['repo_path']).resolve()
+    state_root = Path(state_root).resolve()
+    attempts = state_root / 'investigations/attempts'
+    attempts.mkdir(parents=True, exist_ok=True)
+    active = state_root / 'investigations/active-attempt.json'
+
+    def git(root, *args):
+        return subprocess.check_output(['git', '-C', str(root), *args], timeout=30).decode().strip()
+
+    def clean(root):
+        return not git(root, 'status', '--porcelain', '--untracked-files=all')
+
+    if not clean(repo) or git(repo, 'branch', '--show-current') != 'main':
+        raise RuntimeError('Weekly maintenance requires a clean main checkout')
+    base = git(repo, 'rev-parse', 'HEAD')
+    attempt = json.loads(active.read_text()) if active.exists() else None
+    recovery = None
+    if attempt is not None:
+        saved_work = Path(attempt['work'])
+        work = saved_work.resolve()
+        folder = work.parent
+        if (not folder.is_relative_to(attempts) or work.name != 'work' or saved_work.is_symlink()
+                or not (work / '.git').is_file()):
+            raise ValueError('Unsafe saved investigation attempt')
+        stale_cycle = False
+        if attempt.get('cycle') is not None:
+            cycle_path = Path(attempt['cycle'])
+            if not cycle_path.resolve().is_relative_to(state_root / 'investigations/cycles') or cycle_path.is_symlink():
+                raise ValueError('Unsafe saved investigation cycle')
+            try:
+                frozen = investigations.cycle_data(cycle_path)
+                stale_cycle = investigations.bindings(work) != frozen['bindings']
+            except ValueError:
+                stale_cycle = True
+        if attempt['base_commit'] != base or attempt['due'] != due.isoformat() or stale_cycle:
+            attempt['status'] = 'superseded'
+            save(folder / 'attempt.json', attempt)
+            recovery = str(folder)
+            attempt = None
+    if attempt is None:
+        folder = attempts / uuid.uuid4().hex
+        folder.mkdir()
+        work = folder / 'work'
+        git(repo, 'worktree', 'add', '--detach', str(work), base)
+        scoped = dict(config, repo_path=str(work))
+        config_path = state_root / ('investigation-' + folder.name + '-config.json')
+        save(config_path, scoped)
+        attempt = {'base_commit': base, 'due': due.isoformat(), 'work': str(work),
+                   'config': str(config_path), 'cycle': None, 'status': 'preparing',
+                   'recovery': recovery}
+        save(folder / 'attempt.json', attempt)
+        save(active, attempt)
+        try:
+            cycle = investigations.prepare(scoped, state_root, due.isoformat(), trusted_base=base)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+            attempt['status'] = 'failed'
+            attempt['failure'] = {'class': type(exc).__name__, 'detail': redact(str(exc))[:2000]}
+            save(folder / 'attempt.json', attempt)
+            save(active, attempt)
+            raise
+        attempt['cycle'] = str(cycle)
+    else:
+        config_path = Path(attempt['config'])
+        if config_path.parent.resolve() != state_root or config_path.is_symlink():
+            raise ValueError('Unsafe saved investigation config')
+        scoped = json.loads(config_path.read_text())
+        if scoped != dict(config, repo_path=str(work)):
+            raise ValueError('Investigation configuration changed')
+        if attempt['cycle'] is None:
+            attempt['cycle'] = str(investigations.prepare(scoped, state_root, due.isoformat(), trusted_base=base))
+        cycle = Path(attempt['cycle'])
+        if not cycle.resolve().is_relative_to(state_root / 'investigations/cycles') or cycle.is_symlink():
+            raise ValueError('Unsafe saved investigation cycle')
+        frozen = investigations.cycle_data(cycle)
+    attempt['status'] = 'running'
+    save(folder / 'attempt.json', attempt)
+    save(active, attempt)
+    execution_env = dict(env, SKILL_INVESTIGATION_CYCLE=str(cycle),
+                         SKILL_INVESTIGATION_CONFIG=str(config_path))
+    prompt = maintenance_prompt(work, scoped) + (
+        '\nCurrent host-local investigation context (paths are not publication content):\n'
+        'SKILL_INVESTIGATION_CYCLE=' + str(cycle) + '\n'
+        'SKILL_INVESTIGATION_CONFIG=' + str(config_path) + '\n'
+        'Use uv run --no-project python scripts/investigations.py report --config '
+        '"$SKILL_INVESTIGATION_CONFIG" --cycle "$SKILL_INVESTIGATION_CYCLE". '
+        'Use run and record with the same config/cycle for actual experiments and dispositions. '
+        'Complete required evidence and due investigations before finishing; keep future follow-ups visible. '
+        'A saved attempt may contain your earlier failed work: inspect it, preserve evidence, '
+        'and finish through scoped forward commits. Do not alter the canonical checkout.\n')
+    if attempt.get('recovery'):
+        prompt += ('Prior superseded attempt is read-only recovery context at ' + attempt['recovery']
+                   + '. Reassess its evidence; do not blindly cherry-pick or reset from it.\n')
+    try:
+        review(config['codex_path'], work, folder, prompt, log, execution_env,
+               timeout=max(1, timeout - (time.monotonic() - began)))
+        summary = investigations.validate_cycle(scoped, state_root, cycle)
+        _, heads = investigations.inventory(work)
+        outstanding = sorted((v for v in heads.values() if v['state'] != 'resolved'),
+                             key=lambda v: (v['follow_up']['next_due'], v['skill'], v['issue_id']))
+        summary['outstanding'] = [{'skill': v['skill'], 'issue_id': v['issue_id'],
+                                  'state': v['state'], **v['follow_up']} for v in outstanding]
+        report = folder / 'latest-weekly-report.md'
+        with report.open('a') as stream:
+            stream.write('\n\nValidated investigation result: ' + str(summary['open'])
+                         + ' outstanding issues (including provisional and blocked issues).\n')
+            for issue in summary['outstanding']:
+                stream.write('- ' + issue['skill'] + '/' + issue['issue_id'] + ' [' + issue['state']
+                             + '], due ' + issue['next_due'] + ': ' + issue['next_action'] + '\n')
+        if not clean(work):
+            raise RuntimeError('Investigation review must commit its owned changes')
+        candidate = git(work, 'rev-parse', 'HEAD')
+        git(work, 'merge-base', '--is-ancestor', base, candidate)
+        sync.publication_scope(work, base, candidate, bootstrap=False)
+        sync.validate(work, config['validator_path'])
+        if time.monotonic() - began >= timeout:
+            raise TimeoutError('Investigation validation exceeded the job deadline')
+        if not clean(repo) or git(repo, 'rev-parse', 'HEAD') != base:
+            raise RuntimeError('Canonical checkout changed during investigation')
+        git(repo, 'merge', '--ff-only', candidate)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, sync.SyncError) as exc:
+        attempt['status'] = 'failed'
+        attempt['failure'] = {'class': type(exc).__name__, 'detail': redact(str(exc))[:2000]}
+        save(folder / 'attempt.json', attempt)
+        save(active, attempt)
+        if isinstance(exc, sync.SyncError):
+            raise RuntimeError(str(exc)) from exc
+        raise
+    attempt['status'] = 'validated'
+    attempt['candidate_commit'] = candidate
+    save(folder / 'attempt.json', attempt)
+    # Cleanup is separate from acceptance: a cleanup failure must not relabel
+    # an already accepted forward commit as a failed investigation.
+    try:
+        # Publish the report only after its machine-checked investigation succeeds.
+        os.replace(report, state_root / 'latest-weekly-report.md')
+        active.unlink()
+        git(repo, 'worktree', 'remove', str(work))
+        config_path.unlink()
+    except (OSError, subprocess.SubprocessError) as exc:
+        attempt['cleanup_pending'] = str(exc)
+        save(folder / 'attempt.json', attempt)
+        summary = dict(summary, cleanup_pending=str(folder))
+    return summary
+
+
 def review_prompts(config, state_root, *, timeout, due):
     from prompt_review import run as run_review
     return run_review(config, state_root, timeout=timeout, due=due)
@@ -241,10 +393,20 @@ def execute(args, now=None):
                     if dirty or branch != b'main':
                         raise RuntimeError('Weekly maintenance requires a clean main checkout')
                     stage('collect', lambda: step('collect'), 'Feedback collection failed')
+                    learning = (repo / 'scripts/investigations.py').is_file()
                     def run_review():
-                        prompt = maintenance_prompt(repo, config)
-                        review(config['codex_path'], repo, state_root, prompt, log, env,
-                               timeout=max(1, 5400 - (time.monotonic() - began)))
+                        remaining = max(1, 5400 - (time.monotonic() - began))
+                        if learning:
+                            status['investigations'] = {'complete': False}
+                            try:
+                                status['investigations'] = review_learning_cycle(config, state_root, due, log, env, remaining)
+                            finally:
+                                active = state_root / 'investigations/active-attempt.json'
+                                if not status['investigations'].get('complete') and active.exists():
+                                    status['investigations']['recovery'] = json.loads(active.read_text())
+                        else:
+                            prompt = maintenance_prompt(repo, config)
+                            review(config['codex_path'], repo, state_root, prompt, log, env, timeout=remaining)
                     stage('review', run_review,
                           'Weekly review failed; CLI adaptation failed, execution failed, or a valid fresh report was unavailable')
                     stage('publish', lambda: step('publish'), 'Feedback publication failed')

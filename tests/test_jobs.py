@@ -562,5 +562,167 @@ while True:
         self.assertEqual(final['last_failure_finished_at'], final['finished_at'])
 
 
+class LearningTransactionTests(unittest.TestCase):
+    setUp = JobsTests.setUp
+    def git_at(self, root, *args):
+        return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
+
+    def commit_at(self, root):
+        self.git_at(root, 'add', '.')
+        self.git_at(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'Reviewed change')
+
+    def transaction(self, callback, gate=None, scope=None):
+        import investigations
+        import sync
+        config = json.loads(self.config.read_text())
+        with patch.object(jobs, 'review', side_effect=callback), \
+                patch.object(investigations, 'validate_cycle', side_effect=gate or (lambda *a: {'complete': True, 'open': 0})), \
+                patch.object(sync, 'validate', return_value='validated'), \
+                patch.object(sync, 'publication_scope', side_effect=scope or (lambda *a, **k: None), create=True), \
+                (self.root / 'transaction.log').open('a') as log:
+            return jobs.review_learning_cycle(config, self.state, jobs.latest_due(datetime.now(timezone.utc)), log, dict(os.environ), 30)
+
+    def accepted_review(self, cli, work, state, prompt, log, env, timeout):
+        self.assertEqual(Path(env['SKILL_INVESTIGATION_CONFIG']).parent, self.state.resolve())
+        self.assertIn('SKILL_INVESTIGATION_CYCLE', prompt)
+        (work / 'skills/frontend-ui').mkdir(parents=True, exist_ok=True)
+        (work / 'skills/frontend-ui/guide.md').write_text('Reviewed guidance')
+        self.commit_at(work)
+        (state / 'latest-weekly-report.md').write_text('Validated learning report')
+
+    def test_validated_attempt_advances_main_and_removes_worktree(self):
+        before = self.git_at(self.repo, 'rev-parse', 'HEAD')
+        result = self.transaction(self.accepted_review)
+        self.assertTrue(result['complete'])
+        self.assertNotEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
+        self.assertEqual((self.repo / 'skills/frontend-ui/guide.md').read_text(), 'Reviewed guidance')
+        self.assertFalse((self.state / 'investigations/active-attempt.json').exists())
+        self.assertEqual(len(self.git_at(self.repo, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
+
+    def test_missing_disposition_preserves_candidate_and_canonical_main(self):
+        before = self.git_at(self.repo, 'rev-parse', 'HEAD')
+        with self.assertRaisesRegex(ValueError, 'missing disposition'):
+            self.transaction(self.accepted_review, gate=lambda *a: (_ for _ in ()).throw(ValueError('missing disposition')))
+        self.assertEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        self.assertTrue((Path(saved['work']) / 'skills/frontend-ui/guide.md').exists())
+        self.assertEqual(saved['failure'], {'class': 'ValueError', 'detail': 'missing disposition'})
+        self.assertEqual(self.git_at(self.repo, 'status', '--porcelain'), '')
+
+    def test_weekly_requires_investigation_gate_before_publish(self):
+        import investigations
+        import sync
+        (self.repo / 'scripts/investigations.py').write_text('# available learning runner\n')
+        self.commit_at(self.repo)
+        before = self.git_at(self.repo, 'rev-parse', 'HEAD')
+        self.args.run_now = True
+        with patch.object(jobs, 'review', side_effect=self.accepted_review), \
+                patch.object(investigations, 'validate_cycle', side_effect=ValueError('missing disposition')), \
+                patch.object(sync, 'validate'), patch.object(sync, 'publication_scope'):
+            self.assertEqual(jobs.execute(self.args), 1)
+        status = json.loads((self.state / 'weekly-status.json').read_text())
+        self.assertFalse(status['investigations']['complete'])
+        self.assertEqual(status['investigations']['recovery']['status'], 'failed')
+        self.assertNotIn('publish', self.trace.read_text().splitlines())
+        self.assertNotIn('deploy', self.trace.read_text().splitlines())
+        self.assertEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
+
+    def test_advanced_canonical_archives_attempt_without_copying_its_edits(self):
+        def crash(cli, work, state, prompt, log, env, timeout):
+            (work / 'owned-draft').write_text('old baseline experiment')
+            raise RuntimeError('review interrupted')
+        with self.assertRaises(RuntimeError):
+            self.transaction(crash)
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        (self.repo / 'user-commit').write_text('new canonical baseline')
+        self.commit_at(self.repo)
+        def fresh(cli, work, state, prompt, log, env, timeout):
+            self.assertNotEqual(work, Path(saved['work']))
+            self.assertFalse((work / 'owned-draft').exists())
+            self.assertIn('read-only recovery context', prompt)
+            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+        self.transaction(fresh)
+        self.assertEqual((Path(saved['work']) / 'owned-draft').read_text(), 'old baseline experiment')
+        self.assertEqual(json.loads((Path(saved['work']).parent / 'attempt.json').read_text())['status'], 'superseded')
+
+    def test_crashed_dirty_attempt_resumes_without_resetting_evidence(self):
+        def crash(cli, work, state, prompt, log, env, timeout):
+            (work / 'owned-draft').write_text('preserve failed experiment')
+            raise RuntimeError('review interrupted')
+        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+            self.transaction(crash)
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        work = Path(saved['work'])
+        def resume(cli, resumed, state, prompt, log, env, timeout):
+            self.assertEqual(resumed, work)
+            self.assertEqual((resumed / 'owned-draft').read_text(), 'preserve failed experiment')
+            (resumed / 'owned-draft').unlink()
+            self.accepted_review(cli, resumed, state, prompt, log, env, timeout)
+        self.transaction(resume)
+        self.assertTrue((self.repo / 'skills/frontend-ui/guide.md').exists())
+
+    def test_changed_cycle_evidence_preserves_old_draft_and_starts_clean(self):
+        import investigations
+        def crash(cli, work, state, prompt, log, env, timeout):
+            (work / 'owned-draft').write_text('failed-cycle evidence')
+            raise RuntimeError('review interrupted')
+        with self.assertRaises(RuntimeError): self.transaction(crash)
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        binding = {'skill': 'frontend-ui', 'note_sha256': 'a'*64, 'receipt_sha256': 'b'*64, 'source_machine': 'client-host'}
+        def fresh(cli, work, state, prompt, log, env, timeout):
+            self.assertNotEqual(work, Path(saved['work']))
+            self.assertFalse((work / 'owned-draft').exists())
+            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+        with patch.object(investigations, 'bindings', return_value=[binding]): self.transaction(fresh)
+        self.assertEqual((Path(saved['work'])/'owned-draft').read_text(), 'failed-cycle evidence')
+
+    def test_changed_runner_archives_incompatible_cycle_for_clean_retry(self):
+        import investigations
+        def crash(*args, **kwargs): raise RuntimeError('review interrupted')
+        with self.assertRaises(RuntimeError): self.transaction(crash)
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        original = investigations.cycle_data
+        def read_cycle(path):
+            if str(path) == saved['cycle']: raise ValueError('Investigation runner changed')
+            return original(path)
+        with patch.object(investigations, 'cycle_data', side_effect=read_cycle): self.transaction(self.accepted_review)
+        self.assertEqual(json.loads((Path(saved['work']).parent/'attempt.json').read_text())['status'], 'superseded')
+
+    def test_failed_preparation_retains_a_retryable_attempt(self):
+        import investigations
+        with patch.object(investigations, 'prepare', side_effect=ValueError('invalid source evidence')):
+            with self.assertRaisesRegex(ValueError, 'invalid source evidence'):
+                self.transaction(self.accepted_review)
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        self.assertIsNone(saved['cycle'])
+        self.assertEqual(saved['status'], 'failed')
+        self.assertEqual(saved['failure']['detail'], 'invalid source evidence')
+        def resume(cli, work, state, prompt, log, env, timeout):
+            self.assertEqual(work, Path(saved['work']))
+            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+        self.transaction(resume)
+
+    def test_concurrent_canonical_edits_are_preserved(self):
+        def edit(cli, work, state, prompt, log, env, timeout):
+            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+            (self.repo / 'user-work').write_text('never overwrite')
+        with self.assertRaisesRegex(RuntimeError, 'Canonical checkout changed'):
+            self.transaction(edit)
+        self.assertEqual((self.repo / 'user-work').read_text(), 'never overwrite')
+        self.assertFalse((self.repo / 'skills/frontend-ui/guide.md').exists())
+
+    def test_scope_rejection_never_advances_canonical(self):
+        import sync
+        before = self.git_at(self.repo, 'rev-parse', 'HEAD')
+        def forbidden(cli, work, state, prompt, log, env, timeout):
+            (work / 'maintenance-prompt.md').write_text('forbidden automatic authority change')
+            self.commit_at(work)
+            (state / 'latest-weekly-report.md').write_text('Unsupported claim')
+        with self.assertRaisesRegex(RuntimeError, 'Out-of-scope publication path'):
+            self.transaction(forbidden, scope=sync.publication_scope)
+        self.assertEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
+        self.assertEqual((self.repo / 'maintenance-prompt.md').read_text(), 'Review evidence only.')
+
+
 if __name__ == '__main__':
     unittest.main()

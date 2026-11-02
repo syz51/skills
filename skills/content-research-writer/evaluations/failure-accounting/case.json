@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "skill": "content-research-writer",
+  "id": "failure-accounting",
+  "description": "First-party synthetic behavior reproduction with a deliberately faulty baseline, correction and contrasting condition; not original-project replay or causal proof of skill benefit.",
+  "files": [
+    "check.py"
+  ],
+  "commands": {
+    "baseline": [
+      "uv",
+      "run",
+      "--no-project",
+      "python",
+      "check.py",
+      "--variant",
+      "baseline"
+    ],
+    "candidate": [
+      "uv",
+      "run",
+      "--no-project",
+      "python",
+      "check.py",
+      "--variant",
+      "candidate"
+    ],
+    "contrast": [
+      "uv",
+      "run",
+      "--no-project",
+      "python",
+      "check.py",
+      "--variant",
+      "contrast"
+    ]
+  },
+  "success_codes": {
+    "baseline": [
+      0
+    ],
+    "candidate": [
+      0
+    ],
+    "contrast": [
+      0
+    ]
+  },
+  "timeout_seconds": 60,
+  "evidence_scope": "synthetic_behavior"
+}

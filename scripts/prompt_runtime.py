@@ -19,19 +19,29 @@ ROLE_CONTRACTS = {
     'extract': 'Return only schema JSON, at most three abstract notes for listed verified_skills. No tools or actions. Do not expand eligibility; skip unsupported, duplicate, routine or read-only work.\n',
     'verify': 'Return only schema JSON. No tools or actions. Supported means faithful attribution to supplied messages, never verification of runtime outcomes. Check every material claim and qualification.\n',
     'correct': 'Return only schema JSON, at most one corrected note for the supplied skill. No tools or actions. Preserve the same lesson and explicit uncertainty; return no notes when unsupported.\n',
-    'maintain': '''Maintain only frontend-ui, content-research-writer, find-skills, tauri and typescript and their review records.
-Evidence-supported edits cover descriptions, entrypoints and nested references. TypeScript's
-enrollment also covers its entire skill tree, including owned supporting scripts, agent metadata,
-templates and assets; preserve the other skills' existing update policies and script restrictions.
-Preserve immutable source notes and receipts. Required repository-relative evidence paths,
-hashes and authorized public upstream citations may appear in maintenance review records.
-Do not edit workflows, host configuration or scripts outside the authorized skills/typescript/ exception,
-authorization, this protected policy or maintenance-prompt.md. Preserve source provenance under
-the protected maintenance procedure; permission to edit owned supporting files does not permit
-merging or executing untrusted upstream scripts or special files. Do not expand network access,
-publication or skill authority. Follow the protected maintenance procedure's bounded upstream
-review and validation commands only. The wrapper handles collection, publication and deployment;
-never publish, deploy, push, send messages or create recurring tasks yourself.
+    'maintain': '''Maintain only frontend-ui, content-research-writer, find-skills, tauri and typescript,
+including their entire owned skill trees, nested references, owned supporting scripts,
+agent metadata, templates, assets and evaluation fixtures, plus review and append-only
+investigation records. Preserve immutable source notes and receipts. Repository-relative
+evidence paths, hashes and authorized public upstream citations may appear in review records.
+Use the wrapper-provided isolated recoverable checkout and investigation cycle. Inspect
+saved evidence and registered local project artifacts read-only; execute only reviewed
+first-party reproduction plans in fresh private copies. Copies are not an OS sandbox.
+Never blindly replay source commands or execute untrusted upstream scripts or install hooks.
+Keep private source, paths, raw logs and artifacts host-local; retain only sanitized records in Git.
+Freeze case/oracle bytes before comparisons. An existing rule does not resolve recurrence;
+record actual experiments or precise blockers and carry open/provisional issues forward.
+Keep, revise, simplify, remove or restore guidance when supported. Restore through new
+forward commits, never history resets or discarded concurrent work. Failed experiments are
+learning evidence, not proof of success. Loading, compilation and proxies do not establish
+runtime behavior or guidance benefit. The machine investigation gate runs before publication.
+Do not edit root workflows, host configuration, scripts outside the five owned skill trees,
+authorization, this fixed policy or maintenance-prompt.md. Preserve source provenance under
+the protected maintenance procedure; owned-file authority does not permit importing untrusted
+upstream code or special files. Do not expand network access, publication or skill authority.
+Follow the protected procedure for investigation, bounded upstream review and validation.
+The wrapper handles collection, publication and deployment; never publish, deploy, push,
+send messages or create recurring tasks yourself.
 ''',
 }
 

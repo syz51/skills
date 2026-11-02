@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<title>Conditional input behavior fixture</title>
+<button id="launch">Open editor (Alt+e)</button>
+<section id="editor" hidden><label>Draft <textarea id="draft"></textarea></label></section>
+<pre id="results">pending</pre>
+<script>
+const variant = new URL(location.href).searchParams.get('variant');
+const editor = document.querySelector('#editor');
+const draft = document.querySelector('#draft');
+const launch = document.querySelector('#launch');
+let savedDraft = 'Previously entered text';
+draft.value = savedDraft;
+const checks = [];
+function check(name, passed) { checks.push({name, passed}); }
+function openEditor() {
+  if (variant === 'baseline') {
+    // The route changes, but conditional content remains hidden.
+    location.hash = 'editor';
+    draft.value = '';
+    return;
+  }
+  editor.hidden = false;
+  draft.value = savedDraft;
+  draft.focus();
+}
+launch.addEventListener('click', openEditor);
+document.addEventListener('keydown', event => {
+  if (event.altKey && event.key === 'e') {
+    event.preventDefault();
+    openEditor();
+  }
+});
+function shortcut() {
+  document.dispatchEvent(new KeyboardEvent('keydown', {key: 'e', altKey: true, bubbles: true, cancelable: true}));
+}
+if (variant === 'contrast') {
+  // Merely showing an existing editor must not steal focus from another action.
+  editor.hidden = false;
+  launch.focus();
+  check('existing visible content does not implicitly steal focus', document.activeElement === launch);
+  draft.value = 'Edited text';
+  savedDraft = draft.value;
+  shortcut();
+  check('explicit shortcut focuses an already visible editor', document.activeElement === draft);
+  check('explicit shortcut preserves edited draft', draft.value === 'Edited text');
+} else {
+  launch.focus();
+  shortcut();
+  check('shortcut reveals conditional input', !editor.hidden && draft.getClientRects().length > 0);
+  check('shortcut focuses revealed input', document.activeElement === draft);
+  check('shortcut retains prior draft', draft.value === 'Previously entered text');
+}
+document.querySelector('#results').textContent = JSON.stringify({variant, checks, passed: checks.every(c => c.passed), scope: 'Synthetic real-DOM reproduction; dispatched keyboard event, not physical input or private-project replay.'});
+</script>

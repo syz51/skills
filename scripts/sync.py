@@ -337,6 +337,11 @@ def validate(root, validator=None):
             result = subprocess.run(['uv', 'run', '--with', 'pyyaml', '--python', sys.executable, '--script', str(validator), str(folder)], capture_output=True)
             if result.returncode:
                 raise SyncError('Skill validation command failed for ' + skill)
+    from investigations import validate_events
+    try:
+        validate_events(root)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise SyncError('Invalid investigation history: ' + str(error)) from error
     return skills_hash(root)
 
 def verify_release(root, validator=None):
@@ -353,6 +358,63 @@ def verify_release(root, validator=None):
             raise SyncError('Invalid referenced review record')
     return checksum
 
+def publication_scope(repo, base, head, *, bootstrap=False):
+    """Validate a forward publication without modifying Git or contacting remotes."""
+    git(repo, 'merge-base', '--is-ancestor', base, head)
+    fields = git(repo, 'diff', '--no-renames', '--name-status', '-z', base, head).split(b'\0')
+    changes = [(status.decode('ascii'), os.fsdecode(name)) for status, name in zip(fields[0:-1:2], fields[1:-1:2])]
+    changed_skills, reviewed_skills, reviews = set(), set(), []
+    for status, name in changes:
+        parts = Path(name).parts
+        skill_path = len(parts) >= 3 and parts[0] == 'skills' and parts[1] in SKILLS
+        feedback_path = len(parts) >= 4 and parts[0] == 'feedback' and parts[1] in SKILLS and parts[2] in ('notes', 'reviews', 'verifications', 'investigations')
+        if not (skill_path or feedback_path or name == 'release.json'):
+            raise SyncError('Out-of-scope publication path: ' + name)
+        if skill_path:
+            if not bootstrap:
+                if status != 'D':
+                    mode = git(repo, 'ls-tree', head, '--', name).split(None, 1)[0]
+                    if mode == b'120000':
+                        raise SyncError('Skill symlinks are prohibited')
+                    if mode not in (b'100644', b'100755'):
+                        raise SyncError('Owned supporting content must be a regular file')
+                    if Path(name).suffix == '.md' and mode != b'100644':
+                        raise SyncError('Markdown guidance must be non-executable')
+                if len(parts) == 3 and parts[2] == 'sources.json':
+                    if status != 'M':
+                        raise SyncError('Source provenance changes require workflow maintenance')
+                    before = json.loads(git(repo, 'show', base + ':' + name))
+                    after = json.loads(git(repo, 'show', head + ':' + name))
+                    if not isinstance(before, dict) or not isinstance(after, dict):
+                        raise SyncError('Invalid source provenance')
+                    old_reviews = before.pop('upstreamReview', [])
+                    new_reviews = after.pop('upstreamReview', [])
+                    if before != after:
+                        raise SyncError('Only upstreamReview provenance may evolve')
+                    mutable = {'revision', 'tree', 'reviewedAt'}
+                    if (not isinstance(old_reviews, list) or not isinstance(new_reviews, list)
+                            or any(not isinstance(item, dict) for item in [*old_reviews, *new_reviews])
+                            or [{k: v for k, v in item.items() if k not in mutable} for item in old_reviews]
+                            != [{k: v for k, v in item.items() if k not in mutable} for item in new_reviews]):
+                        raise SyncError('Upstream source enrollment requires workflow maintenance')
+            changed_skills.add(parts[1])
+        if feedback_path and parts[2] == 'notes' and status != 'A':
+            raise SyncError('Feedback notes are immutable')
+        if feedback_path and parts[2] == 'verifications' and status != 'A':
+            raise SyncError('Source verifications are immutable')
+        if feedback_path and parts[2] == 'investigations':
+            if status != 'A':
+                raise SyncError('Investigation events are immutable')
+            if (len(parts) != 4 or not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,79}--[a-f0-9]{64}\.json', parts[-1])
+                    or git(repo, 'ls-tree', head, '--', name).split(None, 1)[0] != b'100644'):
+                raise SyncError('Invalid investigation event path or mode')
+        if feedback_path and parts[2] == 'reviews' and status in ('A', 'M'):
+            reviewed_skills.add(parts[1])
+            reviews.append(name)
+    if not bootstrap and changed_skills - reviewed_skills:
+        raise SyncError('Changed skills require a review record: ' + ', '.join(sorted(changed_skills - reviewed_skills)))
+    return {'changed_skills': sorted(changed_skills), 'reviews': sorted(reviews)}
+
 def publish(args):
     clean(args.repo)
     if not args.validator:
@@ -368,50 +430,8 @@ def publish(args):
             verify_release(checkout, args.validator)
         print('Validated release is already published.')
         return True
-    changed_skills, reviewed_skills, reviews = set(), set(), []
-    for status, name in changes:
-        parts = Path(name).parts
-        skill_path = len(parts) >= 3 and parts[0] == 'skills' and parts[1] in SKILLS
-        feedback_path = len(parts) >= 4 and parts[0] == 'feedback' and parts[1] in SKILLS and parts[2] in ('notes', 'reviews', 'verifications')
-        if not (skill_path or feedback_path or name == 'release.json'):
-            raise SyncError('Out-of-scope publication path: ' + name)
-        if skill_path:
-            if not args.bootstrap:
-                if status != 'D':
-                    mode = git(args.repo, 'ls-tree', 'HEAD', '--', name).split(None, 1)[0]
-                    if mode == b'120000':
-                        raise SyncError('Skill symlinks are prohibited')
-                    if parts[1] != 'typescript' and mode != b'100644':
-                        raise SyncError('Non-TypeScript guidance must be a regular non-executable file')
-                if len(parts) == 3 and parts[2] == 'sources.json':
-                    if status != 'M':
-                        raise SyncError('Source provenance changes require workflow maintenance')
-                    before = json.loads(git(args.repo, 'show', 'refs/remotes/origin/main:' + name))
-                    after = json.loads(git(args.repo, 'show', 'HEAD:' + name))
-                    if not isinstance(before, dict) or not isinstance(after, dict):
-                        raise SyncError('Invalid source provenance')
-                    old_reviews = before.pop('upstreamReview', [])
-                    new_reviews = after.pop('upstreamReview', [])
-                    if before != after:
-                        raise SyncError('Only upstreamReview provenance may evolve')
-                    mutable = {'revision', 'tree', 'reviewedAt'}
-                    if (not isinstance(old_reviews, list) or not isinstance(new_reviews, list)
-                            or any(not isinstance(item, dict) for item in [*old_reviews, *new_reviews])
-                            or [{k: v for k, v in item.items() if k not in mutable} for item in old_reviews]
-                            != [{k: v for k, v in item.items() if k not in mutable} for item in new_reviews]):
-                        raise SyncError('Upstream source enrollment requires workflow maintenance')
-                elif parts[1] != 'typescript' and Path(name).suffix != '.md':
-                    raise SyncError('Supporting file changes require workflow maintenance')
-            changed_skills.add(parts[1])
-        if feedback_path and parts[2] == 'notes' and status != 'A':
-            raise SyncError('Feedback notes are immutable')
-        if feedback_path and parts[2] == 'verifications' and status != 'A':
-            raise SyncError('Source verifications are immutable')
-        if feedback_path and parts[2] == 'reviews' and status in ('A', 'M'):
-            reviewed_skills.add(parts[1])
-            reviews.append(name)
-    if not args.bootstrap and changed_skills - reviewed_skills:
-        raise SyncError('Changed skills require a review record: ' + ', '.join(sorted(changed_skills - reviewed_skills)))
+    scope = publication_scope(args.repo, 'refs/remotes/origin/main', 'HEAD', bootstrap=args.bootstrap)
+    reviews = scope['reviews']
     with worktree(args.repo, 'HEAD') as checkout:
         checksum = validate(checkout, args.validator)
         safe_tree(checkout / 'feedback')

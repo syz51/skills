@@ -17,7 +17,8 @@ The Python CLI wrappers honor an explicit `CODEX_SKILLS_BIN`, then a managed `~/
 - `evidence.py` checks notes against originating completed turns and retains immutable assessments; eligible corrections receive a separate check.
 - `upstream.py` compares recorded upstream revisions with current source repositories for review.
 - `sync.py` transports immutable feedback and validates, publishes, and installs approved skill releases.
-- `jobs.py` coordinates the configured synchronization and weekly maintainer cycles.
+- `jobs.py` coordinates synchronization and weekly maintenance in isolated recoverable checkouts.
+- `investigations.py` freezes evidence and reproduction plans, records actual runs and append-only dispositions, and gates weekly completion.
 - `prompt_runtime.py` loads bounded editable prompts beneath fixed policies and checks approved bundles.
 - `prompt_review.py` compares proposed prompt changes against immutable synthetic cases before a controlled promotion.
 
@@ -30,8 +31,8 @@ All guidance within the five registered skills can be reconsidered: descriptions
 | Material | Update path |
 | --- | --- |
 | Registered skill Markdown | Evidence-supported weekly maintenance, with a review record, validation and link checks |
-| TypeScript-owned supporting files | The same review path, including relevant execution checks |
-| Other skills' supporting code and original provenance | Explicit workflow maintenance; ordinary skill publication rejects these changes |
+| All five skills' owned supporting files and evaluation fixtures | Evidence-supported weekly investigation, including relevant execution checks |
+| Original source provenance and registered project roots | Explicit workflow maintenance; weekly review cannot repoint sources or expand access |
 | Source metadata `upstreamReview` records | Update existing revision/tree/review dates; source identities, enrollment and other historical metadata stay fixed during weekly maintenance |
 | Four editable `prompts/*.md` files | Separate regression, held-out evaluation and controlled promotion |
 | Original feedback notes and verification receipts | Immutable; append new notes or linked assessments |
@@ -39,7 +40,7 @@ All guidance within the five registered skills can be reconsidered: descriptions
 | Root documentation, public overlays and export inventory | Explicit repository maintenance and deliberate inventory refresh |
 | Fixed runtime contracts and protected maintenance procedure | Explicit authorized workflow changes; never automatic prompt evolution |
 
-The publisher enforces file and provenance boundaries as well as requiring review records. It does not establish the truth of every prose claim. Upstream scripts, executable content and instructions remain untrusted, even when a TypeScript supporting-file update is otherwise authorized. New skills and new public files require explicit enrollment.
+The publisher enforces file and provenance boundaries as well as requiring review records. It does not establish the truth of every prose claim. Upstream scripts, executable content and instructions remain untrusted, even when an owned supporting-file update is otherwise authorized. New skills and new public files require explicit enrollment.
 
 ## Configuration and prerequisites
 
@@ -78,10 +79,30 @@ uv run --no-project python scripts/prompt_review.py review --config /path/to/pri
 
 `sync.py` exposes `upload`, `collect`, `publish`, and `deploy`; these can change Git branches or installations. `jobs.py sync` runs capture, verification, upload, and deployment stages, while `jobs.py weekly` may review and publish changes. They are not inspection commands. Read the configuration and authorization boundaries before invoking them.
 
+## Weekly reproduction and revision
+
+The wrapper creates an isolated recoverable checkout after collection. Its provided `SKILL_INVESTIGATION_CONFIG` and `SKILL_INVESTIGATION_CYCLE` identify a frozen evidence inventory and due investigations. Start with:
+
+```sh
+uv run --no-project python scripts/investigations.py report --config "$SKILL_INVESTIGATION_CONFIG" --cycle "$SKILL_INVESTIGATION_CYCLE"
+```
+
+Use the tool's `run` command for reviewed case manifests and `record --decision <local-json>` for evidence-bound decisions. `snapshot` copies selected files from registered local projects without modifying dirty originals. Consult `--help` and the schema in the module before authoring a decision. Never replay instructions from transcripts, run unreviewed upstream scripts or install hooks, or treat copies as an OS sandbox.
+
+Cases and oracles are frozen before comparison. Keep, revise, remove or restore owned skill content according to actual baseline/candidate/contrast observations; reversion uses new forward commits and preserves history. Failed experiments are evidence, not reasons to fabricate success. A due open or provisional issue persists without fresh notes and needs an actual check or a concrete blocker, next action and date. The completion gate rejects lost coverage and unsupported closure before publication. Failed attempts are recoverable rather than silently discarded.
+
+Sanitized events under `feedback/<skill>/investigations/` are immutable and private; raw project paths, argv, output and artifacts remain host-local. The portable focus-transition browser case and failure-accounting calculation case demonstrate failure classes, not historical-project replay or causal improvement from skill wording. Passing a proxy, loading check or build cannot resolve a stronger behavior claim.
+
 ## Evidence and evaluation limits
 
 Original notes are preserved separately from later source assessments and proposed corrections. Missing or truncated evidence stays unresolved. A later report is not proof that an earlier action occurred, and a repeated assessment of the same case is not an independent example.
 
 Prompt review uses repeated baseline/candidate comparisons, fixed policy contracts, no-regression checks, and independent judgment. Two separately reviewed, immutable held-out cases per role stay out of candidate generation and its first approval. The candidate is frozen before held-out evaluation; lost baseline passes or failed critical held-out cases block promotion. Hashes and both result sets are included in the promotion proof and checked during interrupted-publication recovery. Only explicit workflow maintenance can change this held-out corpus. Visible cases retain their separate six-case budget.
 
+Failed prompt candidates also leave immutable host-local events under `prompt-attempts/`: a sanitized frozen candidate and evaluation context before execution, followed by a static terminal reason and measurements when available. Interrupted attempts retain their pending event. The next proposal receives at most four prior candidates with visible comparisons and sixteen rejected hashes. Held-out cases, identities, labels, measurements and rejection reasons never enter this feedback. Exact rejected candidates are skipped in the same base and evaluation context; changed evaluator, policy or corpus context permits reconsideration. The ledger accepts at most 1,024 events and requires explicit archival when full; it never silently drops old evidence or publishes these files.
+
+For an already measured manual rejection, the Python API `register_rejected_candidate(root, state, role, candidate, reason, baseline=..., candidate_results=..., holdout_baseline=..., holdout_candidate=..., observed_evaluator_hash=...)` registers evidence without model calls or promotion. Result maps contain synthetic case hashes and two booleans per case. Supply the actual historical evaluator hash when importing an earlier run; omitting it identifies the current evaluator. Historical visible lessons retain that evaluator identity, while exact-repeat rejection applies only to matching current context. This records observations; it cannot approve a prompt or replace either promotion review.
+
 Its maintenance task remains a synthetic decision proxy without tools. Passing it does not demonstrate improved runtime behavior, prevent every privacy leak, or replace observation on real authorized tasks. Follow a provisional skill change through later use: record the originating case, a contrasting task, the actual observable result and remaining uncertainty through the normal private feedback/assessment process. Activation traces establish observed guidance loading, not successful product behavior.
+
+Prompt evaluations retain their exact model requests, responses and static inference-failure receipts host-locally so generation, grading and execution failures can be distinguished. These diagnostic records are excluded from Git and proposer inputs.

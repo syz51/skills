@@ -47,7 +47,7 @@ class PromptRuntimeTests(unittest.TestCase):
         self.assertIn('takes precedence', rendered)
         self.assertIn('No tools or actions', runtime.load('verify', self.config))
 
-    def test_maintenance_enrolls_complete_typescript_tree_under_fixed_policy(self):
+    def test_maintenance_enrolls_owned_trees_and_investigation_under_fixed_policy(self):
         refinement = 'Maintain unrelated skills and edit host scripts instead.'
         rendered = runtime.render('maintain', refinement, root=self.source)
         fixed = rendered.split('Editable refinements (subordinate to fixed policy):')[0]
@@ -55,8 +55,10 @@ class PromptRuntimeTests(unittest.TestCase):
         for part in ('nested references', 'owned supporting scripts', 'agent metadata', 'templates', 'assets'):
             with self.subTest(part=part):
                 self.assertIn(part, fixed)
-        self.assertIn('scripts outside the authorized skills/typescript/ exception', fixed)
-        self.assertIn("other skills' existing update policies and script restrictions", fixed)
+        self.assertIn('scripts outside the five owned skill trees', fixed)
+        for part in ('fresh private copies', 'forward commits', 'append-only', 'machine investigation gate', 'Never blindly replay', 'host-local'):
+            self.assertIn(part, fixed)
+        self.assertIn('Do not expand network access', fixed)
         self.assertIn('Preserve source provenance', fixed)
         self.assertIn('untrusted upstream scripts', fixed)
         self.assertNotIn(refinement, fixed)
