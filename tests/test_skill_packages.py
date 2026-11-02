@@ -1,5 +1,6 @@
 """License obligations must survive installing a single skill directory."""
 from pathlib import Path
+import hashlib
 import json
 import unittest
 
@@ -45,6 +46,25 @@ class SkillPackageTests(unittest.TestCase):
             with self.subTest(source=name):
                 expected = published_file(f'licenses/{name}.txt').read_bytes()
                 self.assertEqual(published_file(f'skills/frontend-ui/licenses/{name}.txt').read_bytes(), expected)
+
+    def test_retained_unocss_provenance_and_public_enrollment(self):
+        metadata = json.loads(published_file('skills/frontend-ui/sources.json').read_text())
+        proof = metadata['retainedReferenceProvenance']
+        license_bytes = published_file('skills/frontend-ui/licenses/antfu-skills.txt').read_bytes()
+        self.assertEqual(hashlib.sha256(license_bytes).hexdigest(), proof['licenseSha256'])
+        original = metadata['sources']['antfu-design']['sha256']
+        inventory = ROOT / 'public/export.json'
+        entries = ({e['target']: e['source'] for e in json.loads(inventory.read_text())['files']}
+                   if inventory.is_file() else None)
+        self.assertEqual(len(proof['files']), 3)
+        for relative, record in proof['files'].items():
+            with self.subTest(reference=relative):
+                historical = record['upstreamPath'].removeprefix('skills/antfu-design/')
+                self.assertEqual(original[historical], record['upstreamSha256'])
+                self.assertTrue(published_file('skills/frontend-ui/' + relative).is_file())
+                if entries is not None:
+                    target = 'skills/frontend-ui/' + relative
+                    self.assertEqual(entries.get(target), target)
 
     def test_notices_and_preexisting_licenses_remain_in_packages(self):
         for skill in ('frontend-ui', 'find-skills'):

@@ -1454,7 +1454,7 @@ def failure_reason(error):
     return reasons.get(str(error), 'model or schema extraction failure')
 
 
-def capture(config, state_root, *, now=None):
+def capture(config, state_root, *, now=None, retry_now=False):
     deadline = time.monotonic() + CYCLE_TIMEOUT
     state_root = Path(state_root)
     safe_path(state_root)
@@ -1521,7 +1521,7 @@ def capture(config, state_root, *, now=None):
         evidence = turn['evidence_id']
         deferred = state['deferred'].get(evidence, {})
         clock = now or datetime.now(timezone.utc)
-        if deferred.get('retry_at') and clock < timestamp(deferred['retry_at']):
+        if not retry_now and deferred.get('retry_at') and clock < timestamp(deferred['retry_at']):
             errors += 1
             continue
         attempted += 1
@@ -1592,6 +1592,8 @@ def capture(config, state_root, *, now=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/codex-skills/config.json')
+    parser.add_argument('--retry-now', action='store_true',
+                        help='Retry deferred evidence now, retaining all validation and cycle limits')
     args = parser.parse_args()
     root = args.config.expanduser().resolve().parent
     status_path = root / 'capture-status.json'
@@ -1611,7 +1613,7 @@ def main():
                 if config.get('host_id') not in ('client-host', 'maintainer-host') or not Path(config.get('codex_path', '')).is_file():
                     raise ValueError('Invalid capture host configuration')
                 status['cli_version'] = cli_version(config)
-                status['counts'] = capture(config, root)
+                status['counts'] = capture(config, root, retry_now=args.retry_now)
                 status['success'] = status['counts']['errors'] == 0
                 if not status['success']:
                     status['error'] = 'Capture has deferred evidence; source remains pending.'
@@ -1627,7 +1629,8 @@ def main():
             print(json.dumps(summary))
             return 0 if status['success'] else 1
     except BlockingIOError:
-        return 0
+        print('Capture busy; no completed result was produced.')
+        return 75
     except (OSError, ValueError):
         print('Capture preflight failed; evidence remains pending.')
         return 1

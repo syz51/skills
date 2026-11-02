@@ -4,9 +4,15 @@ The shared rules govern design and scope. Keep platform-specific workflows and r
 
 ## UnoCSS
 
-Use the project's installed UnoCSS version and its [official documentation](https://unocss.dev/). Reuse existing tokens, shortcuts, extraction rules, theme behavior, and Floating Vue integration. Preserve established Attributify usage unless the requested change requires otherwise.
+Use the bundled [token combinations](unocss/core-tokens-and-combinations.md), [class utility guidance](unocss/best-practices-class-utilities-over-attributify.md), and [Floating Vue setup](unocss/features-floating-vue-overrides.md) when the project uses UnoCSS:
 
-Three copied UnoCSS reference snapshots are omitted from this public edition pending source-provenance review.
+- Reuse semantic shortcuts and existing token families; define named overlay layers when the project needs them.
+- Prefer class-based utilities for new examples. Preserve established Attributify code unless changing it is necessary or requested.
+- Keep generated icon and status classes statically discoverable; use the project's extraction or safelist mechanism when necessary.
+- Reuse existing tooltip/popover setup and compatible Floating Vue overrides rather than adding that library.
+- Avoid scattering raw values where project tokens exist, and check how modifiers interact with shortcuts.
+
+Do not install UnoCSS to satisfy this guide. The old dual-theme mandate, dials, palette and punctuation bans, mandatory monospace, and fixed animation recipes are superseded by the choices in the shared policy.
 
 ## Sites
 

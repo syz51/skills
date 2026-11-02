@@ -30,4 +30,6 @@ class RepositoryContentTests(unittest.TestCase):
 
     def test_prompt_bundle_and_hash_addressed_cases_are_valid(self):
         prompt_runtime.bundle_hash(ROOT, allow_legacy=False)
-        prompt_review.load_cases(ROOT)
+        cases = prompt_review.load_cases(ROOT)
+        holdouts = prompt_review.load_cases(ROOT, holdouts=True)
+        self.assertFalse({prompt_review.digest(c) for c in cases} & {prompt_review.digest(c) for c in holdouts})

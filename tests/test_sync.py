@@ -92,6 +92,95 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         self.commit('Add bounded prompt bundle')
         sync.git(self.repo, 'push', 'origin', 'main')
 
+    def test_non_typescript_supporting_files_cannot_publish(self):
+        self.release()
+        path = self.repo / 'skills/frontend-ui/scripts/new-helper.sh'
+        path.parent.mkdir()
+        path.write_text('exit 0\n')
+        path.chmod(0o755)
+        review = self.repo / 'feedback/frontend-ui/reviews/change.md'
+        review.parent.mkdir(parents=True)
+        review.write_text('Reviewed fixture change.\n')
+        self.commit()
+        with self.assertRaisesRegex(sync.SyncError, 'Supporting file|non-executable'):
+            sync.publish(self.args)
+
+    def test_typescript_supporting_files_publish_and_deploy(self):
+        self.release()
+        path = self.repo / 'skills/typescript/scripts/helper.sh'
+        path.parent.mkdir()
+        path.write_text('exit 0\n')
+        path.chmod(0o755)
+        review = self.repo / 'feedback/typescript/reviews/change.md'
+        review.parent.mkdir(parents=True)
+        review.write_text('Reviewed fixture change.\n')
+        self.commit()
+        self.assertTrue(sync.publish(self.args))
+        self.assertTrue(sync.deploy(self.args))
+        self.assertEqual((self.args.install_root / 'current/skills/typescript/scripts/helper.sh').read_text(), 'exit 0\n')
+
+    def test_nested_markdown_and_upstream_review_can_evolve(self):
+        self.release()
+        source = self.repo / 'skills/frontend-ui/sources.json'
+        record = {'id': 'guide', 'repository': 'https://github.com/example/guide.git',
+                  'path': 'guide', 'local': '.', 'revision': 'a' * 40, 'tree': 'b' * 40,
+                  'reviewedAt': '2026-10-01T00:00:00+00:00'}
+        source.write_text(json.dumps({'origin': 'retained', 'upstreamReview': [record]}))
+        self.commit()
+        sync.git(self.repo, 'push', 'origin', 'main')
+        source.write_text(json.dumps({'origin': 'retained', 'upstreamReview': [
+            {**record, 'revision': 'c' * 40, 'tree': 'd' * 40,
+             'reviewedAt': '2026-11-02T00:00:00+00:00'}]}))
+        path = self.repo / 'skills/frontend-ui/references/nested/example.md'
+        path.parent.mkdir(parents=True)
+        path.write_text('# Guidance\n\n```sh\nbun test\n```\n')
+        entry = self.repo / 'skills/frontend-ui/SKILL.md'
+        entry.write_text(entry.read_text().replace('description: Fixture', 'description: Clarified fixture') +
+                         '\n[Example](references/nested/example.md)\n')
+        review = self.repo / 'feedback/frontend-ui/reviews/change.md'
+        review.parent.mkdir(parents=True)
+        review.write_text('Reviewed metadata, frontmatter and nested code example.\n')
+        self.commit()
+        self.assertTrue(sync.publish(self.args))
+        self.assertTrue(sync.deploy(self.args))
+        self.assertEqual((self.args.install_root / 'current/skills/frontend-ui/references/nested/example.md').read_text(), path.read_text())
+
+    def test_executable_markdown_is_not_accepted_as_guidance(self):
+        self.release()
+        path = self.repo / 'skills/frontend-ui/guide.md'
+        path.write_text('# Guidance\n')
+        path.chmod(0o755)
+        self.commit()
+        with self.assertRaisesRegex(sync.SyncError, 'non-executable'):
+            sync.publish(self.args)
+
+    def test_source_provenance_outside_upstream_review_is_fixed(self):
+        self.release()
+        path = self.repo / 'skills/frontend-ui/sources.json'
+        path.write_text(json.dumps({'origin': 'retained', 'upstreamReview': []}))
+        self.commit()
+        sync.git(self.repo, 'push', 'origin', 'main')
+        path.write_text(json.dumps({'origin': 'changed', 'upstreamReview': []}))
+        self.commit()
+        with self.assertRaisesRegex(sync.SyncError, 'Only upstreamReview'):
+            sync.publish(self.args)
+
+    def test_upstream_enrollment_and_source_identity_are_fixed(self):
+        self.release()
+        path = self.repo / 'skills/frontend-ui/sources.json'
+        record = {'id': 'guide', 'repository': 'https://github.com/example/guide.git',
+                  'path': 'guide', 'local': '.', 'revision': 'a' * 40, 'tree': 'b' * 40}
+        path.write_text(json.dumps({'upstreamReview': [record]}))
+        self.commit()
+        sync.git(self.repo, 'push', 'origin', 'main')
+        variants = ([{**record, key: 'changed'}] for key in ('id', 'repository', 'path', 'local'))
+        for records in [*variants, [], [record, {**record, 'id': 'extra'}]]:
+            with self.subTest(records=records):
+                path.write_text(json.dumps({'upstreamReview': records}))
+                self.commit()
+                with self.assertRaisesRegex(sync.SyncError, 'enrollment requires workflow'):
+                    sync.publish(self.args)
+
     def test_new_tauri_skill_publishes_and_deploys_from_existing_release(self):
         old_registry = tuple(skill for skill in sync.SKILLS if skill != 'tauri')
         with patch.object(sync, 'SKILLS', old_registry):

@@ -49,6 +49,6 @@ Inspect failed traces before changing an expectation. Add a synthetic regression
 
 Raw traces can contain local instructions and paths. Keep them outside the repository and public inventory, inspect them locally, and delete the run directory when finished. Commit synthetic fixtures and concise verification records rather than real transcripts. Live tests are opt-in and are not silently added to credential-free CI.
 
-The separate `prompt-evals/` corpus tests bounded maintenance-role decisions; it is not a replacement for activation evaluations. Prompt-role validation respects each case's eligible skill scope, and evidence/evaluator fingerprints include the shared guidance parser so semantic changes invalidate applicable assessments.
+The separate `prompt-evals/cases/` corpus tests bounded maintenance-role decisions; it is not a replacement for activation evaluations. `prompt-evals/holdouts/` contains separately reviewed cases withheld from candidate generation and its first approval. Both sets are hash-addressed; automatic publication cannot edit held-out cases. Promotion requires a repeatable visible-case gain, no lost baseline passes and all critical held-out cases passing. The maintenance task remains a tool-free decision proxy. Prompt-role validation respects each case's eligible skill scope, and evidence/evaluator fingerprints include the shared guidance parser so semantic changes invalidate applicable assessments.
 
 This approach follows the [OpenAI skill evaluation guidance](https://developers.openai.com/blog/eval-skills).

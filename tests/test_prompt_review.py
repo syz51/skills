@@ -96,6 +96,87 @@ class PromptReviewTests(unittest.TestCase):
         self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
         self.assertFalse((self.repo / 'prompt-reviews').exists())
 
+    def test_holdouts_are_withheld_until_candidate_is_frozen_and_recorded(self):
+        result = self.run_review()
+        self.assertEqual(result['outcome'], 'promoted')
+        holdouts = review.load_cases(self.repo, holdouts=True)
+        proposal = next(data for _, data, _ in self.calls if 'current_text' in data)
+        oracle = next(data for prompt, data, _ in self.calls if prompt == review.REVIEW_PROMPT)
+        for case in holdouts:
+            self.assertNotIn(case, proposal['cases'])
+            self.assertNotIn(json.dumps(case, sort_keys=True), json.dumps(oracle, sort_keys=True))
+            source = json.loads(case['input'])
+            texts = [m['text'] for m in source.get('messages', [])] or [source.get('scenario', '')]
+            for text in texts:
+                self.assertNotIn(text, json.dumps(proposal))
+                self.assertNotIn(text, json.dumps(oracle))
+        self.assertNotIn('holdout_baseline', proposal)
+        self.assertNotIn('holdout_baseline', oracle['artifact'])
+        record = json.loads(next((self.repo / 'prompt-reviews').glob('*.json')).read_text())
+        self.assertEqual(record['holdout_dataset_hash'], review.digest(holdouts))
+        self.assertTrue(review.holdout_passes(record['holdout_baseline'], record['holdout_candidate'],
+                                             [c for c in holdouts if c['role'] == 'extract']))
+
+    def test_training_gain_cannot_hide_heldout_failure(self):
+        original = review.evaluate
+        def evaluate(config, state, root, role, text, cases, deadline):
+            values = original(config, state, root, role, text, cases, deadline)
+            if cases == review.load_cases(root, holdouts=True) and 'REFINED' in text:
+                values[next(iter(values))] = [False, False]
+            return values
+        with patch.object(review, 'evaluate', side_effect=evaluate):
+            result = self.run_review()
+        self.assertEqual(result['reason'], 'held_out_regression')
+        self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
+        self.assertEqual(len([c for c in self.calls if c[0] == review.REVIEW_PROMPT]), 1)
+
+    def test_heldout_gate_requires_complete_consistent_critical_results(self):
+        cases = [c for c in review.load_cases(self.repo, holdouts=True) if c['role'] == 'extract']
+        good = {review.digest(c): [True, True] for c in cases}
+        self.assertTrue(review.holdout_passes(good, good, cases))
+        bad = {**good, next(iter(good)): [False, True]}
+        self.assertFalse(review.holdout_passes(good, bad, cases))
+        self.assertFalse(review.holdout_passes(bad, bad, cases))
+        self.assertFalse(review.holdout_passes({}, {}, cases))
+        self.assertFalse(review.holdout_passes(good, {**good, 'extra': [True, True]}, cases))
+
+    def test_missing_overlapping_or_tampered_holdouts_fail_before_model(self):
+        directory = self.repo / 'prompt-evals/holdouts'
+        paths = {p.name: p.read_bytes() for p in directory.glob('*.json')}
+        for fault in ('missing', 'overlap', 'tampered'):
+            with self.subTest(fault=fault):
+                for p in directory.glob('*.json'):
+                    p.unlink()
+                for name, data in paths.items():
+                    (directory / name).write_bytes(data)
+                if fault == 'missing':
+                    for p in directory.glob('*.json'):
+                        if json.loads(p.read_text())['role'] == 'extract':
+                            p.unlink()
+                elif fault == 'overlap':
+                    p = next(directory.glob('*.json'))
+                    role = json.loads(p.read_text())['role']
+                    for q in directory.glob('*.json'):
+                        if json.loads(q.read_text())['role'] == role:
+                            q.unlink()
+                    case = next(c for c in review.load_cases(self.repo) if c['role'] == role)
+                    (directory / (review.digest(case) + '.json')).write_bytes(review.encoded(case))
+                else:
+                    p = next(directory.glob('*.json'))
+                    case = json.loads(p.read_text())
+                    case['rubric'] += ' Additional requirement.'
+                    p.write_bytes(review.encoded(case))
+                with patch.object(review, 'model') as model:
+                    with self.assertRaises(ValueError):
+                        review.review(self.config, self.state, self.repo, self.base, 'extract', review.due_key(self.due), time.monotonic() + 60)
+                    model.assert_not_called()
+
+    def test_new_training_case_cannot_copy_a_holdout(self):
+        self.proposal_change = {'new_case': next(c for c in review.load_cases(self.repo, holdouts=True) if c['role'] == 'extract')}
+        result = self.run_review()
+        self.assertEqual(result['reason'], 'rejected_candidate')
+        self.assertFalse(any(prompt == review.REVIEW_PROMPT for prompt, _, _ in self.calls))
+
     def test_wrong_base_role_and_unapproved_candidate_rejected(self):
         for changes in ({'base_hash': 'stale'}, {'role': 'maintain'}, {'text': '\x00bad'}):
             with self.subTest(changes=changes):
@@ -291,7 +372,7 @@ class PromptReviewTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.run_review()
         pushed = review.git(self.repo, 'rev-parse', 'origin/main')
-        for index, fault in enumerate(('base_hash', 'approval_hashes', 'gain', 'scope')):
+        for index, fault in enumerate(('base_hash', 'approval_hashes', 'gain', 'holdout_hash', 'holdout_results', 'scope')):
             with self.subTest(fault=fault):
                 competitor = self.root / ('tampered-' + str(index))
                 subprocess.run(['git', 'clone', '-b', 'main', str(self.remote), str(competitor)], check=True, capture_output=True)
@@ -306,6 +387,10 @@ class PromptReviewTests(unittest.TestCase):
                     audit['approval_hashes'] = ['0' * 64]
                 elif fault == 'gain':
                     audit['candidate'] = audit['baseline']
+                elif fault == 'holdout_hash':
+                    audit['holdout_dataset_hash'] = '0' * 64
+                elif fault == 'holdout_results':
+                    audit['holdout_candidate'][next(iter(audit['holdout_candidate']))] = [False, False]
                 else:
                     (competitor / 'unrelated').write_text('out of scope')
                 (path.parent / (review.digest(audit) + '.json')).write_bytes(review.encoded(audit))

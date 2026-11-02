@@ -211,25 +211,23 @@ def execute(args, now=None):
                 else:
                     status['stages'][name] = {'success': True}
 
-            def capture():
-                run([config['python_path'], str(repo / 'scripts/capture.py'), '--config', str(config_path)],
+            def source_stage(name):
+                began_at = datetime.now(timezone.utc)
+                run([config['python_path'], str(repo / ('scripts/' + name + '.py')), '--config', str(config_path)],
                     log, env, timeout=1200)
-                if args.command == 'weekly':
-                    captured = json.loads((state_root / 'capture-status.json').read_text())
-                    pending = captured['counts']['pending']
-                    if captured.get('success') is not True or type(pending) is not int or pending < 0:
-                        raise RuntimeError('Invalid completed capture status')
-                    return pending == 0
+                completed = json.loads((state_root / (name + '-status.json')).read_text())
+                pending = completed['counts']['pending']
+                finished = datetime.fromisoformat(completed['finished_at'])
+                if (completed.get('success') is not True or type(pending) is not int or pending < 0 or
+                        finished.tzinfo is None or not began_at <= finished <= datetime.now(timezone.utc)):
+                    raise RuntimeError('Invalid or stale source stage result')
+                return pending == 0 if args.command == 'weekly' else True
+
+            def capture():
+                return source_stage('capture')
 
             def evidence():
-                run([config['python_path'], str(repo / 'scripts/evidence.py'), '--config', str(config_path)],
-                    log, env, timeout=1200)
-                if args.command == 'weekly':
-                    verified = json.loads((state_root / 'evidence-status.json').read_text())
-                    pending = verified['counts']['pending']
-                    if verified.get('success') is not True or type(pending) is not int or pending < 0:
-                        raise RuntimeError('Invalid source verification status')
-                    return pending == 0
+                return source_stage('evidence')
 
             try:
                 stage('capture', capture, 'Feedback capture failed',

@@ -103,7 +103,7 @@ npx skills add <owner/repo@skill> -g -y
 
 The `-g` flag installs globally (user-level) and `-y` skips confirmation prompts.
 
-Never install over a locally maintained skill (`frontend-ui`, `content-research-writer`, `find-skills`, or `tauri`); those discovery paths link into a managed release, and overwriting one blocks later deployments. Report the name conflict instead.
+Never install over a locally maintained skill (`frontend-ui`, `content-research-writer`, `find-skills`, `tauri`, or `typescript`); those discovery paths link into a managed release, and overwriting one blocks later deployments. Report the name conflict instead.
 
 ## Common Skill Categories
 

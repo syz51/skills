@@ -7,7 +7,7 @@ The root MIT license covers original contributions. Retained third-party text an
 | [Anthropic skills](https://github.com/anthropics/skills/tree/41bbe19d1a1a7eaab5e7bb9050a417e5c6cffc8f/skills/frontend-design) | Frontend-design source for consolidated guidance | Retained [Apache-2.0 license](skills/frontend-ui/licenses/frontend-design.txt) |
 | [Uncodixfy](https://github.com/cyxzdev/Uncodixfy/tree/de11774974165ed45a09f1a40b95d13994939992) | Source for consolidated frontend guidance | [MIT notice](skills/frontend-ui/licenses/uncodixfy.txt), obtained at e0e028058b5259debdd94b78147c6d6c77bf7da2; upstream SKILL.md and Uncodixfy.md were verified byte-identical to the recorded older source |
 | [make-interfaces-feel-better](https://github.com/jakubkrehel/make-interfaces-feel-better/tree/27355fc332ce3dee6af7107b9224152ad3812066) | Source for consolidated polish guidance | [MIT notice](skills/frontend-ui/licenses/make-interfaces-feel-better.txt) |
-| [antfu/skills](https://github.com/antfu/skills) | Vue, Nuxt, Nitro, Pinia, Vite, VitePress, and Vitest references | [MIT notice](skills/frontend-ui/licenses/antfu-skills.txt), identical at the three recorded commits listed below |
+| [antfu/skills](https://github.com/antfu/skills) | Vue, Nuxt, Nitro, Pinia, Vite, VitePress, Vitest, and retained UnoCSS references | [MIT notice](skills/frontend-ui/licenses/antfu-skills.txt), identical at the three recorded commits listed below |
 | [Vercel agent-skills](https://github.com/vercel-labs/agent-skills/blob/ba46938889d4e58635362fb8f618e1178ac3ec46/README.md#license) | Web-design-guidelines source for consolidated guidance | Recorded README explicitly declares MIT; declaration retained below |
 | [Vercel skills](https://github.com/vercel-labs/skills/tree/773fb2c7bbf16781670a3520affc4abd0c6151ae/skills/find-skills) | Adapted find-skills entrypoint | Retained [MIT notice](skills/find-skills/licenses/vercel-labs-skills.txt) and [attribution](skills/find-skills/ATTRIBUTION.md) |
 | [vuejs-ai/skills](https://github.com/vuejs-ai/skills) | Vue best practices, router, and testing references | Retained license in each corresponding reference directory |
@@ -24,7 +24,7 @@ The pinned Vercel agent-skills README contains the following license declaration
 >
 > MIT
 
-The frontend source attribution also records antfu/design and its upstream inspirations. The three copied UnoCSS reference files are omitted from this initial public export because their installed snapshot could not be pinned to a verified upstream revision. This notice does not assert a license for those omitted files.
+The frontend source attribution also records antfu/design and its upstream inspirations. The three retained UnoCSS references match original files at antfu/skills revision `11cefdc7fda24f056763a1d644b5f8160de6ef49`, with their existing local scope adaptations recorded in source metadata. Its `LICENSE.md` is byte-identical to the bundled antfu-skills MIT notice.
 
 ## Rewritten guidance and conceptual sources
 

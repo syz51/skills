@@ -11,6 +11,33 @@ sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
 import public_export as export
 
 
+class NativeEntrypointTests(unittest.TestCase):
+    def test_managed_binary_and_explicit_override_precede_legacy_install(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            managed = home / '.local/share/codex-skills/public-export/bin/current'
+            managed.parent.mkdir(parents=True)
+            version = managed.with_name('versioned')
+            version.write_text('fixture')
+            version.chmod(0o755)
+            managed.symlink_to(version)
+            override = home / 'override'
+            override.write_text('fixture')
+            override.chmod(0o755)
+            for environment, expected in (({}, managed), ({'CODEX_SKILLS_BIN': str(override)}, override)):
+                with self.subTest(environment=environment), patch.object(export.Path, 'home', return_value=home), \
+                        patch.dict(export.os.environ, environment, clear=True), \
+                        patch.object(export.os, 'execv', side_effect=RuntimeError('exec selected')) as execute:
+                    with self.assertRaisesRegex(RuntimeError, 'exec selected'):
+                        export.rust_cli(['plan'])
+                    execute.assert_called_once_with(str(expected), [str(expected), 'plan'])
+            version.unlink()
+            with patch.object(export.Path, 'home', return_value=home), \
+                    patch.dict(export.os.environ, {}, clear=True), patch.object(export.os, 'execv') as execute:
+                self.assertEqual(export.rust_cli(['plan']), 1)
+                execute.assert_not_called()
+
+
 class ExportTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

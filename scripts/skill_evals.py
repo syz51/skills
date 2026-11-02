@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,7 +22,19 @@ REFERENCES = {
     'typescript/map': ('typescript', 'references/skill-map.md'),
     'frontend-ui/vue-tooling': ('frontend-ui', 'references/vue-typescript-tooling.md'),
 }
-SAFETY = '\nWork directly without delegates. Read-only: do not edit files, install dependencies, browse, connect accounts, or run project commands. Use local files and applicable guidance only.'
+SAFETY = '''
+Work directly without delegates. Read-only: do not edit files, install dependencies,
+browse, connect accounts, or run project commands. This task is self-contained:
+use only this fixture, applicable skill guidance and its guidance reader; do not
+consult user memory or unrelated saved history. Prefer the canonical guidance
+reader in a separate command per file, with at least 8000 output tokens, and
+follow next_start until the file is complete. If the reader cannot run because
+of sandbox, cache or runtime restrictions, use separate single-file cat or sed
+reads with complete visible output. Do not change permissions, install tools or
+claim loading from a failed read. Do not combine guidance reads
+with project-file reads or inventory commands. Preserve the configured skill
+selection and frontend-before-language order; loading is not runtime proof.
+'''
 
 
 def relative(value):
@@ -142,14 +155,27 @@ def run_case(case, output_dir, folders, executable, timeout=240, model=None, can
             (discovery / owner).symlink_to(source, target_is_directory=True)
         (fixture / 'AGENTS.md').write_text(
             f'For frontend/UI work, read {folders["frontend-ui"] / "SKILL.md"} first.\n'
-            f'For TypeScript implementation, review, debugging or configuration work, read {folders["typescript"] / "SKILL.md"}; for frontend work apply both.\n')
+            f'For TypeScript implementation, review, debugging or configuration work, read {folders["typescript"] / "SKILL.md"}. '
+            'When that TypeScript task also involves frontend/UI work, complete frontend-ui first and apply both. '
+            'Frontend work without TypeScript does not require the TypeScript skill.\n'
+            f'Prefer reading guidance with uv run --script {shlex.quote(str(ROOT / "scripts/read_guidance.py"))} '
+            '<absolute-guidance-path>, one file per command with at least 8000 output tokens. '
+            'Follow every next_start continuation before reading later guidance. '
+            'If sandbox, cache or runtime restrictions prevent the reader from running, use separate '
+            'single-file cat or sed reads with complete visible output; keep permissions unchanged. '
+            'Complete frontend-ui before reading TypeScript for frontend work.\n')
     before_fixture = tree_snapshot(fixture)
     before_skills = {name: tree_snapshot(path.resolve()) for name, path in folders.items()}
     targets = snapshot_targets(folders)
     if candidate:
         specs = {name: (name, 'SKILL.md') for name in SKILLS} | REFERENCES
         for key, (owner, relative_path) in specs.items():
-            targets[key]['aliases'].append(str(fixture / '.agents/skills' / owner / relative_path))
+            # macOS may canonicalize /var to /private/var in the CLI's cwd.
+            # Resolve the fixture parent, retaining the discovery-link path.
+            for base in (fixture, fixture.resolve()):
+                alias = str(base / '.agents/skills' / owner / relative_path)
+                if alias not in targets[key]['aliases']:
+                    targets[key]['aliases'].append(alias)
     (directory / 'targets.json').write_text(json.dumps(targets, indent=2) + '\n')
     (directory / 'case.json').write_text(json.dumps(case, indent=2) + '\n')
     command = [executable, 'exec', '--ephemeral', '--json', '--sandbox', 'read-only', '--skip-git-repo-check',

@@ -482,6 +482,57 @@ struct State {
     public_commit: String,
     source_commit: String,
 }
+// Validate only the managed snapshot, never public-owned additions. Recheck Rust
+// on every changed Rust-containing export: shared Markdown/scripts/config can
+// affect tests too, and no-op exports still skip all candidate execution.
+fn rust_checks(validation: &Path, state: &Path, cargo: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let checks: &[&[&str]] = &[
+        &["fmt", "--all", "--", "--check"],
+        &[
+            "clippy",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &["test", "--locked"],
+    ];
+    let mut log = Vec::new();
+    for args in checks {
+        log.extend(format!("cargo {}\n", args.join(" ")).bytes());
+        let mut cmd = Command::new(cargo);
+        cmd.args(*args)
+            .current_dir(validation)
+            .env("CARGO_TARGET_DIR", validation.join("target"));
+        let result = command(cmd, deadline.saturating_duration_since(Instant::now()));
+        match result {
+            Ok((ok, out, err)) => {
+                log.extend(out);
+                log.extend(err);
+                fs::write(
+                    state.join("candidate-rust-tests.log"),
+                    &log[log.len().saturating_sub(65536)..],
+                )?;
+                if !ok {
+                    return Err("Public candidate Rust checks failed".into());
+                }
+            }
+            Err(error) => {
+                // Static subprocess diagnostics; no model or private source text.
+                log.extend(error.to_string().bytes());
+                fs::write(
+                    state.join("candidate-rust-tests.log"),
+                    &log[log.len().saturating_sub(65536)..],
+                )?;
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn execute(
     c: &Config,
     publish: bool,
@@ -494,6 +545,15 @@ fn execute_with_destination(
     publish: bool,
     generate: &dyn Fn(&str) -> Result<CommitMessage>,
     destination: &str,
+) -> Result<ExportResult> {
+    execute_with_checks(c, publish, generate, destination, Path::new("cargo"))
+}
+fn execute_with_checks(
+    c: &Config,
+    publish: bool,
+    generate: &dyn Fn(&str) -> Result<CommitMessage>,
+    destination: &str,
+    cargo: &Path,
 ) -> Result<ExportResult> {
     fs::create_dir_all(&c.state_dir)?;
     let mut paths = vec![c.state_dir.join("export.lock")];
@@ -568,7 +628,18 @@ fn execute_with_destination(
             .current_dir(&validation)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("UV_OFFLINE", "1");
-        let (ok, mut out, err) = command(cmd, Duration::from_secs(600))?;
+        let (ok, mut out, err) = match command(cmd, Duration::from_secs(600)) {
+            Ok(result) => result,
+            Err(error) => {
+                // Replace diagnostics from an older successful attempt even when
+                // the process could not start or could not return its output.
+                fs::write(
+                    c.state_dir.join("candidate-tests.log"),
+                    b"Public candidate test subprocess failed to start or complete; publication stopped.\n",
+                )?;
+                return Err(error);
+            }
+        };
         out.extend(err);
         fs::write(
             c.state_dir.join("candidate-tests.log"),
@@ -576,6 +647,9 @@ fn execute_with_destination(
         )?;
         if !ok {
             return Err("Public candidate tests failed".into());
+        }
+        if files.contains_key("Cargo.toml") {
+            rust_checks(&validation, &c.state_dir, cargo)?;
         }
         let mut diff = git(
             &repo,
@@ -739,6 +813,90 @@ mod tests {
         let c=Config::from_value(json!({"schema_version":1,"source_repo":source,"state_dir":t.path().join("state"),"author_name":"Test","author_email":"test@example.invalid","target_url":"https://github.com/example/skills.git","files":[{"source":"skills/guide.md","target":"skills/guide.md"},{"source":"tests/test_fixture.py","target":"tests/test_fixture.py"}]})).unwrap();
         (t, c, remote)
     }
+    fn rust_fixture(fail: &str) -> (tempfile::TempDir, Config, PathBuf, PathBuf) {
+        let (temp, mut config, remote) = fixture();
+        fs::write(
+            config.source_repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        config.files.push(crate::config::Entry {
+            source: "Cargo.toml".into(),
+            target: "Cargo.toml".into(),
+        });
+        git(&config.source_repo, &["add", "."]).unwrap();
+        git(&config.source_repo, &["commit", "-m", "Add Rust fixture"]).unwrap();
+        let cargo = temp.path().join("cargo");
+        let log = temp.path().join("calls");
+        fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" != '{}' ]\n",
+                log.display(),
+                fail
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        (temp, config, remote, cargo)
+    }
+    #[test]
+    fn rust_candidate_checks_run_before_push_and_noop_skips_them() {
+        let (temp, config, remote, cargo) = rust_fixture("none");
+        let generate = |_: &str| Ok(message());
+        execute_with_checks(&config, true, &generate, remote.to_str().unwrap(), &cargo).unwrap();
+        let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            vec![
+                "fmt --all -- --check",
+                "clippy --all-targets --locked -- -D warnings",
+                "test --locked"
+            ]
+        );
+        assert!(
+            !execute_with_checks(&config, true, &generate, remote.to_str().unwrap(), &cargo)
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("calls")).unwrap(),
+            calls
+        );
+    }
+    #[test]
+    fn every_failed_rust_stage_blocks_generation_and_push() {
+        for stage in ["fmt", "clippy", "test"] {
+            let (_temp, config, remote, cargo) = rust_fixture(stage);
+            let result = execute_with_checks(
+                &config,
+                true,
+                &|_| panic!("Rust failure must precede generation"),
+                remote.to_str().unwrap(),
+                &cargo,
+            );
+            assert!(result.is_err());
+            assert!(git(&remote, &["for-each-ref"]).unwrap().is_empty());
+            assert!(
+                fs::read_to_string(config.state_dir.join("candidate-rust-tests.log"))
+                    .unwrap()
+                    .contains(stage)
+            );
+        }
+    }
+    #[test]
+    fn non_rust_candidate_never_invokes_cargo() {
+        let (_temp, config, remote) = fixture();
+        execute_with_checks(
+            &config,
+            true,
+            &|_| Ok(message()),
+            remote.to_str().unwrap(),
+            Path::new("/missing-cargo"),
+        )
+        .unwrap();
+        assert!(!config.state_dir.join("candidate-rust-tests.log").exists());
+    }
     #[test]
     fn dropping_lock_releases_inherited_open_file_description() {
         let temp = tempfile::tempdir().unwrap();
@@ -808,6 +966,28 @@ mod tests {
                 .unwrap()
                 .contains("Private source context")
         );
+    }
+    #[test]
+    fn python_subprocess_failure_replaces_stale_success_log_and_never_pushes() {
+        let (temp, mut config, remote) = fixture();
+        fs::create_dir_all(&config.state_dir).unwrap();
+        let log = config.state_dir.join("candidate-tests.log");
+        fs::write(&log, "Old attempt: all tests passed\n").unwrap();
+        config.python_path = temp.path().join("missing-private-python");
+        assert!(
+            execute_with_destination(
+                &config,
+                true,
+                &|_| panic!("Must not generate after subprocess failure"),
+                remote.to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "Public candidate test subprocess failed to start or complete; publication stopped.\n"
+        );
+        assert!(git(&remote, &["for-each-ref"]).unwrap().is_empty());
     }
     #[test]
     fn generation_and_test_failures_never_push() {

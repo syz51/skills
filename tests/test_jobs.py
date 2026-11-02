@@ -37,18 +37,20 @@ with (root / 'trace').open('a') as stream: stream.write(sys.argv[1] + '\\n')
 if ((root / 'fail').exists() and sys.argv[1] == 'publish') or (root / ('fail-' + sys.argv[1])).exists(): sys.exit(1)
 ''')
         (self.repo / 'scripts/capture.py').write_text('''import json, pathlib, sys
+from datetime import datetime, timezone
 root = pathlib.Path(__file__).parents[2]
 with (root / 'trace').open('a') as stream: stream.write('capture\\n')
 if (root / 'fail-capture').exists(): sys.exit(1)
 state = pathlib.Path(sys.argv[sys.argv.index('--config') + 1]).parent
-(state / 'capture-status.json').write_text(json.dumps({'success': True, 'counts': {'pending': 3 if (root / 'backlog').exists() else 0}}))
+(state / 'capture-status.json').write_text(json.dumps({'finished_at': datetime.now(timezone.utc).isoformat(), 'success': True, 'counts': {'pending': 3 if (root / 'backlog').exists() else 0}}))
 ''')
         (self.repo / 'scripts/evidence.py').write_text('''import json, pathlib, sys
+from datetime import datetime, timezone
 root = pathlib.Path(__file__).parents[2]
 with (root / 'trace').open('a') as stream: stream.write('evidence\\n')
 if (root / 'fail-evidence').exists(): sys.exit(1)
 state = pathlib.Path(sys.argv[sys.argv.index('--config') + 1]).parent
-(state / 'evidence-status.json').write_text(json.dumps({'success': True, 'counts': {'pending': 1 if (root / 'evidence-backlog').exists() else 0}}))
+(state / 'evidence-status.json').write_text(json.dumps({'finished_at': datetime.now(timezone.utc).isoformat(), 'success': True, 'counts': {'pending': 1 if (root / 'evidence-backlog').exists() else 0}}))
 ''')
         self.codex = self.root / 'codex'
         self.codex.write_text(f'''#!{sys.executable}
@@ -102,6 +104,40 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
         subprocess.run(['git', '-C', str(self.repo), '-c', 'user.name=Test', '-c',
                         'user.email=test@example.test', 'commit', '-m', 'prompt fixture'],
                        check=True, capture_output=True)
+
+    def test_busy_actual_capture_never_completes_sync_or_weekly(self):
+        import shutil
+        for command, old_success in (('sync', False), ('weekly', True)):
+            with self.subTest(command=command):
+                for source in scripts.glob('*.py'):
+                    if source.name != 'jobs.py':
+                        shutil.copy(source, self.repo / 'scripts' / source.name)
+                # Keep downstream source verification and transport harmless fixtures.
+                (self.repo / 'scripts/evidence.py').write_text("raise SystemExit(1)\n")
+                old = {'finished_at': '2020-01-01T00:00:00+00:00', 'success': old_success,
+                       'counts': {'pending': 0 if old_success else 1}}
+                (self.state / 'capture-status.json').write_text(json.dumps(old))
+                with (self.state / 'capture.lock').open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    args = argparse.Namespace(command=command, config=self.config, check=False, run_now=True)
+                    self.assertEqual(jobs.execute(args), 1)
+                current = json.loads((self.state / (command + '-status.json')).read_text())
+                self.assertFalse(current['stages']['capture']['success'])
+                self.assertEqual(json.loads((self.state / 'capture-status.json').read_text()), old)
+                self.assertNotIn('review', current['stages'])
+
+    def test_zero_exit_with_stale_capture_or_evidence_is_rejected(self):
+        for name in ('capture', 'evidence'):
+            with self.subTest(name=name):
+                path = self.repo / 'scripts' / (name + '.py')
+                original = path.read_text()
+                path.write_text('raise SystemExit(0)\n')
+                (self.state / (name + '-status.json')).write_text(json.dumps({
+                    'finished_at': '2020-01-01T00:00:00+00:00', 'success': True, 'counts': {'pending': 0}}))
+                args = argparse.Namespace(command='sync', config=self.config, check=False, run_now=False)
+                self.assertEqual(jobs.execute(args), 1)
+                self.assertFalse(json.loads((self.state / 'sync-status.json').read_text())['stages'][name]['success'])
+                path.write_text(original)
 
     def test_prompt_review_follows_deployment_and_no_change_completes_due(self):
         self.initialize()
@@ -498,6 +534,11 @@ while True:
             observed = json.loads(path.read_text())
             self.assertEqual(observed['phase'], 'running')
             self.assertIsNone(observed['success'])
+            stage = Path(args[0][1]).stem
+            if stage in ('capture', 'evidence'):
+                (self.state / (stage + '-status.json')).write_text(json.dumps({
+                    'finished_at': datetime.now(timezone.utc).isoformat(),
+                    'success': True, 'counts': {'pending': 0}}))
         from unittest.mock import patch
         with patch.object(jobs, 'run', side_effect=assert_started):
             self.assertEqual(jobs.execute(self.args), 0)

@@ -27,7 +27,9 @@ Ordinary generation excludes the generated manifest. When an imported public con
 
 An explicit file inventory selects skills, supporting code, tests, synthetic evaluation cases, and public documentation. New files require an inventory change. Personal host labels are replaced with reference role names; personal backup metadata is removed while upstream provenance is retained. Content checks reject known private identifiers and credential patterns, and the candidate's unit tests must pass before a public commit is pushed.
 
-These checks reduce exposure risk but do not prove that arbitrary content is safe. New sources and license changes need human review. The initial export omits unpinned copied UnoCSS reference files pending provenance review.
+Changed snapshots containing `Cargo.toml` also run formatting, strict Clippy and locked Rust tests before commit-message generation or push. These checks share a ten-minute deadline; failures retain bounded local diagnostics and stop publication. Rust, Cargo and the pinned toolchain must be available on the publishing host. Public-owned code is excluded from candidate execution.
+
+These checks reduce exposure risk but do not prove that arbitrary content is safe. New sources and license changes need human review. The three retained UnoCSS snapshots are explicitly enrolled after their original hashes and bundled MIT license were matched to a pinned upstream revision recorded in source metadata.
 
 The exporter manages only its selected paths and its manifest. Other public-owned files are preserved. There are no force pushes. If a managed public file changes independently, publication stops so the change can be imported and reconciled in the private source. Changes to private review records alone do not require a public commit.
 

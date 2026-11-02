@@ -1,5 +1,30 @@
 {
   "consolidatedAt": "2026-10-08T08:49:15.254464+00:00",
+  "retainedReferenceProvenance": {
+    "files": {
+      "references/unocss/best-practices-class-utilities-over-attributify.md": {
+        "localSha256": "7df77c99604efac585bd39212dd3762836e5597ed9e9e1c22316c2254c05a176",
+        "upstreamPath": "skills/antfu-design/references/best-practices-class-utilities-over-attributify.md",
+        "upstreamSha256": "9c81bf0fb7cd703c9bce774ed531d813585aa1c1009d833a04348d6cd8a09193"
+      },
+      "references/unocss/core-tokens-and-combinations.md": {
+        "localSha256": "57da610acc04989a4fdc64ff8375b034d756626546fc0164dab32d026c0e55b6",
+        "upstreamPath": "skills/antfu-design/references/core-tokens-and-combinations.md",
+        "upstreamSha256": "8bea5e3632f6eebedc2c26358af00a6f2131ab0b352aec098382989759914e77"
+      },
+      "references/unocss/features-floating-vue-overrides.md": {
+        "localSha256": "d4c4de10f8350c93c70b3404cc445730fc5ec2b340ab31c66292eadaeaf225e6",
+        "upstreamPath": "skills/antfu-design/references/features-floating-vue-overrides.md",
+        "upstreamSha256": "554717a783fb05c91b54b826ccaab73b282d2746f8387e0bb9c01d88c0baccce"
+      }
+    },
+    "licenseNotice": "MIT, Anthony Fu; bundled public skill notice: licenses/antfu-skills.txt",
+    "licensePath": "LICENSE.md",
+    "licenseSha256": "2a596f697b619094b6f4067936e0f385027a393bce32211383db0478774c1cb2",
+    "repository": "https://github.com/antfu/skills.git",
+    "revision": "11cefdc7fda24f056763a1d644b5f8160de6ef49",
+    "transform": "Remove upstream YAML frontmatter and prepend the existing local scope paragraph; remaining Markdown matches original bytes. Preserve historical sources.antfu-design and its later upstreamReview independently."
+  },
   "sources": {
     "antfu-design": {
       "sha256": {

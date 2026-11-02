@@ -301,7 +301,11 @@ def execute(config, publish=False):
 
 def rust_cli(arguments):
     """Preserve the old command entrypoint while Rust owns live publication."""
-    binary = Path(os.environ.get('CODEX_SKILLS_BIN', '~/.local/bin/codex-skills')).expanduser()
+    selected = os.environ.get('CODEX_SKILLS_BIN')
+    if selected is None:
+        managed = Path.home() / '.local/share/codex-skills/public-export/bin/current'
+        selected = str(managed) if managed.exists() or managed.is_symlink() else '~/.local/bin/codex-skills'
+    binary = Path(selected).expanduser()
     if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
         print('Install codex-skills or set CODEX_SKILLS_BIN to its absolute executable path.', file=sys.stderr)
         return 1

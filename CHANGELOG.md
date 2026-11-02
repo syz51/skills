@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Require fresh capture and evidence results before completing maintenance jobs.
+- Enforce supporting-file and source-enrollment boundaries during skill publication.
+- Run Rust formatting, strict Clippy and tests before publishing managed Rust snapshots.
+- Add held-out prompt evaluation and recovery proofs without changing fixed policy.
+- Correct skill-review guidance and include provenance-verified UnoCSS references.
+
 ## 0.1.0
 
 - Add the Rust `codex-skills` public publisher and daily deadline runner.

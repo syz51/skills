@@ -855,6 +855,43 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(attempts[1]['previous_capture_rejection'], 'privacy source quotation rejected')
         self.assertNotIn('previous_rejected_output', attempts[1])
 
+    def test_manual_retry_bypasses_backoff_and_retains_privacy_validation(self):
+        self.rollout()
+        now = datetime.now(timezone.utc)
+        rejected = {**self.lesson, 'evidence': 'Built page and checked layout.'}
+        attempts = []
+
+        def run(command, **kwargs):
+            data = json.loads(kwargs['input'][len(capture.PROMPT) + 1:])
+            attempts.append(data['turn'])
+            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': [rejected]}))
+            class Result:
+                returncode = 0
+                stdout = ''
+            return Result()
+
+        with patch.object(capture, 'run_extractor', side_effect=run):
+            first = capture.capture(self.config, self.state, now=now)
+            self.assertEqual((first['errors'], first['pending']), (1, 1))
+            skipped = capture.capture(self.config, self.state, now=now)
+            self.assertEqual((skipped['errors'], skipped['pending']), (1, 1))
+            self.assertEqual(len(attempts), 1)
+            retried = capture.capture(self.config, self.state, now=now, retry_now=True)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[1]['previous_capture_rejection'], 'privacy source quotation rejected')
+        self.assertEqual((retried['processed'], retried['notes'], retried['pending'], retried['errors']),
+                         (0, 0, 1, 1))
+        state = json.loads((self.state / 'capture-state.json').read_text())
+        deferred = next(iter(state['deferred'].values()))
+        self.assertEqual(deferred['attempts'], 2)
+        self.assertEqual(deferred['reason'], 'privacy source quotation rejected')
+        self.assertEqual(datetime.fromisoformat(deferred['retry_at']), now + timedelta(hours=2))
+        with patch.object(capture, 'extract', return_value=[self.lesson]):
+            recovered = capture.capture(self.config, self.state, now=now, retry_now=True)
+        self.assertEqual((recovered['processed'], recovered['notes'], recovered['pending'], recovered['errors']),
+                         (1, 1, 0, 0))
+        self.assertEqual(json.loads((self.state / 'capture-state.json').read_text())['deferred'], {})
+
     def test_arbitrary_failure_text_is_never_added_to_retry_input(self):
         self.rollout()
         now = datetime.now(timezone.utc)

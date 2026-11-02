@@ -157,6 +157,45 @@ class SkillEvalsTests(unittest.TestCase):
         self.assertIn(str(self.skills / 'typescript/SKILL.md'), (fixture / 'AGENTS.md').read_text())
         self.assertEqual(result['configuration'], 'candidate-project-dispatch')
 
+    def test_candidate_canonical_discovery_alias_scores_actual_content(self):
+        physical = self.root / 'physical-output'
+        physical.mkdir()
+        lexical = self.root / 'output-alias'
+        lexical.symlink_to(physical, target_is_directory=True)
+        cli = self.fake('''import json,sys
+from pathlib import Path
+fixture=Path(sys.argv[sys.argv.index('-C')+1]).resolve()
+path=fixture/'.agents/skills/typescript/SKILL.md'
+print(json.dumps({'type':'item.completed','item':{'id':'read','type':'command_execution',
+ 'command':'cat '+str(path),'exit_code':0,'aggregated_output':path.read_text()}}))
+print(json.dumps({'type':'turn.completed'}))
+''')
+        result = ev.run_case(self.case, lexical, self.folders, cli, candidate=True)
+        self.assertTrue(result['passed'], result)
+        target = json.loads((physical / 'test/targets.json').read_text())['typescript']
+        self.assertIn(str(lexical / 'test/fixture/.agents/skills/typescript/SKILL.md'), target['aliases'])
+        self.assertIn(str(physical.resolve() / 'test/fixture/.agents/skills/typescript/SKILL.md'), target['aliases'])
+
+    def test_blocked_reader_requires_observed_fallback_content(self):
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                cli = self.fake('''import json,sys
+from pathlib import Path
+fixture=Path(sys.argv[sys.argv.index('-C')+1]).resolve()
+path=fixture/'.agents/skills/typescript/SKILL.md'
+def completed(identity,command,output,code):
+ print(json.dumps({'type':'item.completed','item':{'id':identity,'type':'command_execution',
+  'command':command,'exit_code':code,'aggregated_output':output}}))
+completed('blocked','uv run --script scripts/read_guidance.py '+str(path),'Permission denied',1)
+''' + ('''completed('fallback','cat '+str(path),path.read_text(),0)
+''' if fallback else '''print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'I loaded the skill.'}}))
+''') + '''print(json.dumps({'type':'turn.completed'}))
+''')
+                case = dict(self.case, id='fallback-' + str(fallback))
+                result = ev.run_case(case, self.root, self.folders, cli, candidate=True)
+                self.assertEqual(result['passed'], fallback, result)
+                self.assertEqual(bool(result['reads']), fallback, result)
+
     def test_timeout_kills_descendants_after_leader_exits(self):
         pidfile = self.root / 'child.pid'
         cli = self.fake('import os,signal,time\npid=os.fork()\nif pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN)\n open(' + repr(str(pidfile)) + ',"w").write(str(os.getpid()))\n time.sleep(30)\nelse:\n time.sleep(30)\n')

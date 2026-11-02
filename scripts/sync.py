@@ -376,6 +376,32 @@ def publish(args):
         if not (skill_path or feedback_path or name == 'release.json'):
             raise SyncError('Out-of-scope publication path: ' + name)
         if skill_path:
+            if not args.bootstrap:
+                if status != 'D':
+                    mode = git(args.repo, 'ls-tree', 'HEAD', '--', name).split(None, 1)[0]
+                    if mode == b'120000':
+                        raise SyncError('Skill symlinks are prohibited')
+                    if parts[1] != 'typescript' and mode != b'100644':
+                        raise SyncError('Non-TypeScript guidance must be a regular non-executable file')
+                if len(parts) == 3 and parts[2] == 'sources.json':
+                    if status != 'M':
+                        raise SyncError('Source provenance changes require workflow maintenance')
+                    before = json.loads(git(args.repo, 'show', 'refs/remotes/origin/main:' + name))
+                    after = json.loads(git(args.repo, 'show', 'HEAD:' + name))
+                    if not isinstance(before, dict) or not isinstance(after, dict):
+                        raise SyncError('Invalid source provenance')
+                    old_reviews = before.pop('upstreamReview', [])
+                    new_reviews = after.pop('upstreamReview', [])
+                    if before != after:
+                        raise SyncError('Only upstreamReview provenance may evolve')
+                    mutable = {'revision', 'tree', 'reviewedAt'}
+                    if (not isinstance(old_reviews, list) or not isinstance(new_reviews, list)
+                            or any(not isinstance(item, dict) for item in [*old_reviews, *new_reviews])
+                            or [{k: v for k, v in item.items() if k not in mutable} for item in old_reviews]
+                            != [{k: v for k, v in item.items() if k not in mutable} for item in new_reviews]):
+                        raise SyncError('Upstream source enrollment requires workflow maintenance')
+                elif parts[1] != 'typescript' and Path(name).suffix != '.md':
+                    raise SyncError('Supporting file changes require workflow maintenance')
             changed_skills.add(parts[1])
         if feedback_path and parts[2] == 'notes' and status != 'A':
             raise SyncError('Feedback notes are immutable')
