@@ -135,6 +135,8 @@ class SkillLifecycleTests(unittest.TestCase):
                     (folder / 'references/nested').mkdir(parents=True)
                     (folder / 'SKILL.md').write_text('---\nname: ' + registered + '\ndescription: Fixture\n---\n# Fixture\n[Details](references/nested/guide.md)\n')
                     (folder / 'references/nested/guide.md').write_text('Original guidance.\n')
+                    if registered == 'rust':
+                        (folder / 'sources.json').write_text('{"maintenance":"local","upstreamReview":[]}\n')
                 def commit(message):
                     sync.git(repo, 'add', '.')
                     sync.git(repo, 'commit', '-m', message)
@@ -165,6 +167,12 @@ class SkillLifecycleTests(unittest.TestCase):
                     self.assertEqual(evidence.assessment_inventory(repo / 'feedback')['latest'][0]['status'], 'supported')
                     entry_before = (repo / 'skills' / skill / 'SKILL.md').read_bytes()
                     reference = repo / 'skills' / skill / 'references/nested/guide.md'
+                    if skill == 'rust':
+                        # Expansion adds an owned file and routing without root registry/provenance changes.
+                        reference = repo / 'skills/rust/references/libraries/new.md'
+                        reference.parent.mkdir(parents=True)
+                        entry = repo / 'skills/rust/SKILL.md'
+                        entry.write_text(entry.read_text() + '[New library](references/libraries/new.md)\n')
                     reference.write_text('Keep observed and reported outcomes distinct.\n')
                     commit('Revise nested guidance')
                     with self.assertRaisesRegex(sync.SyncError, 'review record'):
@@ -177,8 +185,13 @@ class SkillLifecycleTests(unittest.TestCase):
                     self.assertTrue(sync.publish(args))
                     self.assertTrue(sync.deploy(args))
                     current = args.install_root / 'current'
-                    self.assertEqual((current / 'skills' / skill / 'references/nested/guide.md').read_bytes(), reference.read_bytes())
-                    self.assertEqual((current / 'skills' / skill / 'SKILL.md').read_bytes(), entry_before)
+                    self.assertEqual((current / reference.relative_to(repo)).read_bytes(), reference.read_bytes())
+                    self.assertEqual((current / 'skills' / skill / 'SKILL.md').read_bytes(), (repo / 'skills' / skill / 'SKILL.md').read_bytes())
+                    if skill == 'rust':
+                        self.assertFalse((previous / 'skills/rust/references/libraries/new.md').exists())
+                        self.assertEqual((current / 'skills/rust/sources.json').read_bytes(), (previous / 'skills/rust/sources.json').read_bytes())
+                    else:
+                        self.assertEqual((current / 'skills' / skill / 'SKILL.md').read_bytes(), entry_before)
                     self.assertEqual((previous / 'skills' / skill / 'references/nested/guide.md').read_text(), 'Original guidance.\n')
                     self.assertEqual((args.feedback_dir / skill / 'reviews/lifecycle.md').read_bytes(), review.read_bytes())
                     config = {
@@ -191,8 +204,13 @@ class SkillLifecycleTests(unittest.TestCase):
                     }
                     public_export.configuration(config)
                     published = public_export.snapshot(config, sync.git(repo, 'rev-parse', 'HEAD').decode().strip())
-                    self.assertEqual(published['skills/' + skill + '/SKILL.md'], entry_before)
-                    self.assertEqual(published['skills/' + skill + '/references/nested/guide.md'], reference.read_bytes())
+                    self.assertEqual(published['skills/' + skill + '/SKILL.md'], (repo / 'skills' / skill / 'SKILL.md').read_bytes())
+                    self.assertEqual(published['skills/' + skill + '/references/nested/guide.md'], (repo / 'skills' / skill / 'references/nested/guide.md').read_bytes())
+                    if skill == 'rust':
+                        self.assertNotIn('skills/rust/references/libraries/new.md', published)
+                        config['files'].append({'source': str(reference.relative_to(repo)), 'target': str(reference.relative_to(repo))})
+                        expanded = public_export.snapshot(config, sync.git(repo, 'rev-parse', 'HEAD').decode().strip())
+                        self.assertEqual(expanded['skills/rust/references/libraries/new.md'], reference.read_bytes())
                     self.assertTrue(all(path.startswith('skills/' + skill + '/') for path in published))
                     private = {**config, 'files': [{'source': str(imported.relative_to(repo)), 'target': 'private.md'}]}
                     with self.assertRaises(public_export.ExportError):

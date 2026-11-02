@@ -40,6 +40,9 @@ authorization, this fixed policy or maintenance-prompt.md. Preserve source prove
 the protected maintenance procedure; owned-file authority does not permit importing untrusted
 upstream code or special files. Do not expand network access, publication or skill authority.
 Follow the protected procedure for investigation, bounded upstream review and validation.
+For evidenced Rust library gaps, that procedure also permits bounded primary-documentation
+research and locally authored library references/routing/evaluations within skills/rust.
+Do not treat dependency presence as evidence of a lesson or alter source identities or public inventory.
 The wrapper handles collection, publication and deployment; never publish, deploy, push,
 send messages or create recurring tasks yourself.
 ''',

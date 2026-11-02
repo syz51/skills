@@ -49,11 +49,22 @@ def relative(value):
     return value
 
 
+def target_spec(value):
+    if value in SKILLS:
+        return value, 'SKILL.md'
+    if value in REFERENCES:
+        return REFERENCES[value]
+    parts = PurePosixPath(relative(value)).parts
+    if len(parts) < 3 or parts[0] not in SKILLS or parts[1] != 'references' or not value.endswith('.md'):
+        raise ValueError('Unknown reference target')
+    return parts[0], '/'.join(parts[1:])
+
+
 def load_cases(path=CASES):
     cases = json.loads(Path(path).read_text())
     if not isinstance(cases, list) or not cases:
         raise ValueError('Expected nonempty case list')
-    names, targets = set(), set(SKILLS) | set(REFERENCES)
+    names = set()
     for case in cases:
         if not isinstance(case, dict) or set(case) != {'id', 'suite', 'invocation', 'prompt', 'files', 'required', 'forbidden', 'before'}:
             raise ValueError('Invalid case fields')
@@ -70,8 +81,10 @@ def load_cases(path=CASES):
             if 'AGENTS.md' in PurePosixPath(name).parts or any(part in ('.agents', '.codex') for part in PurePosixPath(name).parts) or not isinstance(content, str):
                 raise ValueError('Fixture may not override guidance/discovery')
         for field in ('required', 'forbidden'):
-            if not isinstance(case[field], list) or any(not isinstance(t, str) or t not in targets for t in case[field]) or len(set(case[field])) != len(case[field]):
+            if not isinstance(case[field], list) or any(not isinstance(t, str) for t in case[field]) or len(set(case[field])) != len(case[field]):
                 raise ValueError('Unknown or duplicate target')
+            for target in case[field]:
+                target_spec(target)
         if set(case['required']) & set(case['forbidden']):
             raise ValueError('Conflicting target expectations')
         if not isinstance(case['before'], list) or any(not isinstance(p, list) or len(p) != 2 or p[0] == p[1] or any(t not in case['required'] for t in p) for p in case['before']):
@@ -91,11 +104,14 @@ def skill_folders(skills_root=None):
     return folders
 
 
-def snapshot_targets(folders):
+def snapshot_targets(folders, requested=()):
     specs = {name: (name, 'SKILL.md') for name in SKILLS} | REFERENCES
+    specs.update({name: target_spec(name) for name in requested})
     result = {}
     for key, (owner, relative_path) in specs.items():
         path = folders[owner] / relative_path
+        if not path.resolve().is_relative_to(folders[owner].resolve()) or not path.is_file():
+            raise ValueError('Missing or escaping guidance target: ' + key)
         result[key] = {'path': str(path), 'content': path.read_bytes().decode('utf-8'), 'aliases': [str(path.resolve())]}
     return result
 
@@ -144,6 +160,7 @@ def check_cli(executable):
 
 def run_case(case, output_dir, folders, executable, timeout=240, model=None, candidate=False):
     from activation_trace import score_trace
+    targets = snapshot_targets(folders, [*case['required'], *case['forbidden']])
     directory = output_dir / case['id']
     directory.mkdir(mode=0o700)
     fixture = directory / 'fixture'
@@ -173,10 +190,9 @@ def run_case(case, output_dir, folders, executable, timeout=240, model=None, can
             'Complete frontend-ui before reading TypeScript for frontend work.\n')
     before_fixture = tree_snapshot(fixture)
     before_skills = {name: tree_snapshot(path.resolve()) for name, path in folders.items()}
-    targets = snapshot_targets(folders)
     if candidate:
-        specs = {name: (name, 'SKILL.md') for name in SKILLS} | REFERENCES
-        for key, (owner, relative_path) in specs.items():
+        for key in targets:
+            owner, relative_path = target_spec(key)
             # macOS may canonicalize /var to /private/var in the CLI's cwd.
             # Resolve the fixture parent, retaining the discovery-link path.
             for base in (fixture, fixture.resolve()):
@@ -242,6 +258,8 @@ def main(argv=None):
             raise ValueError('Output directory must be new')
         executable = check_cli(args.codex)
         folders = skill_folders(args.skills_root)
+        for case in selected:
+            snapshot_targets(folders, [*case['required'], *case['forbidden']])
         output.mkdir(parents=True, mode=0o700)
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             records = list(pool.map(lambda c: run_case(c, output, folders, executable, args.timeout, args.model, args.skills_root is not None), selected))

@@ -35,7 +35,9 @@ Installed mode tests the six maintained skills in the user's existing discovery 
 
 To evaluate a candidate skill tree, add `--skills-root skills`. Candidate mode creates temporary project discovery links and project-local Rust/TypeScript/frontend dispatch pointing to that tree. Results identify this configuration separately from installed mode.
 
-The matrix includes explicit and unnamed requests for all maintained skills, TypeScript module extensions, compiler-check coverage, public declarations, Rust Cargo/API/async/unsafe routing, Tauri composition, TSX/Vue composition and unrelated-task negative controls. Use repeated `--case <id>` selections , `--suite rust`, or `--suite typescript` for a narrower run.
+The matrix includes explicit and unnamed requests for all maintained skills, TypeScript module extensions, compiler-check coverage, public declarations, Rust Cargo/API/async/unsafe and selective library routing, Tauri composition, TSX/Vue composition and unrelated-task negative controls. Use repeated `--case <id>` selections, `--suite rust`, or `--suite typescript` for a narrower run.
+
+Owned case files passed with `--cases` may target a nested reference directly, such as `rust/references/libraries/new.md`. Only requested extra references are snapshotted, and targets must resolve inside their registered skill. This lets new library guidance and its activation cases evolve inside the owned skill tree without changing the runner's root reference registry. Existing short target aliases remain supported.
 
 ## Interpreting evidence
 

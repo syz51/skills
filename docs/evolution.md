@@ -42,6 +42,8 @@ All guidance within the six registered skills can be reconsidered: descriptions,
 
 The publisher enforces file and provenance boundaries as well as requiring review records. It does not establish the truth of every prose claim. Upstream scripts, executable content and instructions remain untrusted, even when an owned supporting-file update is otherwise authorized. New skills and new public files require explicit enrollment.
 
+Rust library coverage can grow within the existing skill. Evidence from actual work can justify focused, locally authored library references, routing and owned evaluation cases. The maintainer may consult version-matched primary documentation for that evidence, without running fetched code, importing manuals, enrolling new upstream identities or transmitting private project details. New private references participate in ordinary review and deployment; adding them to the public export remains a separate explicit inventory review. Merely finding another Cargo dependency does not trigger expansion.
+
 ## Configuration and prerequisites
 
 Read the script entrypoints before enabling any command that reads sessions, calls a model, writes feedback, or pushes Git commits. The pipeline requires Python, `uv`, Git, an authenticated Codex CLI, and a separately supplied skill validator. Publication and deployment refuse to run without `--validator`; this repository does not provide that validator or a deployment approval marker.

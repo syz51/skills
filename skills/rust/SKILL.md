@@ -11,6 +11,8 @@ Use this skill for Rust language, ownership, API and Cargo decisions. For Tauri 
 
 Load supporting guidance only when needed:
 
+- Library/framework APIs, configuration or integration behavior: [Library and framework map](references/library-map.md), then only the relevant owner/reference. Standard-library ownership work does not require this map just because dependencies exist.
+
 - Toolchains, editions, MSRV, workspace/feature configuration, dependency changes, or check selection: [Cargo and compatibility](references/cargo-and-compatibility.md).
 - Public APIs, traits, conversions, error contracts, documentation, or compatibility: [APIs and errors](references/api-and-errors.md).
 - Futures, task lifecycle, synchronization, or concurrent shutdown: [Async and concurrency](references/async-and-concurrency.md).

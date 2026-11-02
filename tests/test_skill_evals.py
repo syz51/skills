@@ -61,6 +61,48 @@ class SkillEvalsTests(unittest.TestCase):
                 self.assertTrue(any(c['invocation'] == 'configured' and skill in c['required'] and '$' not in c['prompt'] for c in cases))
                 self.assertTrue(any(skill in c['forbidden'] for c in cases))
 
+    def test_generic_reference_target_rejects_unsafe_names_and_paths(self):
+        for target in ('unknown/references/x.md', 'rust/references/../x.md',
+                       'rust/references/x.txt', '/rust/references/x.md', 'rust/references//x.md'):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                ev.target_spec(target)
+        target = 'rust/references/libraries/new.md'
+        with self.assertRaisesRegex(ValueError, 'Missing'):
+            ev.snapshot_targets(self.folders, [target])
+        folder = self.skills / 'rust/references/libraries'
+        folder.mkdir(parents=True)
+        outside = self.root / 'outside.md'
+        outside.write_text('Private outside file')
+        (folder / 'new.md').symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, 'escaping'):
+            ev.snapshot_targets(self.folders, [target])
+        with patch.object(ev, 'run_process', side_effect=AssertionError('model call')):
+            with self.assertRaises(ValueError):
+                ev.run_case(dict(self.case, required=[target]), self.root, self.folders, 'unused')
+
+    def test_new_owned_reference_case_scores_without_root_registry_enrollment(self):
+        target = 'rust/references/libraries/new.md'
+        path = self.skills / target
+        path.parent.mkdir(parents=True)
+        path.write_text('# New library contract\nUse version-matched APIs.\n')
+        case = dict(self.case, suite='rust', required=[target], files={}, prompt='Review this new library API.')
+        casefile = self.root / 'owned-cases.json'
+        casefile.write_text(json.dumps([case]))
+        self.assertEqual(ev.load_cases(casefile), [case])
+        self.assertNotIn(target, ev.snapshot_targets(self.folders))
+        cli = self.fake('''import json,sys
+from pathlib import Path
+fixture=Path(sys.argv[sys.argv.index('-C')+1]).resolve()
+path=fixture/'.agents/skills/rust/references/libraries/new.md'
+print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':'cat '+str(path),'exit_code':0,'aggregated_output':path.read_text()}}))
+print(json.dumps({'type':'turn.completed'}))
+''')
+        result = ev.run_case(case, self.root, self.folders, cli, candidate=True)
+        self.assertTrue(result['passed'], result)
+        saved = json.loads((self.root / 'test/targets.json').read_text())[target]
+        self.assertEqual(saved['content'], path.read_text())
+        self.assertIn(str((self.root / 'test/fixture').resolve() / '.agents/skills/rust/references/libraries/new.md'), saved['aliases'])
+
     def test_plan_never_invokes_model_or_creates_output(self):
         with patch.object(ev, 'check_cli', side_effect=AssertionError('live call')), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(ev.main(['plan', '--suite', 'all']), 0)

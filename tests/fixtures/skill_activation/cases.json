@@ -399,5 +399,132 @@
       "rust"
     ],
     "before": []
+  },
+  {
+    "id": "rust-library-tokio",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review task shutdown and cancellation in src/lib.rs using this project's Tokio contract. Findings only.",
+    "files": {
+      "Cargo.toml": "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\ntokio={version=\"1\",features=[\"rt\",\"sync\"]}\n",
+      "src/lib.rs": "pub async fn work() { let task=tokio::spawn(async { 1 }); drop(task); }\n"
+    },
+    "required": [
+      "rust",
+      "rust/references/library-map.md",
+      "rust/references/libraries/tokio.md"
+    ],
+    "forbidden": [
+      "rust/references/libraries/axum.md",
+      "rust/references/libraries/serde.md",
+      "rust/references/libraries/clap.md"
+    ],
+    "before": []
+  },
+  {
+    "id": "rust-library-axum",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review Axum route syntax and extractor/state contracts in src/lib.rs for the declared dependency version. Findings only.",
+    "files": {
+      "Cargo.toml": "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\naxum=\"0.8\"\n",
+      "src/lib.rs": "pub fn app() -> axum::Router { axum::Router::new().route(\"/users/:id\", axum::routing::get(|| async { \"ok\" })) }\n"
+    },
+    "required": [
+      "rust",
+      "rust/references/library-map.md",
+      "rust/references/libraries/axum.md"
+    ],
+    "forbidden": [
+      "rust/references/libraries/serde.md",
+      "rust/references/libraries/clap.md"
+    ],
+    "before": []
+  },
+  {
+    "id": "rust-library-serde-alias",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review the JSON serialization/deserialization boundary in crates/parser/src/lib.rs; follow workspace and renamed dependency configuration. Findings only.",
+    "files": {
+      "Cargo.toml": "[workspace]\nmembers=[\"crates/parser\"]\n[workspace.dependencies]\njson={package=\"serde_json\",version=\"1\"}\n",
+      "crates/parser/Cargo.toml": "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\njson.workspace=true\n",
+      "crates/parser/src/lib.rs": "pub fn read(s: &str) -> json::Value { json::from_str(s).unwrap() }\n"
+    },
+    "required": [
+      "rust",
+      "rust/references/library-map.md",
+      "rust/references/libraries/serde.md"
+    ],
+    "forbidden": [
+      "rust/references/libraries/tokio.md",
+      "rust/references/libraries/axum.md",
+      "rust/references/libraries/clap.md"
+    ],
+    "before": []
+  },
+  {
+    "id": "rust-library-clap-selective",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review only Clap flag parsing and default behavior in src/main.rs. Other dependencies are unrelated to this requested change. Findings only.",
+    "files": {
+      "Cargo.toml": "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nclap={version=\"4\",features=[\"derive\"]}\ntokio=\"1\"\naxum=\"0.8\"\nserde=\"1\"\n",
+      "src/main.rs": "use clap::Parser;\n#[derive(Parser)]\nstruct Args { #[arg(long, default_value=\"false\")] verbose: bool }\nfn main() { let _=Args::parse(); }\n",
+      "Cargo.lock": "version = 4\n\n[[package]]\nname = \"clap\"\nversion = \"4.6.7\"\n"
+    },
+    "required": [
+      "rust",
+      "rust/references/library-map.md",
+      "rust/references/libraries/clap.md"
+    ],
+    "forbidden": [
+      "rust/references/libraries/tokio.md",
+      "rust/references/libraries/axum.md",
+      "rust/references/libraries/serde.md"
+    ],
+    "before": []
+  },
+  {
+    "id": "rust-library-uncovered",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review how to verify reqwest timeout and client configuration in this Rust project. If the installed Rust guidance has no dedicated reqwest reference, explain the official version-matched documentation needed. Do not browse in this read-only exercise or invent a local owner/reference.",
+    "files": {
+      "Cargo.toml": "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nreqwest=\"0.12\"\n",
+      "src/lib.rs": "pub fn client() -> reqwest::Client { reqwest::Client::new() }\n"
+    },
+    "required": [
+      "rust",
+      "rust/references/library-map.md"
+    ],
+    "forbidden": [
+      "rust/references/libraries/tokio.md",
+      "rust/references/libraries/axum.md",
+      "rust/references/libraries/serde.md",
+      "rust/references/libraries/clap.md"
+    ],
+    "before": []
+  },
+  {
+    "id": "rust-library-std-only",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review the ownership error and public borrowing/API contract in this standard-library-only Rust function; no external library APIs are involved. Findings only.",
+    "files": {
+      "src/lib.rs": "pub fn first(values: Vec<String>) -> Option<&str> { values.first().map(String::as_str) }\n"
+    },
+    "required": [
+      "rust",
+      "rust/api"
+    ],
+    "forbidden": [
+      "rust/references/library-map.md",
+      "rust/references/libraries/tokio.md",
+      "rust/references/libraries/axum.md",
+      "rust/references/libraries/serde.md",
+      "rust/references/libraries/clap.md"
+    ],
+    "before": []
   }
 ]

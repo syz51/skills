@@ -11,7 +11,7 @@ Agent skills and the tools used to improve them through feedback, source verific
 | [find-skills](skills/find-skills/SKILL.md) | Discover skills when explicitly requested |
 | [tauri](skills/tauri/SKILL.md) | Tauri guidance alongside frontend-ui |
 | [typescript](skills/typescript/SKILL.md) | Shared TypeScript language, tooling, public-type checks, and integration references |
-| [rust](skills/rust/SKILL.md) | Rust language, Cargo, API, async, and safety guidance with managed feedback |
+| [rust](skills/rust/SKILL.md) | Rust language, Cargo, API, async, safety, and on-demand library guidance with managed feedback |
 
 ## Install skills
 
