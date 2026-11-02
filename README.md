@@ -11,6 +11,7 @@ Agent skills and the tools used to improve them through feedback, source verific
 | [find-skills](skills/find-skills/SKILL.md) | Discover skills when explicitly requested |
 | [tauri](skills/tauri/SKILL.md) | Tauri guidance alongside frontend-ui |
 | [typescript](skills/typescript/SKILL.md) | Shared TypeScript language, tooling, public-type checks, and integration references |
+| [rust](skills/rust/SKILL.md) | Rust language, Cargo, API, async, and safety guidance with managed feedback |
 
 ## Install skills
 
@@ -22,7 +23,9 @@ npx skills add syz51/skills
 
 You can also use `pnpm dlx skills add syz51/skills` or `bunx skills add syz51/skills`. If the CLI is already installed globally, run `skills add syz51/skills` directly.
 
-Choose the skills and agents you want in the installer. Alternatively, copy a selected `skills/<name>/` directory into your agent's skill discovery directory, preserving its references. Tauri also uses frontend-ui; TypeScript work on frontends applies both typescript and frontend-ui.
+Choose the skills and agents you want in the installer. Alternatively, copy a selected `skills/<name>/` directory into your agent's skill discovery directory, preserving its references. Tauri also uses frontend-ui; TypeScript work on frontends applies both typescript and frontend-ui, and Rust changes also use rust when available.
+
+For reliable activation, add a dispatch instruction to your agent's global instructions: before Rust implementation, review, debugging, migration, or Cargo/toolchain configuration work, read `rust`; apply `tauri` for Tauri integration and read `frontend-ui` before language guidance for frontend work. Unrelated tasks inside a Rust repository do not require it. Skill discovery alone does not guarantee invocation.
 
 Installing skill files does not configure background jobs or start transcript capture. The optional guidance reader and feedback integration use the separate maintenance setup described below.
 

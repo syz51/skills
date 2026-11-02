@@ -1,0 +1,6 @@
+interface:
+  display_name: "Rust"
+  short_description: "Rust implementation, review and Cargo workflows"
+  default_prompt: "Use $rust to implement and verify this Rust change."
+policy:
+  allow_implicit_invocation: true

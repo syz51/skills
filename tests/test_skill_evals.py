@@ -52,6 +52,9 @@ class SkillEvalsTests(unittest.TestCase):
         self.assertTrue(any(c['before'] == [['frontend-ui', 'typescript']] for c in cases))
         self.assertGreaterEqual(sum('typescript' in c['forbidden'] for c in cases), 2)
         self.assertTrue(any('typescript/tooling' in c['required'] for c in cases))
+        for reference in ('rust/cargo', 'rust/api', 'rust/async', 'rust/unsafe'):
+            self.assertTrue(any(reference in c['required'] for c in cases))
+        self.assertTrue(any({'rust', 'tauri'} <= set(c['required']) for c in cases))
         for skill in ev.SKILLS:
             with self.subTest(skill=skill):
                 self.assertTrue(any(c['invocation'] == 'explicit' and skill in c['required'] for c in cases))

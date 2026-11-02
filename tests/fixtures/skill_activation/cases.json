@@ -292,5 +292,112 @@
     ],
     "forbidden": [],
     "before": []
+  },
+  {
+    "id": "rust-explicit",
+    "suite": "rust",
+    "invocation": "explicit",
+    "prompt": "Use $rust to review the ownership contract in src/lib.rs. Give findings only.",
+    "files": {
+      "src/lib.rs": "pub fn value() -> u32 { 1 }\n"
+    },
+    "required": [
+      "rust",
+      "rust/api"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "rust-ownership",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review the public ownership and error contract in src/lib.rs. Give findings only.",
+    "files": {
+      "src/lib.rs": "pub fn value() -> u32 { 1 }\n"
+    },
+    "required": [
+      "rust",
+      "rust/api"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "rust-cargo",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review the feature configuration and supported compiler in Cargo.toml. Give findings only.",
+    "files": {
+      "Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.75\"\n[features]\ndefault = []\nfast = []\n",
+      "src/lib.rs": "pub fn value() -> u32 { 1 }\n"
+    },
+    "required": [
+      "rust",
+      "rust/cargo"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "rust-async",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review cancellation and blocking in this async Rust function in src/lib.rs. Give findings only.",
+    "files": {
+      "src/lib.rs": "pub async fn work() { std::thread::sleep(std::time::Duration::from_secs(1)); }\n"
+    },
+    "required": [
+      "rust",
+      "rust/async"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "rust-unsafe",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review the safety contract of the Rust FFI boundary in src/lib.rs. Give findings only.",
+    "files": {
+      "src/lib.rs": "pub unsafe fn first(p: *const u8) -> u8 { unsafe { *p } }\n"
+    },
+    "required": [
+      "rust",
+      "rust/unsafe"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "rust-tauri",
+    "suite": "rust",
+    "invocation": "configured",
+    "prompt": "Review the Rust Tauri command boundary in src/main.rs; check both native integration and Rust error/ownership contracts. Give findings only.",
+    "files": {
+      "src/main.rs": "#[tauri::command]\nfn greet(name: String) -> String { format!(\"Hello {name}\") }\n"
+    },
+    "required": [
+      "rust",
+      "tauri",
+      "rust/api"
+    ],
+    "forbidden": [],
+    "before": []
+  },
+  {
+    "id": "rust-negative",
+    "suite": "rust",
+    "invocation": "negative",
+    "prompt": "Correct the spelling in notes.txt. Describe the correction without editing. This is a prose-only task. Do not inspect Rust code.",
+    "files": {
+      "notes.txt": "The documant is ready.\n",
+      "src/lib.rs": "pub fn value() -> u32 { 1 }\n"
+    },
+    "required": [],
+    "forbidden": [
+      "rust"
+    ],
+    "before": []
   }
 ]

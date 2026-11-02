@@ -26,7 +26,7 @@ from read_guidance import SKILL_PATTERN, SKILLS, guidance_path, observed, reques
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 # Distinctive headings that identify each loaded SKILL.md besides its frontmatter name.
-HEADINGS = {'frontend-ui': 'Frontend', 'content-research-writer': 'Content|Research', 'find-skills': 'Find Skills', 'tauri': 'Tauri', 'typescript': 'TypeScript'}
+HEADINGS = {'frontend-ui': 'Frontend', 'content-research-writer': 'Content|Research', 'find-skills': 'Find Skills', 'tauri': 'Tauri', 'typescript': 'TypeScript', 'rust': 'Rust'}
 SINCE = '2026-10-09T14:45:00+00:00'
 # Claude Code records no turn-complete event; the newest finished reply waits this long for follow-on records.
 CLAUDE_QUIET = timedelta(minutes=15)

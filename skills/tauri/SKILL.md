@@ -9,6 +9,8 @@ For saved guidance provenance, use `uv run --script ~/.local/share/codex-skills/
 
 Read `frontend-ui` first for shared frontend policy. Inspect the current manifests, lockfiles, Tauri configuration, capabilities, and relevant code before applying version-specific documentation.
 
+For Rust implementation, review, debugging, or Cargo/toolchain changes, also read `rust` when available; it owns language, API, safety, and Cargo guidance. This skill owns Tauri commands, IPC, capabilities, configuration, and platform integration. For TypeScript changes, also follow `typescript` when available. Pure native Rust work does not require unrelated frontend references.
+
 ## Preserve the runtime boundary
 
 - Bundle a static frontend for Tauri. Keep SSR, server routes, credentials, and other server-only work in the server application or an explicitly designed backend; importing shared UI does not make server code available inside the native app.

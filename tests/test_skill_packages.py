@@ -15,7 +15,7 @@ def published_file(relative):
 class SkillPackageTests(unittest.TestCase):
     def test_every_skill_contains_original_contribution_license(self):
         expected = published_file('LICENSE').read_bytes()
-        for skill in ('frontend-ui', 'content-research-writer', 'find-skills', 'tauri', 'typescript'):
+        for skill in ('frontend-ui', 'content-research-writer', 'find-skills', 'tauri', 'typescript', 'rust'):
             with self.subTest(skill=skill):
                 self.assertEqual(published_file(f'skills/{skill}/LICENSE').read_bytes(), expected)
 
@@ -40,6 +40,22 @@ class SkillPackageTests(unittest.TestCase):
                 self.assertEqual(entries.get(relative), relative)
         self.assertEqual(entries['skills/typescript/LICENSE'], 'public/files/skills/typescript/LICENSE')
         self.assertFalse(any(entry['source'].startswith('feedback/') for entry in files))
+
+    def test_rust_public_inventory_contains_only_reviewed_portable_files(self):
+        inventory = ROOT / 'public/export.json'
+        if not inventory.is_file():
+            self.skipTest('Private export inventory is checked before publication')
+        entries = {entry['target']: entry['source'] for entry in json.loads(inventory.read_text())['files']}
+        reviewed = ('SKILL.md', 'sources.json', 'agents/openai.yaml',
+                    'references/cargo-and-compatibility.md', 'references/api-and-errors.md',
+                    'references/async-and-concurrency.md', 'references/unsafe-and-ffi.md',
+                    'references/feedback.md')
+        for name in reviewed:
+            relative = 'skills/rust/' + name
+            with self.subTest(path=relative):
+                self.assertEqual(entries.get(relative), relative)
+        self.assertEqual(entries.get('skills/rust/LICENSE'), 'public/files/skills/rust/LICENSE')
+        self.assertFalse(any(source.startswith('feedback/rust/') for source in entries.values()))
 
     def test_frontend_bundles_exact_required_upstream_notices(self):
         for name in ('antfu-skills', 'make-interfaces-feel-better', 'turborepo', 'uncodixfy'):

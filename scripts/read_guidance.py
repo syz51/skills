@@ -9,7 +9,7 @@ import shlex
 
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
-SKILLS = ('frontend-ui', 'content-research-writer', 'find-skills', 'tauri', 'typescript')
+SKILLS = ('frontend-ui', 'content-research-writer', 'find-skills', 'tauri', 'typescript', 'rust')
 SKILL_PATTERN = '|'.join(map(re.escape, SKILLS))
 PROTOCOL = 'codex-guidance-read/v1'
 MAX_BYTES = 6000

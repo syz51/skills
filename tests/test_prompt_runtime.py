@@ -55,7 +55,7 @@ class PromptRuntimeTests(unittest.TestCase):
         for part in ('nested references', 'owned supporting scripts', 'agent metadata', 'templates', 'assets'):
             with self.subTest(part=part):
                 self.assertIn(part, fixed)
-        self.assertIn('scripts outside the five owned skill trees', fixed)
+        self.assertIn('scripts outside the six owned skill trees', fixed)
         for part in ('fresh private copies', 'forward commits', 'append-only', 'machine investigation gate', 'Never blindly replay', 'host-local'):
             self.assertIn(part, fixed)
         self.assertIn('Do not expand network access', fixed)

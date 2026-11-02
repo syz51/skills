@@ -95,6 +95,22 @@ class SkillLifecycleTests(unittest.TestCase):
         self.assertIn('runtime outcomes not replayed', value['scope'])
         return config, note, receipt, original
 
+    def test_zero_lesson_turns_are_assessed_once_without_inventing_notes(self):
+        for skill in read_guidance.SKILLS:
+            with self.subTest(skill=skill), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config, source, lesson, loaded_sha = self.fixture(root, skill)
+                state_root = root / 'capture-state'
+                with patch.object(capture, 'model_response', return_value={'notes': []}) as model:
+                    first = capture.capture(config, state_root)
+                    second = capture.capture(config, state_root)
+                self.assertEqual((first['processed'], first['notes'], first['errors']), (1, 0, 0))
+                self.assertEqual((second['processed'], second['notes'], second['errors']), (0, 0, 0))
+                model.assert_called_once()
+                state = json.loads((state_root / 'capture-state.json').read_text())
+                self.assertEqual([entry['notes'] for entry in state['processed'].values()], [0])
+                self.assertFalse(list(Path(config['feedback_dir']).glob('*/notes/*.md')))
+
     def test_actual_helper_and_node_formats_bind_receipts_for_every_skill(self):
         for skill in read_guidance.SKILLS:
             for mode in ('helper', 'node'):

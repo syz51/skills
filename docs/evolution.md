@@ -26,12 +26,12 @@ The scripts preserve the reference host names `client-host` and `maintainer-host
 
 ## Evolution boundaries
 
-All guidance within the five registered skills can be reconsidered: descriptions, Markdown prose, headings, examples, code fences, nested references and the feedback-review guide itself. Eligibility is not an instruction to rewrite working guidance. Changes need concrete evidence or reviewed upstream updates and must preserve task scope, provenance, attribution and the fixed maintenance policy.
+All guidance within the six registered skills can be reconsidered: descriptions, Markdown prose, headings, examples, code fences, nested references and the feedback-review guide itself. Eligibility is not an instruction to rewrite working guidance. Changes need concrete evidence or reviewed upstream updates and must preserve task scope, provenance, attribution and the fixed maintenance policy.
 
 | Material | Update path |
 | --- | --- |
 | Registered skill Markdown | Evidence-supported weekly maintenance, with a review record, validation and link checks |
-| All five skills' owned supporting files and evaluation fixtures | Evidence-supported weekly investigation, including relevant execution checks |
+| All six skills' owned supporting files and evaluation fixtures | Evidence-supported weekly investigation, including relevant execution checks |
 | Original source provenance and registered project roots | Explicit workflow maintenance; weekly review cannot repoint sources or expand access |
 | Source metadata `upstreamReview` records | Update existing revision/tree/review dates; source identities, enrollment and other historical metadata stay fixed during weekly maintenance |
 | Four editable `prompts/*.md` files | Separate regression, held-out evaluation and controlled promotion |

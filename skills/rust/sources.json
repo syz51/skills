@@ -1,0 +1,7 @@
+{
+  "enrolledAt": "2026-11-02",
+  "maintenance": "local",
+  "updatePolicy": "Locally authored Rust guidance synthesized from primary Rust documentation checked on 2026-11-02; source links are retained in the relevant references. No copied upstream snapshot is claimed. Evidence-supported evolution covers the complete skill tree: description, entrypoint, all nested references, owned supporting scripts, agent metadata, templates, assets and evaluations. Preserve original source provenance and existing privacy, authorization and tool/runtime contracts; update provenance only through its reviewed policy. Use the shared feedback, review, validation and release workflow. Runtime and platform APIs remain with their maintained owners; verify version-sensitive details against the project toolchain.",
+  "upstreamReview": [],
+  "version": 1
+}

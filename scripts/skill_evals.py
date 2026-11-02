@@ -18,6 +18,10 @@ from read_guidance import SKILLS
 ROOT = Path(__file__).resolve().parent.parent
 CASES = ROOT / 'tests/fixtures/skill_activation/cases.json'
 REFERENCES = {
+    'rust/cargo': ('rust', 'references/cargo-and-compatibility.md'),
+    'rust/api': ('rust', 'references/api-and-errors.md'),
+    'rust/async': ('rust', 'references/async-and-concurrency.md'),
+    'rust/unsafe': ('rust', 'references/unsafe-and-ffi.md'),
     'typescript/tooling': ('typescript', 'references/tooling-and-public-types.md'),
     'typescript/map': ('typescript', 'references/skill-map.md'),
     'frontend-ui/vue-tooling': ('frontend-ui', 'references/vue-typescript-tooling.md'),
@@ -57,7 +61,7 @@ def load_cases(path=CASES):
         if '/' in name or name in names:
             raise ValueError('Duplicate or nested case ID')
         names.add(name)
-        if case['suite'] not in ('typescript', 'managed') or case['invocation'] not in ('explicit', 'configured', 'negative'):
+        if case['suite'] not in ('typescript', 'rust', 'managed') or case['invocation'] not in ('explicit', 'configured', 'negative'):
             raise ValueError('Invalid case mode')
         if not isinstance(case['prompt'], str) or not case['prompt'].strip() or not isinstance(case['files'], dict):
             raise ValueError('Invalid prompt/files')
@@ -158,6 +162,9 @@ def run_case(case, output_dir, folders, executable, timeout=240, model=None, can
             f'For TypeScript implementation, review, debugging or configuration work, read {folders["typescript"] / "SKILL.md"}. '
             'When that TypeScript task also involves frontend/UI work, complete frontend-ui first and apply both. '
             'Frontend work without TypeScript does not require the TypeScript skill.\n'
+            f'For Rust implementation, review, debugging, migration or Cargo/toolchain configuration work, read {folders["rust"] / "SKILL.md"}. '
+            f'For Tauri integration work, also read {folders["tauri"] / "SKILL.md"}; Rust owns language and Cargo decisions. '
+            'Unrelated work in a Rust repository does not require rust.\n'
             f'Prefer reading guidance with uv run --script {shlex.quote(str(ROOT / "scripts/read_guidance.py"))} '
             '<absolute-guidance-path>, one file per command with at least 8000 output tokens. '
             'Follow every next_start continuation before reading later guidance. '
@@ -208,7 +215,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('list', 'plan', 'run'))
     parser.add_argument('--cases', type=Path, default=CASES)
-    parser.add_argument('--suite', choices=('typescript', 'all'), default='typescript')
+    parser.add_argument('--suite', choices=('typescript', 'rust', 'all'), default='typescript')
     parser.add_argument('--case', action='append', default=[])
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--skills-root', type=Path)

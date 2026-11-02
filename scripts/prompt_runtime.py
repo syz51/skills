@@ -19,7 +19,7 @@ ROLE_CONTRACTS = {
     'extract': 'Return only schema JSON, at most three abstract notes for listed verified_skills. No tools or actions. Do not expand eligibility; skip unsupported, duplicate, routine or read-only work.\n',
     'verify': 'Return only schema JSON. No tools or actions. Supported means faithful attribution to supplied messages, never verification of runtime outcomes. Check every material claim and qualification.\n',
     'correct': 'Return only schema JSON, at most one corrected note for the supplied skill. No tools or actions. Preserve the same lesson and explicit uncertainty; return no notes when unsupported.\n',
-    'maintain': '''Maintain only frontend-ui, content-research-writer, find-skills, tauri and typescript,
+    'maintain': '''Maintain only frontend-ui, content-research-writer, find-skills, tauri, typescript and rust,
 including their entire owned skill trees, nested references, owned supporting scripts,
 agent metadata, templates, assets and evaluation fixtures, plus review and append-only
 investigation records. Preserve immutable source notes and receipts. Repository-relative
@@ -35,7 +35,7 @@ Keep, revise, simplify, remove or restore guidance when supported. Restore throu
 forward commits, never history resets or discarded concurrent work. Failed experiments are
 learning evidence, not proof of success. Loading, compilation and proxies do not establish
 runtime behavior or guidance benefit. The machine investigation gate runs before publication.
-Do not edit root workflows, host configuration, scripts outside the five owned skill trees,
+Do not edit root workflows, host configuration, scripts outside the six owned skill trees,
 authorization, this fixed policy or maintenance-prompt.md. Preserve source provenance under
 the protected maintenance procedure; owned-file authority does not permit importing untrusted
 upstream code or special files. Do not expand network access, publication or skill authority.

@@ -15,7 +15,7 @@ For frontend work, read `frontend-ui` first. This map does not broaden other ski
 | tsdown declaration output, exports, and bundling | `frontend-ui` | `references/frameworks/tsdown/guide.md`. Apply shared consumer checks from this skill without copying bundler-specific options. |
 | React, Next.js, and TanStack framework contracts | `frontend-ui` | `references/frameworks.md`, then the relevant framework reference. |
 | React review after editing multiple TSX components | `vercel:react-best-practices` | `SKILL.md`; preserve its existing review trigger and React-specific checklist. |
-| Rust/TypeScript IPC and native runtime boundaries | `tauri` | `SKILL.md`; TypeScript compilation does not establish native-side correctness or serialized IPC compatibility. |
+| Rust/TypeScript IPC and native runtime boundaries | `tauri`; `rust` for Rust changes | Tauri owns IPC and native integration; Rust owns language and Cargo decisions. TypeScript compilation does not establish native-side correctness or serialized IPC compatibility. |
 | AI SDK inferred UI/agent types and SDK APIs | `vercel:ai-sdk` | `SKILL.md`; retain SDK-specific inference and protocol guidance with the SDK. |
 | Feature flags and `flags.ts` conventions | `vercel:flags-sdk` | `SKILL.md`; Flags Explorer export conventions are product-specific. |
 | Vercel module/runtime, deployment, or durable execution integration | `vercel:vercel-cli`, `vercel:vercel-functions`, or `vercel:workflow` | The relevant `SKILL.md`; choose by the actual platform task. Platform build success does not replace semantic checking. |

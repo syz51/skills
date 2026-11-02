@@ -66,4 +66,4 @@ Merge those fields into your reviewed configuration; this fragment is not a comp
 
 ## Weekly investigation boundary
 
-Private weekly publication follows isolated review and a machine-readable investigation gate. All five owned skill trees may change, including first-party fixtures; source identities, root policy and immutable notes/receipts remain protected. Sanitized investigation events are append-only private evidence and are excluded from this public export. New public fixture and tool files still require explicit inventory enrollment. Reverting guidance means a reviewed forward commit, never a force push or history rewrite.
+Private weekly publication follows isolated review and a machine-readable investigation gate. All six owned skill trees may change, including first-party fixtures; source identities, root policy and immutable notes/receipts remain protected. Sanitized investigation events are append-only private evidence and are excluded from this public export. New public fixture and tool files still require explicit inventory enrollment. Reverting guidance means a reviewed forward commit, never a force push or history rewrite.
