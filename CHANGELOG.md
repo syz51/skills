@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Refresh Rust dependencies and CI tooling; migrate SHA-256 formatting while preserving stored hashes. Building from source now requires Rust 1.88 or newer.
 - Require fresh capture and evidence results before completing maintenance jobs.
 - Enforce supporting-file and source-enrollment boundaries during skill publication.
 - Run Rust formatting, strict Clippy and tests before publishing managed Rust snapshots.

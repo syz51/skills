@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           gh api --paginate --slurp "repos/$GH_REPO/commits/$GITHUB_SHA/check-runs?per_page=100" > "$RUNNER_TEMP/checks.json"
           jq -e --arg sha "$GITHUB_SHA" \
-            --argjson required '["tests (3.13)","tests (3.14)","Rust (ubuntu-latest)","Rust (macos-latest)"]' '
+            --argjson required '["tests (3.13)","tests (3.14)","tests (3.15)","Rust (ubuntu-latest)","Rust (macos-latest)"]' '
             [.[].check_runs[] | select(.app.id == 15368 and .head_sha == $sha)] as $runs
             | $required | all(.[]; . as $name
               | [$runs[] | select(.name == $name)] | sort_by(.started_at, .id) | last

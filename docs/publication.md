@@ -15,6 +15,8 @@ The Rust executable also provides `codex-skills daily --config <path>` for the l
 
 The configuration and publication state stay private. The `plan` command reports selected paths without publishing. Installing the skills does not install this job. The local computer must be awake and online for publication; a missed or failed run is retried by the routine rather than treated as a successful publication.
 
+Publication waits up to five minutes for the shared maintenance lock, checking cancellation while waiting. Publication and daily-job locks remain nonblocking. A daily attempt still blocked by another maintenance or publication transaction records `outcome: "deferred"` and `reason: "publication_lock_held"`, with `success: null`. It leaves the deadline pending for the next scheduled attempt. Lock I/O errors remain failures. A second daily process cannot replace the active process's status.
+
 ## Message generation
 
 Configure the Codex executable, authentication home, model, reasoning effort and timeout explicitly in the private generation configuration. Also configure `python_path` for the existing candidate-validation suite. The publisher uses the exact released `codex-commit` library; generation receives the staged public diff, excluding generated manifest noise. Private commit messages and private repository history are never used as message context.

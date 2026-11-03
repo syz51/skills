@@ -92,8 +92,70 @@ fn overlapping_job_never_calls_publication() {
     let root = TempDir::new().unwrap();
     let config = config(&root);
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
+    let original = b"active status";
+    fs::write(root.path().join("daily-status.json"), original).unwrap();
     let _lock = codex_skills::export::acquire(&[root.path().join("job.lock")]).unwrap();
     assert!(daily::run_with(&config, now, || panic!("overlapping job must not run")).is_err());
+    assert!(!root.path().join("daily-state.json").exists());
+    assert_eq!(
+        fs::read(root.path().join("daily-status.json")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn export_lock_defers_real_publication_without_completing_deadline() {
+    let root = TempDir::new().unwrap();
+    let mut config = config(&root);
+    config.cycle_lock = Some(root.path().join("cycle.lock"));
+    let lock = codex_skills::export::acquire(&[root.path().join("export.lock")]).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
+    // No Git repository or candidate exists: reaching source inspection would fail.
+    let result = daily::run(&config, now, &|_| panic!("must not generate while busy")).unwrap();
+    assert_eq!(
+        result,
+        json!({"outcome": "deferred", "reason": "publication_lock_held"})
+    );
+    let status: Value =
+        serde_json::from_slice(&fs::read(root.path().join("daily-status.json")).unwrap()).unwrap();
+    assert!(status["success"].is_null());
+    assert_eq!(status["outcome"], "deferred");
+    assert_eq!(status["reason"], "publication_lock_held");
+    assert!(status["finished_at"].is_string());
+    assert!(!root.path().join("daily-state.json").exists());
+    assert!(!root.path().join("candidate-tests.log").exists());
+    assert!(!root.path().join("export-state.json").exists());
+    drop(lock);
+    assert_eq!(
+        daily::run_with(&config, now, || Ok(json!({"changed": false}))).unwrap()["outcome"],
+        "unchanged"
+    );
+    assert_eq!(
+        daily::run_with(&config, now, || panic!("deadline completed")).unwrap()["outcome"],
+        "not_due"
+    );
+}
+
+#[test]
+fn lock_io_failure_is_not_a_deferral() {
+    let root = TempDir::new().unwrap();
+    let mut config = config(&root);
+    // A missing parent yields a real open error rather than lock contention.
+    config.cycle_lock = Some(root.path().join("missing/cycle.lock"));
+    let error = match codex_skills::export::acquire(&[config.cycle_lock.clone().unwrap()]) {
+        Err(error) => error,
+        Ok(_) => panic!("missing parent must fail"),
+    };
+    assert!(!error.is::<codex_skills::export::LockBusy>());
+    assert!(error.is::<std::io::Error>());
+    let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
+    assert!(daily::run(&config, now, &|_| panic!("must not generate")).is_err());
+    // Failure to acquire cycle.lock releases the already acquired export.lock.
+    assert!(codex_skills::export::acquire(&[root.path().join("export.lock")]).is_ok());
+    let status: Value =
+        serde_json::from_slice(&fs::read(root.path().join("daily-status.json")).unwrap()).unwrap();
+    assert_eq!(status["success"], false);
+    assert!(status.get("outcome").is_none());
     assert!(!root.path().join("daily-state.json").exists());
 }
 

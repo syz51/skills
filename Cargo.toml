@@ -2,7 +2,7 @@
 name = "codex-skills"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Curated public skill publication with informative commit messages"
 license = "MIT"
 repository = "https://github.com/syz51/skills"
@@ -11,18 +11,18 @@ publish = false
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 regex = "1"
 tempfile = "3.27.0"
 fs2 = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1"
 caseless = "0.2.2"
-signal-hook = "0.3.18"
+signal-hook = "0.4.6"
 nix = { version = "0.31.3", features = ["process", "signal"] }
-codex-commit = "=0.6.0"
+codex-commit = "=0.6.5"
 
 [profile.release]
 lto = true

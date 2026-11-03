@@ -70,6 +70,13 @@ pub fn run_with(
     });
     let result = match result {
         Ok(value) => value,
+        Err(error) if error.is::<export::LockBusy>() => {
+            status["outcome"] = json!("deferred");
+            status["reason"] = json!("publication_lock_held");
+            status["finished_at"] = json!(Utc::now().to_rfc3339());
+            export::save(&status_path, &status)?;
+            return Ok(json!({"outcome": "deferred", "reason": "publication_lock_held"}));
+        }
         Err(_) => {
             status["success"] = json!(false);
             status["error"] = json!(FAILURE);

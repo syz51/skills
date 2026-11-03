@@ -63,7 +63,10 @@ class PromptReviewTests(unittest.TestCase):
         if schema is review.REVIEW_SCHEMA:
             return {'approved': self.approval, 'artifact_hash': value['artifact_hash']}
         source = value.get('turn', value)
-        is_correction = 'keyboard focus' in json.dumps(source)
+        # Model both supported guidance corrections; a new positive corpus case
+        # must not become an unrelated candidate regression in this test double.
+        is_correction = any(text in json.dumps(source) for text in
+                            ('keyboard focus', 'accessible names for icon-only controls'))
         if is_correction:
             return {'notes': [NOTE]}
         if not self.baseline_pass and 'REFINED' not in prompt and 'button spacing' in json.dumps(source):

@@ -23,6 +23,16 @@ use std::{
 
 pub const MANIFEST: &str = ".public-export.json";
 pub type Files = BTreeMap<String, Vec<u8>>;
+/// Expected contention with another publication or maintenance transaction.
+#[derive(Debug)]
+pub struct LockBusy;
+impl std::fmt::Display for LockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Publication deferred: job lock held")
+    }
+}
+impl std::error::Error for LockBusy {}
+
 pub struct Locks {
     _files: Vec<File>,
 }
@@ -39,12 +49,31 @@ pub fn acquire(paths: &[PathBuf]) -> Result<Locks> {
     let mut locks = Locks { _files: Vec::new() };
     for p in paths {
         let f = OpenOptions::new().create(true).append(true).open(p)?;
-        f.try_lock_exclusive()
-            .map_err(|_| "Publication deferred: job lock held")?;
+        lock_file(&f, Duration::ZERO, &|| false)?;
         locks._files.push(f);
     }
     Ok(locks)
 }
+// Only the shared maintenance lock waits; publication/job locks stay nonblocking.
+fn lock_file(file: &File, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if cancelled() {
+            return Err("Publication cancelled".into());
+        }
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() >= timeout {
+                    return Err(LockBusy.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(start.elapsed())));
+    }
+}
+
 pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut f = tempfile::NamedTempFile::new_in(path.parent().ok_or("State parent missing")?)?;
     serde_json::to_writer_pretty(&mut f, value)?;
@@ -83,7 +112,10 @@ fn bytes(value: &impl Serialize) -> Result<Vec<u8>> {
     Ok(ascii.into_bytes())
 }
 fn hash(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 fn terminate_group(child: &mut Child) {
     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
@@ -556,11 +588,17 @@ fn execute_with_checks(
     cargo: &Path,
 ) -> Result<ExportResult> {
     fs::create_dir_all(&c.state_dir)?;
-    let mut paths = vec![c.state_dir.join("export.lock")];
-    if let Some(p) = &c.cycle_lock {
-        paths.push(p.clone())
+    let mut locks = acquire(&[c.state_dir.join("export.lock")])?;
+    if let Some(path) = &c.cycle_lock {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        lock_file(
+            &file,
+            Duration::from_secs(300),
+            &crate::cancellation::requested,
+        )?;
+        locks._files.push(file);
     }
-    let _locks = acquire(&paths)?;
+    let _locks = locks;
     let local = clean(&c.source_repo)?;
     let mut revision = local.clone();
     if c.fetch_source {
@@ -585,12 +623,11 @@ fn execute_with_checks(
     } else {
         None
     };
-    if let Some(s) = &state {
-        if s.target_url != c.target_url
-            || !regex::Regex::new(r"^[0-9a-f]{40,64}$")?.is_match(&s.public_commit)
-        {
-            return Err("Publication state mismatch".into());
-        }
+    if let Some(s) = &state
+        && (s.target_url != c.target_url
+            || !regex::Regex::new(r"^[0-9a-f]{40,64}$")?.is_match(&s.public_commit))
+    {
+        return Err("Publication state mismatch".into());
     }
     let tmp = tempfile::tempdir()?;
     let repo = tmp.path().join("checkout");
@@ -778,6 +815,17 @@ pub fn validate_message(m: &CommitMessage) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn sha256_preserves_lowercase_zero_padded_hex() {
+        assert_eq!(
+            hash(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hash(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
     fn fixture() -> (tempfile::TempDir, Config, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let source = t.path().join("source");
@@ -912,6 +960,41 @@ mod tests {
         assert!(acquire(&paths).is_ok());
     }
     #[test]
+    fn shared_lock_waits_for_release_and_times_out_when_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cycle.lock");
+        let owner = acquire(std::slice::from_ref(&path)).unwrap();
+        let file = OpenOptions::new().append(true).open(&path).unwrap();
+        let error = lock_file(&file, Duration::from_millis(30), &|| false).unwrap_err();
+        assert!(error.is::<LockBusy>());
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(owner);
+        });
+        lock_file(&file, Duration::from_secs(2), &|| false).unwrap();
+        releaser.join().unwrap();
+        assert!(acquire(std::slice::from_ref(&path)).is_err());
+        FileExt::unlock(&file).unwrap();
+        assert!(acquire(&[path]).is_ok());
+    }
+
+    #[test]
+    fn shared_lock_wait_checks_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cycle.lock");
+        let _owner = acquire(std::slice::from_ref(&path)).unwrap();
+        let file = OpenOptions::new().append(true).open(path).unwrap();
+        let start = Instant::now();
+        let error = lock_file(&file, Duration::from_secs(300), &|| {
+            start.elapsed() >= Duration::from_millis(30)
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Publication cancelled");
+        assert!(!error.is::<LockBusy>());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn command_deadline_covers_exited_leader_with_inherited_pipes() {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("pid");
@@ -967,6 +1050,40 @@ mod tests {
                 .contains("Private source context")
         );
     }
+    #[test]
+    fn publication_continues_after_shared_cycle_lock_is_released() {
+        let (temp, mut config, remote) = fixture();
+        let cycle = temp.path().join("cycle.lock");
+        config.cycle_lock = Some(cycle.clone());
+        let owner = acquire(&[cycle]).unwrap();
+        let calls = AtomicUsize::new(0);
+        let result = thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                drop(owner);
+            });
+            execute_with_destination(
+                &config,
+                true,
+                &|_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(message())
+                },
+                remote.to_str().unwrap(),
+            )
+            .unwrap()
+        });
+        assert!(result.changed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let commit = result.public_commit.unwrap();
+        assert_eq!(text(&remote, &["rev-parse", "HEAD"]).unwrap(), commit);
+        let state: Value =
+            serde_json::from_slice(&fs::read(config.state_dir.join("export-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["public_commit"], commit);
+        assert_eq!(state["source_commit"], result.source_commit);
+    }
+
     #[test]
     fn python_subprocess_failure_replaces_stale_success_log_and_never_pushes() {
         let (temp, mut config, remote) = fixture();
