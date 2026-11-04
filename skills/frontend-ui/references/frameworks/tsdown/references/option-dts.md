@@ -189,12 +189,12 @@ For DTS-specific issues, report to [rolldown-plugin-dts](https://github.com/sxzz
 
 ### Vue Support
 
-Enable Vue component type generation (requires `vue-tsc`):
+Enable Vue component type generation with `dts.tsc.vue` (requires `vue-tsc`); see the reviewed [version scope](../guide.md#version-scope):
 
 ```ts
 export default defineConfig({
   dts: {
-    vue: true,
+    tsc: { vue: true },
   },
 })
 ```
@@ -229,7 +229,7 @@ export default defineConfig({
 |--------|------|-------------|
 | `sourcemap` | `boolean` | Generate declaration source maps |
 | `compilerOptions` | `object` | Override TypeScript compiler options |
-| `vue` | `boolean` | Enable Vue type generation (requires vue-tsc) |
+| `tsc.vue` | `boolean` | Enable Vue type generation under `dts.tsc` (requires vue-tsc) |
 | `oxc` | `boolean` | Use oxc-transform for fast generation |
 | `tsconfig` | `string` | Path to tsconfig file |
 | `resolver` | `'oxc' \| 'tsc'` | Module resolver: `'oxc'` (default, fast) or `'tsc'` (more compatible) |

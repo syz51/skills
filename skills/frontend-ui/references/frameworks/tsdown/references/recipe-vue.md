@@ -6,6 +6,8 @@ Build Vue component libraries with tsdown.
 
 tsdown provides first-class support for Vue libraries through integration with `unplugin-vue` and `rolldown-plugin-dts` for type generation.
 
+The Vue declaration options follow the reviewed [version scope](../guide.md#version-scope). Match them to the project's installed toolchain.
+
 ## Quick Start
 
 ### Use Starter Template
@@ -40,7 +42,7 @@ export default defineConfig({
     Vue({ isProduction: true }),
   ],
   dts: {
-    vue: true,  // Enable Vue type generation
+    tsc: { vue: true }, // Enable Vue type generation
   },
 })
 ```
@@ -136,7 +138,7 @@ export default defineConfig({
     }),
   ],
   dts: {
-    vue: true,
+    tsc: { vue: true },
   },
   clean: true,
 })
@@ -157,7 +159,7 @@ export default defineConfig({
     neverBundle: ['vue'],
   },
   plugins: [Vue({ isProduction: true })],
-  dts: { vue: true },
+  dts: { tsc: { vue: true } },
 })
 ```
 
@@ -183,7 +185,7 @@ export default defineConfig({
     neverBundle: ['vue'],
   },
   plugins: [Vue({ isProduction: true })],
-  dts: { vue: true },
+  dts: { tsc: { vue: true } },
 })
 ```
 
@@ -210,6 +212,8 @@ export default defineConfig({
 
 ### Package.json Configuration
 
+This example shows package metadata. Development dependencies (`tsdown`, `typescript`, `unplugin-vue`, `vue`, and `vue-tsc`) are omitted: select compatible versions for the project rather than treating this snapshot as a tested dependency combination.
+
 ```json
 {
   "name": "my-vue-library",
@@ -228,13 +232,6 @@ export default defineConfig({
   "files": ["dist"],
   "peerDependencies": {
     "vue": "^3.0.0"
-  },
-  "devDependencies": {
-    "tsdown": "^0.9.0",
-    "typescript": "^5.0.0",
-    "unplugin-vue": "^5.0.0",
-    "vue": "^3.4.0",
-    "vue-tsc": "^2.0.0"
   }
 }
 ```
@@ -260,7 +257,7 @@ export default defineConfig({
       dts: 'src/components.d.ts',
     }),
   ],
-  dts: { vue: true },
+  dts: { tsc: { vue: true } },
 })
 ```
 
@@ -287,7 +284,7 @@ export default defineConfig({
       jsxImportSource: 'vue',
     },
   },
-  dts: { vue: true },
+  dts: { tsc: { vue: true } },
 })
 ```
 
@@ -302,7 +299,7 @@ export default defineConfig({
     neverBundle: ['vue', /^@mycompany\//],
   },
   plugins: [Vue({ isProduction: true })],
-  dts: { vue: true },
+  dts: { tsc: { vue: true } },
 })
 ```
 
@@ -331,7 +328,7 @@ Vue({
 ## Tips
 
 1. **Always externalize Vue** - Don't bundle Vue itself
-2. **Enable vue: true in dts** - For proper type generation
+2. **Enable tsc.vue in dts** - For proper type generation
 3. **Use platform: 'neutral'** - Maximum compatibility
 4. **Install vue-tsc** - Required for type generation
 5. **Set isProduction: true** - Optimize for production
@@ -348,7 +345,7 @@ pnpm add -D vue-tsc
 
 Enable in config:
 ```ts
-dts: { vue: true }
+dts: { tsc: { vue: true } }
 ```
 
 ### Component Types Missing

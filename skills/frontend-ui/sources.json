@@ -991,9 +991,9 @@
       "local": "references/frameworks/tsdown",
       "path": "skills/tsdown",
       "repository": "https://github.com/rolldown/tsdown.git",
-      "reviewedAt": "2026-10-29T08:54:09.620244+00:00",
-      "revision": "17bd0fc1f5ce2331f4e061179594f2447152eb6a",
-      "tree": "ac732104463e4adad543e703bbf84b137dab02d2"
+      "reviewedAt": "2026-11-04T00:10:53.339246+00:00",
+      "revision": "915473256a2f43c941649850aa10712709782973",
+      "tree": "48a8348553d3559498b480d6f767b257af780f70"
     }
   ],
   "upstreamReviewNote": "Framework entries are snapshots of the upstream folder under `local`: SKILL.md is adapted as guide.md, and GENERATION.md, SYNC.md, README.md and LICENSE.md are not mirrored. Apply reference changes with `git apply --directory=skills/frontend-ui/<local> --exclude='*/SKILL.md' --exclude='*/GENERATION.md' --exclude='*/SYNC.md' --exclude='*/README.md' --exclude='*/LICENSE.md' --include='*.md' <patch>`, adding `--reject` when hunks conflict with `localEdits`; merge rejected hunks into their own files and SKILL.md changes into guide.md by hand, then delete any .rej or .orig files. Design entries (local \".\") were consolidated into SKILL.md and references/*.md; treat their changes as ideas to evaluate rather than files to copy.",

@@ -4,6 +4,10 @@ Shared frontend/UI policy: [frontend-ui](../../../SKILL.md) and [framework bound
 
 Blazing-fast bundler for TypeScript/JavaScript libraries powered by Rolldown and Oxc.
 
+## Version scope
+
+The Vue declaration examples reflect reviewed upstream revision `915473256a2f43c941649850aa10712709782973`: source package version `0.23.5`, with the `rolldown-plugin-dts` `^0.29.0` transition to `dts.tsc.vue`. The reviewed schema retains `dts.vue` as a deprecated alias. This source review does not verify a published package or a complete dependency combination. Match the installed toolchain's documentation before adopting these options; this snapshot does not require a project upgrade.
+
 ## Runtime Requirement
 
 `tsdown` requires **Node.js 22.18.0 or higher to run** (build-time only). However, the bundled output can target much lower Node.js versions via the [`target`](references/option-target.md) option, so libraries built with tsdown are **not locked to Node.js 22+ at runtime**.
@@ -77,7 +81,7 @@ export default defineConfig({
 | Entry points | `entry: ['src/*.ts', '!**/*.test.ts']` | [option-entry](references/option-entry.md) |
 | Output formats | `format: ['esm', 'cjs', 'iife', 'umd']` | [option-output-format](references/option-output-format.md) |
 | Output directory | `outDir: 'dist'`, `outExtensions` | [option-output-directory](references/option-output-directory.md) |
-| Type declarations | `dts: true`, `dts: { sourcemap, compilerOptions, vue }` | [option-dts](references/option-dts.md) |
+| Type declarations | `dts: true`, `dts: { sourcemap, compilerOptions, tsc: { vue: true } }` | [option-dts](references/option-dts.md) |
 | Target environment | `target: 'es2020'`, `target: 'esnext'` | [option-target](references/option-target.md) |
 | Platform | `platform: 'node'`, `platform: 'browser'` | [option-platform](references/option-platform.md) |
 | Tree shaking | `treeshake: true`, custom options | [option-tree-shaking](references/option-tree-shaking.md) |
