@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Extract bounded, private feedback from completed local skill work; no chat writes."""
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import argparse
 import prompt_runtime
 import ast
@@ -18,9 +16,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import activation_trace
+import claude_cli
 from read_guidance import SKILL_PATTERN, SKILLS, guidance_path, observed, request, shell_words
 
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -38,18 +36,9 @@ MAX_OUTPUT = 12000
 MAX_TURNS = 20
 MODEL_TIMEOUT = 240
 CYCLE_TIMEOUT = 900
-PRIVACY_REJECTIONS = {'privacy identifier rejected', 'privacy source quotation rejected', 'privacy source name rejected'}
-STARTUP_DIAGNOSTIC = ('Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; '
-                      'enable `features.code_mode_host` and install `codex-code-mode-host`.')
+# CLI paths whose --help advertised every isolation control in this process.
+VERIFIED_CLIS = set()
 FIELDS = ('title', 'task', 'observation', 'evidence', 'cause', 'proposal')
-TOOL_FEATURES = {'shell_tool', 'multi_agent', 'apps', 'plugins', 'hooks', 'code_mode_host',
-                 'code_mode', 'multi_agent_v2', 'sleep_tool', 'computer_use', 'browser_use',
-                 'image_generation', 'view_image', 'daemon_auto_start'}
-EXTRACTOR_CONFIG = ('project_doc_max_bytes=0', 'model_reasoning_effort="xhigh"', 'approval_policy="never"',
-                    'tools.update_plan.enabled=false', 'tools.experimental_request_user_input.enabled=false',
-                    'web_search="disabled"', 'features.multi_agent_v2.non_code_mode_only=false',
-                    'features.code_mode.excluded_tool_namespaces=["functions","clock","collaboration"]')
-REQUIRED_CONFIG = ('project_doc_max_bytes=0', 'approval_policy="never"', 'web_search="disabled"')
 SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['notes'], 'properties': {
     'notes': {'type': 'array', 'maxItems': 3, 'items': {'type': 'object', 'additionalProperties': False,
         'required': ['skill', *FIELDS], 'properties': {'skill': {'type': 'string', 'enum': list(SKILLS)},
@@ -89,15 +78,6 @@ def timestamp(value):
     if result.tzinfo is None:
         raise ValueError('Capture timestamps must include timezone')
     return result
-
-
-def redact(text):
-    text = re.sub(r'(?i)(?:bearer\s+|(?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s"\']+', '[redacted credential]', text)
-    text = re.sub(r'\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b', '[redacted credential]', text)
-    text = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[redacted email]', text)
-    text = re.sub(r'https?://[^\s<>"\']+', '[redacted URL]', text)
-    text = re.sub(r'/(?:Users|home)/[^\s<>"\']+', '[local path]', text)
-    return text
 
 
 def text_content(payload):
@@ -678,7 +658,7 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
                     continue
                 source_hash.update(line)
                 if kind == 'event_msg' and payload.get('type') == 'user_message':
-                    current['messages'].append({'role': 'user', 'text': redact(payload.get('message', ''))})
+                    current['messages'].append({'role': 'user', 'text': payload.get('message', '')})
                 if kind == 'response_item':
                     item_type = payload.get('type')
                     if item_type in ('function_call', 'custom_tool_call'):
@@ -740,9 +720,9 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
                     elif item_type == 'message' and payload.get('role') == 'user':
                         text = text_content(payload)
                         if not text.startswith(('# AGENTS.md instructions', '<environment_context>')):
-                            current['messages'].append({'role': 'user', 'text': redact(text)})
+                            current['messages'].append({'role': 'user', 'text': text})
                     elif item_type == 'message' and payload.get('role') == 'assistant':
-                        current['messages'].append({'role': 'assistant', 'text': redact(text_content(payload))})
+                        current['messages'].append({'role': 'assistant', 'text': text_content(payload)})
                 if kind == 'event_msg' and payload.get('type') == 'task_complete':
                     finished = record.get('timestamp')
                     if payload.get('turn_id') != current['turn'] or not finished:
@@ -869,7 +849,7 @@ def claude_record(scan, record, line, source_notes):
             text = claude_text(queued.get('prompt'))
             if text:
                 current['hash'].update(line)
-                current['messages'].append({'role': 'user', 'text': redact(text)})
+                current['messages'].append({'role': 'user', 'text': text})
                 scan['context'] = current['filter'] = current['filter'] + '\n' + text
         return
     message = record.get('message')
@@ -899,7 +879,7 @@ def claude_record(scan, record, line, source_notes):
             if not isinstance(item, dict):
                 continue
             if item.get('type') == 'text' and isinstance(item.get('text'), str) and item['text'].strip():
-                current['messages'].append({'role': 'assistant', 'text': redact(item['text'])})
+                current['messages'].append({'role': 'assistant', 'text': item['text']})
             elif item.get('type') == 'tool_use':
                 scan['uses'][item.get('id')] = (item.get('name', ''), item.get('input') if isinstance(item.get('input'), dict) else {})
                 current['calls'].append({'name': item.get('name', '')})
@@ -927,7 +907,7 @@ def claude_record(scan, record, line, source_notes):
     elif not record.get('isCompactSummary'):
         text = claude_text(content)
         if text:
-            current['messages'].append({'role': 'user', 'text': redact(text)})
+            current['messages'].append({'role': 'user', 'text': text})
 
 
 def add_read(scan, entry):
@@ -1035,33 +1015,13 @@ def validate_notes(value, turn):
             raise ValueError('Invalid capture note scope')
         if any(not isinstance(note[k], str) or not note[k].strip() or len(note[k]) > 1000 or '\n' in note[k] for k in FIELDS):
             raise ValueError('Invalid capture note field')
-        if any(redact(note[k]) != note[k] or re.search(r'(?:\+?\d[\d ()-]{8,}\d|\b\d+\s+\w+\s+(?:Street|Road|Avenue)\b)', note[k], re.I) for k in FIELDS):
-            raise ValueError('Capture output contains private identifiers')
-    source_text = '\n'.join(m.get('text', '') for m in turn.get('messages', []))
-    source_words = re.findall(r'\w+', source_text)
-    source_phrases = {' '.join(source_words[i:i + 7]).lower() for i in range(max(0, len(source_words) - 6))}
-    sentences = [part.strip(' \n\t\"\'“”‘’') for part in re.split(r'[.!?。！？\n]+', source_text)]
-    sentences += re.findall(r'[\"“]([^\"”]{20,})[\"”]', source_text)
-    sentences = [re.sub(r'\s+', ' ', sentence).casefold() for sentence in sentences if len(sentence) >= 20 or (len(sentence) >= 5 and re.fullmatch(r'[\u3000-\u9fff\uf900-\ufaff]+', sentence))]
-    names = re.findall(r'(?i:\b(?:customer|client|company|project|organization|named|called)\s*[:=]?\s+)[\"“]?((?:[A-Z][\w-]*)(?:\s+[A-Z][\w-]*){0,3})', source_text)
-    names += re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', source_text)
-    generic_names = {'Frontend UI', 'Content Research Writer', 'Find Skills', 'JSON Schema', 'Python Standard Library',
-                     'Google Docs', 'Google Sheets', 'Google Slides', 'Microsoft Excel', 'GitHub Actions'}
-    names = [name.casefold() for name in names if name not in generic_names]
-    for note in value['notes']:
-        words = re.findall(r'\w+', ' '.join(note[k] for k in FIELDS))
-        if any(' '.join(words[i:i + 7]).lower() in source_phrases for i in range(max(0, len(words) - 6))):
-            raise ValueError('Capture output quotes source text')
-        for field_text in (note[k] for k in FIELDS):
-            normalized = re.sub(r'\s+', ' ', field_text).casefold()
-            if any(sentence in normalized for sentence in sentences):
-                raise ValueError('Capture output quotes a private source sentence')
-            if any(re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', normalized) for name in names):
-                raise ValueError('Capture output includes a source identifying name')
-            for phrase in re.findall(r'[\u3000-\u9fff\uf900-\ufaff]{12,}', field_text):
-                if any(phrase[i:i + 12] in source_text for i in range(len(phrase) - 11)):
-                    raise ValueError('Capture output quotes private source text')
     return value['notes']
+
+
+def validate_summary(summary, skill='frontend-ui'):
+    """Source-check summaries are committed as a note field, so the same field rules apply."""
+    note = {'skill': skill, **{key: 'Source evidence assessment' for key in FIELDS}, 'evidence': summary}
+    validate_notes({'notes': [note]}, {'verified_skills': [skill]})
 
 
 def message_context(messages, compact=False):
@@ -1101,9 +1061,9 @@ def extract(config, state_root, turn, existing, *, deadline=None):
     return validate_notes(model_response(config, state_root, prompt_runtime.load('extract', config), data, SCHEMA, deadline=deadline), turn)
 
 
-def run_extractor(command, *, env, input, timeout):
+def run_extractor(command, *, env, input, timeout, cwd=None):
     """Reap the isolated CLI and its children together, including inherited output pipes."""
-    with subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    with subprocess.Popen(command, env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True, start_new_session=True) as process:
         try:
             stdout, stderr = process.communicate(input, timeout=timeout)
@@ -1113,7 +1073,10 @@ def run_extractor(command, *, env, input, timeout):
             except ProcessLookupError:
                 pass
             stdout, stderr = process.communicate()
-            raise subprocess.TimeoutExpired('restricted extractor', timeout, output=stdout, stderr=stderr) from None
+            expired = subprocess.TimeoutExpired('restricted extractor', timeout, output=stdout, stderr=stderr)
+            # The CLI may have exited on its own while a child held the pipes open; keep its status.
+            expired.returncode = process.returncode
+            raise expired from None
         except BaseException:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -1124,86 +1087,54 @@ def run_extractor(command, *, env, input, timeout):
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def extractor_events(stdout, *, partial=False):
-    """Validate control events; retain no model, reasoning, or error text in diagnostics."""
-    if isinstance(stdout, bytes):
-        stdout = stdout.decode(errors='replace')
-    stdout = stdout or ''
-    if len(stdout) > 1000000:
-        raise RuntimeError('Capture event output exceeds safety bound')
-    started, completed, errors = False, False, []
-    lines = stdout.splitlines()
-    for index, line in enumerate(lines):
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            if partial and index == len(lines) - 1 and not stdout.endswith('\n'):
-                break
-            raise
-        if not isinstance(event, dict):
-            raise ValueError('Invalid capture output')
-        if event.get('type') == 'turn.started':
-            started = True
-        if event.get('type') == 'turn.completed':
-            completed = True
-        item = event.get('item', {})
-        if not isinstance(item, dict):
-            raise ValueError('Invalid capture output')
-        if not started and item.get('type') == 'error' and item.get('message') == STARTUP_DIAGNOSTIC:
-            continue
-        if (item and item.get('type') not in ('agent_message', 'reasoning', 'error')) or event.get('type') in ('tool_call', 'function_call'):
-            raise RuntimeError('Capture model attempted tool execution')
-        if item.get('type') == 'error' and isinstance(item.get('message'), str):
-            errors.append(item['message'])
-        if event.get('type') == 'error' and isinstance(event.get('message'), str):
-            errors.append(event['message'])
-        error = event.get('error')
-        if isinstance(error, dict) and isinstance(error.get('message'), str):
-            errors.append(error['message'])
-    return ('completed' if completed else 'inference' if started else 'startup'), '\n'.join(errors)
+def verify_cli(cli, *, deadline=None):
+    """Fail closed before a private prompt reaches a CLI that cannot enforce every isolation control.
+
+    Verification is keyed by the executable's identity, so a CLI replaced in place is checked again.
+    """
+    status = os.stat(cli)
+    identity = (cli, status.st_ino, status.st_size, status.st_mtime_ns)
+    if identity in VERIFIED_CLIS:
+        return
+    if claude_cli.missing_flags(cli_text(cli, '--help', deadline=deadline), claude_cli.RESTRICTED_FLAGS):
+        raise RuntimeError('Capture CLI required control is unavailable')
+    VERIFIED_CLIS.add(identity)
 
 
-def extractor_error_class(stderr, event_errors):
-    if isinstance(stderr, bytes):
-        stderr = stderr.decode(errors='replace')
-    text = (stderr or '') + '\n' + event_errors
-    for label, pattern in (
-            ('authentication', r'\b401\b|unauthori[sz]ed|not logged in|authentication (?:failed|required)|refresh.token.*expired'),
-            ('rate limit', r'\b429\b|rate.?limit|usage limit|quota exceeded'),
-            ('connection', r'connection (?:reset|refused|closed)|stream disconnected|error sending request|network (?:unreachable|error)|timed out|unexpected eof|\b50[234]\b')):
-        if re.search(pattern, text, re.I):
-            return label
-    return 'CLI or output'
+def usable(output):
+    return isinstance(output, dict) and len(json.dumps(output, ensure_ascii=False)) <= MAX_OUTPUT
 
 
 def model_response(config, state_root, prompt, data, response_schema, *, deadline=None):
     with tempfile.TemporaryDirectory(prefix='.capture-model-', dir=state_root) as folder:
-        root = Path(folder)
-        schema, output = root / 'schema.json', root / 'output.json'
-        schema.write_text(json.dumps(response_schema))
         bounded_timeout(MODEL_TIMEOUT, deadline)
-        profile = compatible_profile(config['codex_path'], state_root, deadline=deadline)
-        command = extractor_command(config['codex_path'], profile, root, schema, output, deadline=deadline)
-        child_env = extractor_env()
+        cli = str(claude_cli.cli_path(config))
+        verify_cli(cli, deadline=deadline)
+        command = claude_cli.restricted_command(cli, response_schema)
+        child_env = claude_cli.child_env()
         for attempt in range(1, 3):
             timeout = bounded_timeout(MODEL_TIMEOUT, deadline)
-            output.unlink(missing_ok=True)
             began = time.monotonic()
             try:
-                result = run_extractor(command, env=child_env, input=prompt + '\n' + data, timeout=timeout)
+                result = run_extractor(command, env=child_env, input=prompt + '\n' + data, timeout=timeout, cwd=folder)
             except subprocess.TimeoutExpired as error:
-                phase, event_errors = extractor_events(error.output, partial=True)
-                category = extractor_error_class(error.stderr, event_errors)
+                exit_code = getattr(error, 'returncode', None)
+                phase, output, event_errors, facts = claude_cli.structured_run(error.output, partial=True)
+                # A leftover child can hold the pipes open after the CLI answered; keep the finished answer.
+                if phase == 'completed' and usable(output):
+                    return output
+                category = claude_cli.failure_class(decoded(error.stderr) + '\n' + event_errors)
                 if category == 'CLI or output':
                     category = 'timeout'
             else:
-                phase, event_errors = extractor_events(result.stdout)
-                failed = result.returncode != 0 or not output.is_file() or output.stat().st_size > MAX_OUTPUT
-                category = extractor_error_class(getattr(result, 'stderr', ''), event_errors)
-                if not failed:
-                    return json.loads(output.read_text())
-            diagnostics = {'elapsed_seconds': round(time.monotonic() - began, 3),
-                           'phase': phase, 'failure_class': category, 'attempts': attempt}
+                exit_code = result.returncode
+                # A crashed CLI can stop mid-line; keep what it wrote so the failure stays diagnosable.
+                phase, output, event_errors, facts = claude_cli.structured_run(result.stdout, partial=result.returncode != 0)
+                if result.returncode == 0 and phase == 'completed' and usable(output):
+                    return output
+                category = claude_cli.failure_class(decoded(result.stderr) + '\n' + event_errors)
+            diagnostics = {'elapsed_seconds': round(time.monotonic() - began, 3), 'phase': phase,
+                           'failure_class': category, 'attempts': attempt, 'exit_code': exit_code, **facts}
             # Keep recovered failures diagnosable without logging CLI or source text.
             print(json.dumps({'event': 'extractor_attempt_failed', **diagnostics}), file=sys.stderr, flush=True)
             # Deadline exhaustion is scheduling, not a failed assessment. Never settle its evidence.
@@ -1214,208 +1145,29 @@ def model_response(config, state_root, prompt, data, response_schema, *, deadlin
             raise ExtractorFailure(reason, diagnostics)
 
 
-def extractor_env():
-    return {key: value for key, value in os.environ.items() if not key.startswith('CODEX_') or key == 'CODEX_HOME'}
+def decoded(value):
+    return value.decode(errors='replace') if isinstance(value, bytes) else value or ''
 
 
 def cli_text(cli, *args, deadline=None):
-    result = run_bounded([cli, *args], env={**extractor_env(), 'LC_ALL': 'C'},
+    result = run_bounded([cli, *args], env={**claude_cli.child_env(), 'LC_ALL': 'C'},
                          capture_output=True, text=True, timeout=10, deadline=deadline)
     if result.returncode or len(result.stdout) > 100000:
         raise RuntimeError('Capture CLI capability discovery failed')
     return result.stdout
 
 
-def help_options(text):
-    options = {}
-    current = ()
-    for line in text.splitlines():
-        match = re.match(r'^\s+(-(?:-[a-z][a-z0-9-]*|[A-Za-z])(?:,\s*-(?:-[a-z][a-z0-9-]*|[A-Za-z]))*)(?:\s|$)', line)
-        if match:
-            current = tuple(re.findall(r'--[a-z][a-z0-9-]*|-[A-Za-z]', match[1]))
-            for option in current:
-                options[option] = ''
-        elif current:
-            for option in current:
-                options[option] += ' ' + line.strip()
-    return options
-
-
-def help_flag(options, names, meaning, *, required=True):
-    for name in names:
-        if name in options:
-            return name
-    matches = [name for name, description in options.items()
-               if name.startswith('--') and re.search(meaning, description, re.I)]
-    if len(matches) == 1:
-        return matches[0]
-    if required:
-        raise RuntimeError('Capture CLI required control is unavailable')
-    return None
-
-
-def help_command(text, names, meaning):
-    commands = dict(re.findall(r'^\s{2,}([a-z][a-z0-9-]*)\s{2,}([^\n]+)$', text, re.M))
-    for name in names:
-        if name in commands:
-            return name
-    matches = [name for name, description in commands.items() if re.search(meaning, description, re.I)]
-    if len(matches) == 1:
-        return matches[0]
-    raise RuntimeError('Capture CLI capability discovery failed')
-
-
-def discover_profile(cli, *, deadline=None):
-    root_help = cli_text(cli, '--help', deadline=deadline)
-    command = help_command(root_help, ('exec', 'e'), r'(?:run|execute) Codex non.interactively\b')
-    root_options = help_options(root_help)
-    options = help_options(cli_text(cli, command, '--help', deadline=deadline))
-    profile = {'command': command,
-        'standalone': help_flag(root_options, ('--no-daemon',), r'without.*shared background server'),
-        'strict': help_flag(options, ('--strict-config',), r'fields.*not recognized|fields.*does not recognize', required=False)}
-    for key, names, meaning in (
-        ('ignore_config', ('--ignore-user-config',), r'do not load.*config\.toml'),
-        ('ignore_rules', ('--ignore-rules',), r'do not load.*(?:execpolicy|\.rules)'),
-        ('ephemeral', ('--ephemeral',), r'without persisting session'),
-        ('cd', ('-C', '--cd'), r'(?:working|workspace) root'),
-        ('model', ('-m', '--model'), r'model.*(?:agent|use)|agent.*model'),
-        ('config', ('-c', '--config'), r'override a configuration value'),
-        ('sandbox', ('--sandbox', '-s'), r'sandbox policy.*model.generated'),
-        ('schema', ('--output-schema',), r'JSON Schema.*(?:response|output)'),
-        ('output', ('-o', '--output-last-message'), r'file.*(?:last|final).*message|final.*message.*file'),
-        ('json', ('--json', '--experimental-json'), r'print.*(?:JSONL|JSON events|newline.delimited JSON)'),
-        ('skip_git', ('--skip-git-repo-check',), r'outside.*Git repository')):
-        profile[key] = help_flag(options, names, meaning, required=key != 'skip_git')
-    if 'read-only' not in options[profile['sandbox']]:
-        raise RuntimeError('Capture CLI required control is unavailable')
-    feature_command = help_command(root_help, ('features',), r'(?:inspect|manage) feature flags\b')
-    listing = help_command(cli_text(cli, feature_command, '--help', deadline=deadline), ('list',), r'(?:list|show) known features\b')
-    features = cli_text(cli, feature_command, listing, deadline=deadline)
-    active = {match[1] for match in re.finditer(
-        r'^([a-z][a-z0-9_.-]*)\s+(?!removed\b)[a-z][a-z ]+\s+(?:true|false)\s*$', features, re.M)}
-    if not active:
-        raise RuntimeError('Capture CLI capability discovery failed')
-    profile['overrides'] = list(EXTRACTOR_CONFIG) + ['features.' + name + '=false' for name in sorted(active & TOOL_FEATURES)]
-    return profile
-
-
-def extractor_command(cli, profile, root, schema, output, *, deadline=None):
-    command = [cli, profile['standalone'], profile['command'], profile['ignore_config'],
-               profile['ignore_rules'], profile['ephemeral'], profile['cd'], str(root),
-               profile['model'], 'gpt-6.1-sol', profile['sandbox'], 'read-only',
-               profile['schema'], str(schema), profile['output'], str(output), profile['json']]
-    for key in ('strict', 'skip_git'):
-        if profile[key]:
-            command.append(profile[key])
-    if not profile['skip_git']:
-        run_bounded(['git', 'init', '-q', str(root)], env=extractor_env(), check=True, capture_output=True,
-                    timeout=10, deadline=deadline)
-    for option in profile['overrides']:
-        command.extend([profile['config'], option])
-    return command + ['-']
-
-
-def audit_profile(cli, profile, root, *, deadline=None):
-    requests = []
-    class AuditEndpoint(BaseHTTPRequestHandler):
-        def do_POST(self):
-            self.connection.settimeout(5)
-            size = int(self.headers.get('Content-Length', '0'))
-            if self.path == '/v1/responses' and 0 < size <= 1000000:
-                try:
-                    requests.append(json.loads(self.rfile.read(size)))
-                except (ValueError, OSError):
-                    pass
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error":{"message":"Local capture compatibility check complete"}}')
-        def log_message(self, *args):
-            pass
-    server = HTTPServer(('127.0.0.1', 0), AuditEndpoint)
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
-    try:
-        with tempfile.TemporaryDirectory(prefix='.capture-audit-', dir=root) as folder:
-            directory = Path(folder)
-            schema = directory / 'schema.json'
-            schema.write_text(json.dumps(SCHEMA))
-            overrides = ('model_provider="capture_audit"', 'model_providers.capture_audit.name="Local capture audit"',
-                'model_providers.capture_audit.base_url="http://127.0.0.1:' + str(server.server_port) + '/v1"',
-                'model_providers.capture_audit.wire_api="responses"', 'model_providers.capture_audit.requires_openai_auth=false',
-                'model_providers.capture_audit.supports_websockets=false', 'model_providers.capture_audit.request_max_retries=0')
-            for _ in range(len(profile['overrides']) + 1):
-                command = extractor_command(cli, profile, directory, schema, directory / 'output.json', deadline=deadline)
-                for option in overrides:
-                    command[-1:-1] = [profile['config'], option]
-                result = run_bounded(command, env=extractor_env(), input='Compatibility check only. Return {"notes":[]}.',
-                                     capture_output=True, text=True, timeout=30, deadline=deadline)
-                if requests:
-                    if any(not isinstance(request, dict) or request.get('model') != 'gpt-6.1-sol'
-                           or not isinstance(request.get('input'), list) or not request['input'] for request in requests):
-                        break
-                    if any(request.get('tools') not in (None, []) for request in requests):
-                        raise RuntimeError('Capture CLI isolation check exposed tools')
-                    return
-                removed = re.search(r'unknown configuration field `([a-zA-Z0-9_.-]+)` in -c/--config override', result.stderr)
-                if not removed or not profile['strict']:
-                    break
-                key = removed[1]
-                if any(value.startswith(key + '=') for value in REQUIRED_CONFIG):
-                    break
-                remaining = [value for value in profile['overrides'] if value.split('=', 1)[0] != key]
-                if remaining == profile['overrides']:
-                    break
-                profile['overrides'] = remaining
-    finally:
-        server.shutdown()
-        worker.join(timeout=2)
-        server.server_close()
-    raise RuntimeError('Capture CLI isolation check failed')
-
-
-@lru_cache(maxsize=4)
-def verified_profile(cli, root, identity, deadline=None):
-    profile = discover_profile(cli, deadline=deadline)
-    with Path(cli).open('rb') as binary:
-        digest = hashlib.file_digest(binary, 'sha256').hexdigest()
-    fingerprint = hashlib.sha256((digest + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()).encode()).hexdigest()
-    cache = Path(root) / 'capture-cli.json'
-    safe_path(cache)
-    try:
-        saved = json.loads(cache.read_text()) if cache.is_file() else {}
-    except (OSError, ValueError):
-        saved = {}
-    discovered = {**profile, 'overrides': list(profile['overrides'])}
-    if (isinstance(saved, dict) and saved.get('fingerprint') == fingerprint
-            and saved.get('discovered') == discovered and saved.get('tools') == []):
-        adapted = saved.get('profile')
-        overrides = adapted.get('overrides') if isinstance(adapted, dict) else None
-        if (isinstance(overrides, list) and adapted == {**profile, 'overrides': overrides}
-                and all(value in profile['overrides'] for value in overrides)
-                and all(value in overrides for value in REQUIRED_CONFIG)):
-            return adapted
-    audit_profile(cli, profile, root, deadline=deadline)
-    atomic(cache, json.dumps({'fingerprint': fingerprint, 'discovered': discovered, 'profile': profile, 'tools': [],
-                             'verified_at': datetime.now(timezone.utc).isoformat()}) + '\n')
-    return profile
-
-
-def compatible_profile(cli, root, *, deadline=None):
-    info = Path(cli).stat()
-    return verified_profile(cli, str(root), (info.st_ino, info.st_size, info.st_mtime_ns), deadline)
-
-
 def cli_version(config):
     """Bounded diagnostic metadata; version checks never gate capture."""
     try:
-        result = subprocess.run([config['codex_path'], '--version'], env=extractor_env(),
+        result = subprocess.run([str(claude_cli.cli_path(config)), '--version'], env=claude_cli.child_env(),
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return 'unknown'
     if result.returncode or len(result.stdout) > 256:
         return 'unknown'
     version = result.stdout.strip()
-    return version if re.fullmatch(r'codex-cli [0-9][0-9A-Za-z._+-]*', version) else 'unknown'
+    return version if re.fullmatch(r'[0-9][0-9A-Za-z._+-]* \(Claude Code\)', version) else 'unknown'
 
 
 def failure_reason(error):
@@ -1431,11 +1183,6 @@ def failure_reason(error):
     if isinstance(error, KeyError):
         return 'invalid capture state'
     reasons = {
-        'Capture output contains private identifiers': 'privacy identifier rejected',
-        'Capture output quotes source text': 'privacy source quotation rejected',
-        'Capture output quotes a private source sentence': 'privacy source quotation rejected',
-        'Capture output quotes private source text': 'privacy source quotation rejected',
-        'Capture output includes a source identifying name': 'privacy source name rejected',
         'Invalid capture output': 'model schema rejected',
         'Invalid capture note field': 'model schema rejected',
         'Invalid capture note scope': 'model scope rejected',
@@ -1443,13 +1190,13 @@ def failure_reason(error):
         'Invalid capture host configuration': 'invalid host configuration',
         'Capture paths must not contain user symlinks': 'unsafe local path',
         'Capture input exceeds safety bound': 'input bound exceeded',
-        'Capture event output exceeds safety bound': 'output bound exceeded',
+        'Claude event output exceeds safety bound': 'output bound exceeded',
+        'Invalid Claude output': 'extractor CLI or output failure',
         'Capture model attempted tool execution': 'model tool event rejected',
         'Feedback extraction failed; completed turn remains pending': 'extractor CLI or output failure',
         'Capture CLI capability discovery failed': 'CLI capability discovery failed',
         'Capture CLI required control is unavailable': 'CLI safety control unavailable',
-        'Capture CLI isolation check failed': 'CLI isolation verification failed',
-        'Capture CLI isolation check exposed tools': 'CLI isolation verification exposed tools',
+        'Claude session exposed tools': 'CLI isolation verification exposed tools',
     }
     return reasons.get(str(error), 'model or schema extraction failure')
 
@@ -1480,7 +1227,7 @@ def capture(config, state_root, *, now=None, retry_now=False):
         for path in sorted((feedback / skill / 'notes').glob('*.md')):
             safe_path(path)
             content = path.read_text()
-            notes.append({'skill': skill, 'text': redact(content)[:1500], 'order': path.stat().st_mtime_ns, 'hash': (re.findall(r'^- Lesson hash: ([a-f0-9]{64})$', content, re.M) or [None])[0]})
+            notes.append({'skill': skill, 'text': content[:1500], 'order': path.stat().st_mtime_ns, 'hash': (re.findall(r'^- Lesson hash: ([a-f0-9]{64})$', content, re.M) or [None])[0]})
             for evidence in re.findall(r'^- Capture evidence: ([a-f0-9]{64})$', content, re.M):
                 parts = re.findall(r'^- Capture lesson: ([0-9]+)/([0-9]+)$', content, re.M)
                 if parts:
@@ -1527,10 +1274,7 @@ def capture(config, state_root, *, now=None, retry_now=False):
         attempted += 1
         try:
             if evidence not in state['pending']:
-                candidate = dict(turn)
-                if deferred.get('reason') in PRIVACY_REJECTIONS:
-                    candidate['previous_capture_rejection'] = deferred['reason']
-                lessons = extract(config, state_root, candidate, notes, deadline=deadline)
+                lessons = extract(config, state_root, turn, notes, deadline=deadline)
                 state['pending'][evidence] = {'lessons': lessons, 'deployed': deployed, 'machine': machine, 'recorded_at': clock.isoformat()}
                 atomic(state_path, json.dumps(state, indent=2) + '\n')
             transaction = state['pending'][evidence]
@@ -1610,7 +1354,7 @@ def main():
             atomic(status_path, json.dumps(status) + '\n')
             try:
                 config = json.loads(args.config.read_text())
-                if config.get('host_id') not in ('client-host', 'maintainer-host') or not Path(config.get('codex_path', '')).is_file():
+                if config.get('host_id') not in ('client-host', 'maintainer-host') or not claude_cli.cli_path(config).is_file():
                     raise ValueError('Invalid capture host configuration')
                 status['cli_version'] = cli_version(config)
                 status['counts'] = capture(config, root, retry_now=args.retry_now)

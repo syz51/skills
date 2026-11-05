@@ -835,6 +835,33 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         with self.assertRaisesRegex(sync.SyncError, 'Broken'):
             sync.validate(self.repo)
 
+    def test_validator_defaults_to_repository_script(self):
+        seen = []
+        with patch.object(sync, 'deploy', side_effect=lambda args: seen.append(args.validator) or True), \
+                patch.object(sys, 'argv', ['sync.py', 'deploy', '--repo', str(self.repo)]):
+            self.assertEqual(sync.main(), 0)
+        self.assertEqual(seen, [Path(__file__).resolve().parents[1] / 'scripts/validate_skill.py'])
+        self.assertTrue(seen[0].is_file())
+
+    def test_repository_validator_gates_publication(self):
+        import shutil
+        stub = str(self.root / 'bin')
+        uv = shutil.which('uv', path=os.pathsep.join(entry for entry in os.environ['PATH'].split(os.pathsep)
+                                                     if entry != stub))
+        if uv is None:
+            self.skipTest('uv is unavailable')
+        self.args.validator = sync.VALIDATOR
+        with patch.dict(os.environ, {'PATH': str(Path(uv).parent) + os.pathsep + os.environ['PATH']}):
+            self.release()
+            (self.repo / 'skills/frontend-ui/SKILL.md').write_text(
+                '---\nname: Frontend_UI\ndescription: Fixture\n---\n# Fixture\n')
+            review = self.repo / 'feedback/frontend-ui/reviews/rename.md'
+            review.parent.mkdir(parents=True)
+            review.write_text('Reviewed rename')
+            self.commit()
+            with self.assertRaisesRegex(sync.SyncError, 'Skill validation command failed for frontend-ui'):
+                sync.publish(self.args)
+
     def test_deploy_last_known_good_and_local_edits(self):
         self.release()
         self.assertTrue(sync.deploy(self.args))

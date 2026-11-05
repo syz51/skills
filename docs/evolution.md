@@ -4,7 +4,7 @@ The scripts separate evidence collection from policy changes. Use an independent
 
 ## Incremental Rust migration
 
-The public publisher and its daily runner now live in the Rust `codex-skills` executable. They directly use the `codex-commit` library for generation-only messages from public diffs. The source-feedback, verification, retry, prompt-evaluation and daily private-release contracts remain in their existing Python modules. A broader migration should preserve those contracts component by component; this release does not replace the entire maintenance pipeline.
+The public publisher and its daily runner now live in the Rust `codex-skills` executable. They generate messages from public diffs by running the Claude Code CLI directly, without tools or repository context. The source-feedback, verification, retry, prompt-evaluation and daily private-release contracts remain in their existing Python modules. A broader migration should preserve those contracts component by component; this release does not replace the entire maintenance pipeline.
 
 The old `scripts/public_export.py` and `scripts/public_export_job.py` remain regression references. Use the Rust commands in [Public publication](publication.md) for deployed publishing. Python remains a prerequisite for the current validation suite and maintenance commands below.
 
@@ -13,7 +13,7 @@ The Python CLI wrappers honor an explicit `CODEX_SKILLS_BIN`, then a managed `~/
 ## Components
 
 - `read_guidance.py` returns bounded guidance text and hashes of exactly what was returned.
-- `capture.py` discovers completed saved turns and extracts bounded, abstract feedback through a restricted Codex invocation.
+- `capture.py` discovers completed saved turns and extracts bounded, abstract feedback through a restricted, tool-less Claude Code invocation. Transcript text reaches the model unredacted, and neither the fixed policy contract that every prompt renders, the daily maintainer's included, nor the extract, verify and correct prompts carry privacy instructions. Notes, source-check summaries and corrections are validated for structure and skill scope only, so they can contain credentials, personal data, identifiers, URLs, paths or quoted source text; review them before sharing.
 - `evidence.py` checks notes against originating completed turns and retains immutable assessments; eligible corrections receive a separate check.
 - `upstream.py` compares recorded upstream revisions with current source repositories for review.
 - `sync.py` transports immutable feedback and validates, publishes, and installs approved skill releases.
@@ -46,9 +46,11 @@ Rust library coverage can grow within the existing skill. Evidence from actual w
 
 ## Configuration and prerequisites
 
-Read the script entrypoints before enabling any command that reads sessions, calls a model, writes feedback, or pushes Git commits. The pipeline requires Python, `uv`, Git, an authenticated Codex CLI, and a separately supplied skill validator. Publication and deployment refuse to run without `--validator`; this repository does not provide that validator or a deployment approval marker.
+Read the script entrypoints before enabling any command that reads sessions, calls a model, writes feedback, or pushes Git commits. The pipeline requires Python, `uv`, Git and an authenticated Claude Code CLI. Publication and deployment validate every skill with `scripts/validate_skill.py`, run through `uv run --with pyyaml --script`; it is the default `--validator` of `sync.py`. This repository does not provide a deployment approval marker.
 
-The configured repository, feedback directory, installation root, session roots, host role, and executable paths must belong to your own setup. The `jobs.py` wrapper requires `repo_path`, `host_id`, `python_path`, `uv_path`, `codex_path`, `validator_path`, and `role`. The maintainer role is tied to `maintainer-host`. Default storage is under `~/.local/share/codex-skills/`; `CODEX_HOME` controls the Codex session and feedback defaults, and Claude Code sources use `CLAUDE_CONFIG_DIR` where configured.
+Restricted model calls (extraction, source checks, corrections and prompt review) run `claude --print` in an empty temporary directory with no user settings, CLAUDE.md, tools, MCP servers, skills, saved session or memory. The CLI's `--help` must advertise every isolation flag before the first call, and a stream that exposes or uses any tool besides the `StructuredOutput` tool added by `--json-schema` fails closed. The daily maintainer review instead runs with the user's Claude Code configuration and `--permission-mode bypassPermissions` in its review checkout.
+
+The configured repository, feedback directory, installation root, session roots, host role, and executable paths must belong to your own setup. The `jobs.py` wrapper requires `repo_path`, `host_id`, `python_path`, `uv_path`, and `role`; `claude_path` is optional (default `~/.local/bin/claude`), and legacy `codex_path` and `validator_path` fields are ignored. The maintainer role is tied to `maintainer-host`. Default storage is under `~/.local/share/codex-skills/`; `CODEX_HOME` controls the historical Codex session and feedback defaults, and Claude Code sources use `CLAUDE_CONFIG_DIR` where configured.
 
 Capture's historical default lower bound and source-retention behavior are reference deployment choices: inspect them before a first run. Keep authentication outside the repository. Installing skills alone enables none of these commands.
 
@@ -107,6 +109,6 @@ Failed prompt candidates also leave immutable host-local events under `prompt-at
 
 For an already measured manual rejection, the Python API `register_rejected_candidate(root, state, role, candidate, reason, baseline=..., candidate_results=..., holdout_baseline=..., holdout_candidate=..., observed_evaluator_hash=...)` registers evidence without model calls or promotion. Result maps contain synthetic case hashes and two booleans per case. Supply the actual historical evaluator hash when importing an earlier run; omitting it identifies the current evaluator. Historical visible lessons retain that evaluator identity, while exact-repeat rejection applies only to matching current context. This records observations; it cannot approve a prompt or replace either promotion review.
 
-Its maintenance task remains a synthetic decision proxy without tools. Passing it does not demonstrate improved runtime behavior, prevent every privacy leak, or replace observation on real authorized tasks. Follow a provisional skill change through later use: record the originating case, a contrasting task, the actual observable result and remaining uncertainty through the normal private feedback/assessment process. Activation traces establish observed guidance loading, not successful product behavior.
+Its maintenance task remains a synthetic decision proxy without tools. Passing it does not demonstrate improved runtime behavior or replace observation on real authorized tasks. Follow a provisional skill change through later use: record the originating case, a contrasting task, the actual observable result and remaining uncertainty through the normal private feedback/assessment process. Activation traces establish observed guidance loading, not successful product behavior.
 
 Prompt evaluations retain their exact model requests, responses and static inference-failure receipts host-locally so generation, grading and execution failures can be distinguished. These diagnostic records are excluded from Git and proposer inputs.

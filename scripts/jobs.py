@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ import time
 import uuid
 from zoneinfo import ZoneInfo
 
-from capture import cli_text, help_command, help_flag, help_options, redact
+import claude_cli
 
 TOKYO = ZoneInfo('Asia/Tokyo')
 
@@ -54,9 +55,10 @@ def new_status(path, command, now):
     return status
 
 
-def run(command, log, env, stdin=None, timeout=5400):
+def run(command, log, env, stdin=None, timeout=5400, cwd=None, stdout=None):
     with subprocess.Popen(command, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                          stdout=log, stderr=log, env=env, start_new_session=True, text=True) as process:
+                          stdout=log if stdout is None else stdout, stderr=log, env=env, cwd=cwd,
+                          start_new_session=True, text=True) as process:
         try:
             process.communicate(stdin, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -80,46 +82,45 @@ def run(command, log, env, stdin=None, timeout=5400):
             raise RuntimeError('Command failed: ' + Path(command[0]).name)
 
 
-def review_command(cli, repo, report):
-    """Discover the review invocation without changing its privileges or user configuration."""
+def review_command(cli, env, timeout):
+    """Refuse to review unless the CLI still advertises every flag the review's privileges depend on."""
     try:
-        root_help = cli_text(cli, '--help')
-        subcommand = help_command(root_help, ('exec', 'e'), r'(?:run|execute) Codex non.interactively\b')
-        options = help_options(cli_text(cli, subcommand, '--help'))
-        flags = {}
-        for key, names, meaning in (
-            ('ephemeral', ('--ephemeral',), r'without persisting session'),
-            ('cd', ('-C', '--cd'), r'(?:working|workspace) root'),
-            ('model', ('-m', '--model'), r'model.*(?:agent|use)|agent.*model'),
-            ('config', ('-c', '--config'), r'override a configuration value'),
-            ('sandbox', ('--sandbox', '-s'), r'sandbox policy.*model.generated'),
-            ('output', ('-o', '--output-last-message'), r'file.*(?:last|final).*message|final.*message.*file'),
-            ('json', ('--json', '--experimental-json'), r'print.*(?:JSONL|JSON events|newline.delimited JSON)')):
-            flags[key] = help_flag(options, names, meaning, required=key != 'config')
-        if 'danger-full-access' not in options[flags['sandbox']]:
-            raise RuntimeError('Required review permissions are unavailable')
-        effort = help_flag(options, ('--reasoning-effort', '--effort'), r'reasoning effort', required=False)
-        approval = help_flag(options, ('--ask-for-approval', '-a'), r'when.*(?:approval|human approval)', required=False)
-        if not flags['config'] and (not effort or not approval):
-            raise RuntimeError('Required review model or approval controls are unavailable')
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-        raise RuntimeError('Weekly review CLI adaptation failed; required command or controls are unavailable') from None
-    command = [cli, subcommand, flags['ephemeral'], flags['cd'], str(repo), flags['model'], 'gpt-6.1-sol',
-               flags['sandbox'], 'danger-full-access', flags['json'], flags['output'], str(report)]
-    command += [effort, 'xhigh'] if effort else [flags['config'], 'model_reasoning_effort="xhigh"']
-    command += [approval, 'never'] if approval else [flags['config'], 'approval_policy="never"']
-    return command + ['-']
+        help_text = subprocess.run([str(cli), '--help'], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   env=dict(env, LC_ALL='C'), timeout=min(30, timeout), check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        help_text = ''
+    if claude_cli.missing_flags(help_text, claude_cli.REVIEW_FLAGS):
+        raise RuntimeError('Weekly review CLI adaptation failed; required command or controls are unavailable')
+    return claude_cli.review_command(cli)
 
 
 def review(cli, repo, state_root, prompt, log, env, timeout):
     began = time.monotonic()
+    env = claude_cli.child_env(env)
+    command = review_command(cli, env, timeout)
     with tempfile.TemporaryDirectory(prefix='.weekly-review-', dir=state_root) as folder:
         report = Path(folder) / 'report.md'
-        command = review_command(cli, repo, report)
+        events = Path(folder) / 'events.jsonl'
         remaining = timeout - (time.monotonic() - began)
         if remaining <= 0:
             raise RuntimeError('Weekly review command adaptation timed out')
-        run(command, log, env, stdin=prompt, timeout=remaining)
+        with events.open('w+', errors='replace') as stream:
+            try:
+                run(command, log, env, stdin=prompt, timeout=remaining, cwd=repo, stdout=stream)
+            finally:
+                # Keep the full event stream in the job log, whether or not the review succeeded.
+                stream.seek(0)
+                log.flush()
+                shutil.copyfileobj(stream, log)
+                log.flush()
+            stream.seek(0)
+            lines = stream.read().splitlines()
+        try:
+            text = claude_cli.final_result('\n'.join(lines))
+        except RuntimeError:
+            text = None
+        if text is not None:
+            report.write_text(text)
         if report.is_symlink() or not report.is_file() or report.stat().st_size > 1000000:
             raise RuntimeError('Weekly review did not produce a valid fresh report; publication was deferred')
         os.replace(report, state_root / 'latest-weekly-report.md')
@@ -204,7 +205,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
             cycle = investigations.prepare(scoped, state_root, due.isoformat(), trusted_base=base)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
             attempt['status'] = 'failed'
-            attempt['failure'] = {'class': type(exc).__name__, 'detail': redact(str(exc))[:2000]}
+            attempt['failure'] = {'class': type(exc).__name__, 'detail': str(exc)[:2000]}
             save(folder / 'attempt.json', attempt)
             save(active, attempt)
             raise
@@ -241,7 +242,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         prompt += ('Prior superseded attempt is read-only recovery context at ' + attempt['recovery']
                    + '. Reassess its evidence; do not blindly cherry-pick or reset from it.\n')
     try:
-        review(config['codex_path'], work, folder, prompt, log, execution_env,
+        review(claude_cli.cli_path(config), work, folder, prompt, log, execution_env,
                timeout=max(1, timeout - (time.monotonic() - began)))
         summary = investigations.validate_cycle(scoped, state_root, cycle)
         _, heads = investigations.inventory(work)
@@ -261,7 +262,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         candidate = git(work, 'rev-parse', 'HEAD')
         git(work, 'merge-base', '--is-ancestor', base, candidate)
         sync.publication_scope(work, base, candidate, bootstrap=False)
-        sync.validate(work, config['validator_path'])
+        sync.validate(work, sync.VALIDATOR)
         if time.monotonic() - began >= timeout:
             raise TimeoutError('Investigation validation exceeded the job deadline')
         if not clean(repo) or git(repo, 'rev-parse', 'HEAD') != base:
@@ -269,7 +270,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         git(repo, 'merge', '--ff-only', candidate)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, sync.SyncError) as exc:
         attempt['status'] = 'failed'
-        attempt['failure'] = {'class': type(exc).__name__, 'detail': redact(str(exc))[:2000]}
+        attempt['failure'] = {'class': type(exc).__name__, 'detail': str(exc)[:2000]}
         save(folder / 'attempt.json', attempt)
         save(active, attempt)
         if isinstance(exc, sync.SyncError):
@@ -303,17 +304,21 @@ def execute(args, now=None):
     config_path = args.config.expanduser().resolve()
     state_root = config_path.parent
     config = json.loads(config_path.read_text())
-    required = ('repo_path', 'host_id', 'python_path', 'uv_path', 'codex_path', 'validator_path', 'role')
-    if any(not isinstance(config.get(key), str) or not config[key] for key in required):
+    # Configurations written for the Codex runtime may still carry codex_path and validator_path; they are unused.
+    required = ('repo_path', 'host_id', 'python_path', 'uv_path', 'role')
+    claude = config.get('claude_path', str(claude_cli.DEFAULT_CLI))
+    if any(not isinstance(config.get(key), str) or not config[key] for key in required) or not isinstance(claude, str) or not claude:
         raise ValueError('Missing or invalid host configuration')
     if config['host_id'] not in ('client-host', 'maintainer-host') or config['role'] not in ('client', 'maintainer'):
         raise ValueError('Invalid host or role')
     if args.command == 'weekly' and (config['role'] != 'maintainer' or config['host_id'] != 'maintainer-host'):
         raise ValueError('Daily maintenance is restricted to the remote maintainer')
     repo = Path(config['repo_path']).expanduser().resolve()
-    for key in ('python_path', 'uv_path', 'codex_path', 'validator_path'):
-        if not Path(config[key]).is_file():
-            raise ValueError('Missing configured executable or validator: ' + key)
+    executables = {'python_path': Path(config['python_path']), 'uv_path': Path(config['uv_path']),
+                   'claude_path': claude_cli.cli_path(config)}
+    for key, path in executables.items():
+        if not path.is_file():
+            raise ValueError('Missing configured executable: ' + key)
     if any(not (repo / name).is_file() for name in ('scripts/sync.py', 'scripts/capture.py', 'scripts/evidence.py', 'maintenance-prompt.md')):
         raise ValueError('Repository workflow is missing')
     state_path = state_root / 'weekly-state.json'
@@ -335,9 +340,11 @@ def execute(args, now=None):
             if not args.run_now and not weekly_due(now, state):
                 return 0
         env = dict(os.environ)
-        env['PATH'] = os.pathsep.join([str(Path(config['uv_path']).parent), str(Path(config['python_path']).parent), '/usr/bin', '/bin', '/usr/sbin', '/sbin', env.get('PATH', '')])
+        env['PATH'] = os.pathsep.join([str(executables[key].parent) for key in ('uv_path', 'python_path', 'claude_path')]
+                                      + ['/usr/bin', '/bin', '/usr/sbin', '/sbin', env.get('PATH', '')])
+        # sync.py validates skills with the repository's own scripts/validate_skill.py.
         command = [config['python_path'], str(repo / 'scripts/sync.py'), '--repo', str(repo),
-                   '--host-id', config['host_id'], '--validator', config['validator_path']]
+                   '--host-id', config['host_id']]
         status_path = state_root / (args.command + '-status.json')
         status = new_status(status_path, args.command, now)
         save(status_path, status)
@@ -407,7 +414,7 @@ def execute(args, now=None):
                                     status['investigations']['recovery'] = json.loads(active.read_text())
                         else:
                             prompt = maintenance_prompt(repo, config)
-                            review(config['codex_path'], repo, state_root, prompt, log, env, timeout=remaining)
+                            review(claude_cli.cli_path(config), repo, state_root, prompt, log, env, timeout=remaining)
                     stage('review', run_review,
                           'Maintenance review failed; CLI adaptation failed, execution failed, or a valid fresh report was unavailable')
                     stage('publish', lambda: step('publish'), 'Feedback publication failed')

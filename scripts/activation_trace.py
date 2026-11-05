@@ -1,4 +1,8 @@
-"""Score observed skill content in Codex CLI JSONL, without replaying saved code.
+"""Score observed skill content in agent traces, without replaying saved code.
+
+``score_claude_trace`` reads Claude Code stream-json from live evaluations.
+``score_trace`` and its helpers read Codex CLI JSONL; capture.py still uses
+them for historical Codex rollouts.
 
 The caller supplies immutable pre-run file snapshots. A requested path, a tool's
 start event, or an assistant saying it used a skill is never loading evidence.
@@ -9,7 +13,9 @@ from dataclasses import dataclass
 import hashlib
 import fnmatch
 import json
+import os
 from pathlib import Path
+import posixpath
 import re
 import shlex
 
@@ -689,13 +695,8 @@ def node_read_observations(code, output, state):
     return results
 
 
-def score_trace(trace_text, targets, required, forbidden=(), before=()):
-    """Return a deterministic activation verdict for supplied pre-run snapshots.
-
-    Complete coverage can comprise multiple verified continuation chunks. Their
-    individual hashes remain partial; no synthetic historical full-file hash is
-    reported. Ordering requires complete earlier guidance before any later read.
-    """
+def _target_paths(trace_text, targets, required, forbidden, before):
+    """Validate snapshots and map each observed path or alias to its targets."""
     if not isinstance(trace_text, str) or not isinstance(targets, dict):
         raise ValueError('Expected trace text and a target mapping')
     known = set(required) | set(forbidden) | {target for pair in before for target in pair}
@@ -716,6 +717,17 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
             if any(part in ('.', '..') for part in path.split('/')):
                 raise ValueError('Target paths must not contain traversal')
             paths.setdefault(path, []).append(name)
+    return known, paths
+
+
+def score_trace(trace_text, targets, required, forbidden=(), before=()):
+    """Return a deterministic activation verdict for supplied pre-run snapshots.
+
+    Complete coverage can comprise multiple verified continuation chunks. Their
+    individual hashes remain partial; no synthetic historical full-file hash is
+    reported. Ordering requires complete earlier guidance before any later read.
+    """
+    known, paths = _target_paths(trace_text, targets, required, forbidden, before)
     failures, reads, intervals, first, complete_at, unverified, exposures = [], [], {}, {}, {}, [], []
     completed, failed, seen = False, False, {}
     node_state = {'bindings': {}, 'modules': set()}
@@ -1035,6 +1047,219 @@ def score_trace(trace_text, targets, required, forbidden=(), before=()):
     for name, event in exposures:
         if not any(read['target'] == name and read['event'] == event for read in reads):
             mark_uncertain([name], event)
+    for name in required:
+        if name not in complete_at:
+            failures.append(f'Complete content was not observed: {name}')
+    for name in forbidden:
+        if name in first:
+            failures.append(f'Forbidden guidance was read: {name}')
+    for earlier, later in before:
+        if (earlier not in complete_at or later not in first or complete_at[earlier] >= first[later]
+                or any(name == later and event <= complete_at[earlier] for name, event in unverified)):
+            failures.append(f'Read order not established: {earlier} before {later}')
+    return {'passed': not failures, 'completed': completed and not failed, 'reads': reads, 'failures': failures}
+
+
+_SKILL_BASE = 'Base directory for this skill: '
+_FRONTMATTER = re.compile(r'---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)')
+
+
+def _skill_bodies(content):
+    """Text the Claude Code Skill tool injects for a SKILL.md snapshot.
+
+    The injection carries the body after the YAML frontmatter, whose name and
+    description the session already lists as skill metadata. Observed
+    injections drop the body's leading line breaks; nothing else may differ.
+    """
+    match = _FRONTMATTER.match(content)
+    body = content[match.end():] if match else content
+    return {text for text in (body, re.sub(r'^\r?\n', '', body), re.sub(r'^(?:\r?\n)+', '', body)) if text.strip()}
+
+
+def _read_bounds(expected, file):
+    """Character bounds of a Read result's raw content within a snapshot.
+
+    Read numbers lines from 1 and counts the empty line after a final newline.
+    A returned line implies its terminator, so line-chunked reads can tile the
+    file. Any difference from the snapshot's lines yields no evidence.
+    """
+    start_line, count, total = file.get('startLine'), file.get('numLines'), file.get('totalLines')
+    if any(type(value) is not int for value in (start_line, count, total)) or start_line < 1 or count < 1:
+        return None
+    lines = expected.split('\n')
+    if total != len(lines) or start_line - 1 + count > len(lines):
+        return None
+    text = '\n'.join(lines[start_line - 1:start_line - 1 + count])
+    if file.get('content') != text:
+        return None
+    start = sum(len(line) + 1 for line in lines[:start_line - 1])
+    end = start + len(text)
+    return start, end + 1 if end < len(expected) else end
+
+
+def score_claude_trace(trace_text, targets, required, forbidden=(), before=()):
+    """Score Claude Code stream-json with the same semantics as score_trace.
+
+    Evidence is tool output returned in the session: a Skill tool injection of
+    a SKILL.md body, attributed to the successful Skill call that produced it,
+    or a Read result's raw content (``tool_use_result``; the tool_result text
+    carries line-number prefixes). Requested paths and assistant text are never
+    evidence. A failed, unattributed or unsupported request for a target, or any
+    tool other than Read and Skill, leaves that target unverified: it fails a
+    forbidden expectation and ordering, and never satisfies a required one.
+    """
+    known, paths = _target_paths(trace_text, targets, required, forbidden, before)
+    real = {}
+    for path, names in paths.items():
+        real.setdefault(os.path.realpath(path), set()).update(names)
+    skill_dirs = {path[:-len('/SKILL.md')]: names for path, names in paths.items() if path.endswith('/SKILL.md')}
+    failures, reads, intervals, first, complete_at, unverified = [], [], {}, {}, {}, []
+    completed, failed = False, False
+    calls, answered, attempts, loaded_skills = {}, set(), {}, []
+
+    def lookup(path):
+        """Targets a path names; None when it could name any of them."""
+        if not isinstance(path, str) or not path:
+            return None
+        if not path.startswith('/'):
+            # A relative path resolves against an unrecorded cwd: suffixes bound it.
+            relative = posixpath.normpath(path)
+            if relative == '.' or relative.split('/')[0] == '..':
+                return None
+            return {name for candidate, names in paths.items() if candidate.endswith('/' + relative) for name in names}
+        return set(paths.get(path, ())) | real.get(os.path.realpath(path), set())
+
+    def mark_uncertain(names, event):
+        for name in sorted(set(names)):
+            unverified.append((name, event))
+            if name in forbidden:
+                failures.append(f'Unverified forbidden read attempt: {name}')
+
+    def add(name, call, event, observed, start, end):
+        expected = targets[name]['content']
+        record = {'target': name, 'event': event,
+                  'coverage': 'complete' if start == 0 and end == len(expected) else 'partial',
+                  'sha256': _digest(observed), 'start': start, 'end': end}
+        attempts.get(call, {}).pop(name, None)
+        if record in reads:
+            return
+        reads.append(record)
+        # Ordering counts from the request: a later guide requested before the
+        # earlier one completed was not read after it, whenever it returned.
+        first.setdefault(name, calls[call][2])
+        intervals.setdefault(name, []).append((start, end))
+        covered = 0
+        for begin, stop in sorted(intervals[name]):
+            if begin > covered:
+                break
+            covered = max(covered, stop)
+        if covered == len(expected):
+            complete_at.setdefault(name, event)
+
+    def exposed(text, event):
+        # Full target content in unattributed output is uncertainty, not proof.
+        for name in known:
+            if targets[name]['content'] in text and not any(r['target'] == name and r['event'] == event for r in reads):
+                mark_uncertain([name], event)
+
+    for index, line in enumerate(trace_text.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError()
+        except (ValueError, RecursionError):
+            failures.append(f'Malformed JSONL at line {index + 1}')
+            continue
+        kind = event.get('type')
+        if kind == 'result':
+            completed = event.get('subtype') == 'success' and event.get('is_error') is False
+            failed |= not completed
+            continue
+        if kind not in ('assistant', 'user'):
+            continue
+        content = (event.get('message') or {}).get('content') if isinstance(event.get('message'), dict) else None
+        if isinstance(content, str):
+            content = [{'type': 'text', 'text': content}]
+        if not isinstance(content, list) or event.get('parent_tool_use_id') is not None:
+            # Unknown message shapes and subagent activity cannot establish absence.
+            mark_uncertain(known, index)
+            continue
+        if kind == 'assistant':
+            for block in content:
+                if not isinstance(block, dict) or not str(block.get('type', '')).endswith('tool_use'):
+                    continue
+                identity, tool, arguments = block.get('id'), block.get('name'), block.get('input')
+                if not isinstance(identity, str) or identity in calls or not isinstance(arguments, dict):
+                    mark_uncertain(known, index)
+                    continue
+                calls[identity] = (tool, arguments, index)
+                if tool == 'Read':
+                    names = lookup(arguments.get('file_path'))
+                elif tool == 'Skill' and isinstance(arguments.get('skill'), str):
+                    skill = arguments['skill'].lstrip('/')
+                    names = {skill} & set(targets)
+                else:
+                    names = None
+                if names is None:
+                    # Another tool or an unattributable request may read anything.
+                    mark_uncertain(known, index)
+                    continue
+                attempts[identity] = {name: index for name in names}
+            continue
+        results = [block for block in content if isinstance(block, dict) and block.get('type') == 'tool_result']
+        for block in results:
+            identity = block.get('tool_use_id')
+            if identity not in calls or identity in answered:
+                mark_uncertain(known, index)
+                continue
+            answered.add(identity)
+            tool, arguments, _ = calls[identity]
+            data = event.get('tool_use_result')
+            # Structured output belongs to a single result; never split it.
+            if block.get('is_error') or len(results) != 1 or not isinstance(data, dict):
+                continue
+            if tool == 'Skill' and data.get('success') is True and isinstance(data.get('commandName'), str):
+                loaded_skills.append((identity, data['commandName'], arguments.get('args')))
+            elif tool == 'Read' and data.get('type') == 'text' and isinstance(data.get('file'), dict):
+                file = data['file']
+                if (file.get('filePath') != arguments.get('file_path') or not isinstance(file.get('content'), str)
+                        or not str(file['filePath']).startswith('/')):
+                    continue
+                for name in lookup(file['filePath']) or ():
+                    bounds = _read_bounds(targets[name]['content'], file)
+                    if bounds:
+                        add(name, identity, index, file['content'], *bounds)
+                exposed(file['content'], index)
+        if event.get('isSynthetic') is not True:
+            continue
+        for block in content:
+            text = block.get('text') if isinstance(block, dict) and block.get('type') == 'text' else None
+            if not isinstance(text, str) or not text.startswith(_SKILL_BASE):
+                continue
+            header, separator, body = text.partition('\n\n')
+            names = skill_dirs.get(header[len(_SKILL_BASE):], [])
+            for name in names:
+                call = next((item for item in loaded_skills if item[1] == name), None)
+                if call is None:
+                    mark_uncertain([name], index)
+                    continue
+                loaded_skills.remove(call)
+                identity, _, args = call
+                for expected in _skill_bodies(targets[name]['content']):
+                    if body == expected or isinstance(args, str) and body == expected + '\n\nARGUMENTS: ' + args:
+                        add(name, identity, index, expected, 0, len(targets[name]['content']))
+                        break
+            if not names:
+                for name in known:
+                    if any(expected in body for expected in _skill_bodies(targets[name]['content'])):
+                        mark_uncertain([name], index)
+    for pending in attempts.values():
+        for name, event in pending.items():
+            mark_uncertain([name], event)
+    if not completed or failed:
+        failures.append('Claude session did not complete successfully')
     for name in required:
         if name not in complete_at:
             failures.append(f'Complete content was not observed: {name}')

@@ -203,6 +203,23 @@ class PromptReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'visible inventory mismatch'):
             review.prior_attempt_feedback(self.repo, self.state, 'extract')
 
+    def test_cases_may_name_urls_emails_and_paths_but_stay_non_executable(self):
+        template = next(c for c in review.load_cases(self.repo) if c['role'] == 'extract')
+        identifiers = ' See https://example.com/a, a@example.com and /home/alice/notes; token=abc123.'
+        review.validate_case(dict(template, rubric=template['rubric'] + identifiers))
+        for unsafe in (' ```sh', ' $(id)', ' eval(x)', ' C:\\tmp', ' /etc/hosts'):
+            with self.subTest(unsafe=unsafe), self.assertRaisesRegex(ValueError, 'Unsafe synthetic case'):
+                review.validate_case(dict(template, rubric=template['rubric'] + unsafe))
+
+    def test_attempt_candidates_may_name_urls_emails_and_paths_but_not_nul(self):
+        base = (self.repo/'prompts/extract.md').read_text()
+        candidate = base + '\nCompare https://example.com/a, a@example.com and /home/alice/notes.\n'
+        identity = review.freeze_attempt(self.repo, self.state, 'extract', candidate)
+        self.assertEqual(review.attempt_events(self.state)[identity]['candidate'], candidate)
+        for unsafe in (base + '\x00', 'x' * 24001):
+            with self.subTest(size=len(unsafe)), self.assertRaisesRegex(ValueError, 'Unsafe prompt attempt candidate'):
+                review.freeze_attempt(self.repo, self.state, 'extract', unsafe)
+
     def test_interrupted_atomic_attempt_write_leaves_no_partial_event(self):
         candidate = (self.repo/'prompts/extract.md').read_text()+'\nClarify correction attribution.\n'
         with patch.object(review.capture.os, 'link', side_effect=OSError('interrupted before publication')):
@@ -419,7 +436,7 @@ class PromptReviewTests(unittest.TestCase):
 
     def test_reader_source_drift_stops_prompt_review(self):
         original = Path.read_bytes
-        for module in (review.read_guidance, review.capture.activation_trace):
+        for module in (review.read_guidance, review.capture.activation_trace, review.claude_cli):
             path = Path(module.__file__)
             def changed(value):
                 data = original(value)
@@ -427,14 +444,14 @@ class PromptReviewTests(unittest.TestCase):
             with self.subTest(module=module.__name__), patch.object(Path, 'read_bytes', changed), self.assertRaises(review.SourceChanged):
                 review.assert_sources_current()
 
-    def test_cases_are_immutable_hash_addressed_and_private_cases_rejected(self):
+    def test_cases_are_immutable_hash_addressed_and_invalid_cases_rejected(self):
         cases = review.load_cases(self.repo)
         coverage = {'extract': {'empty', 'note'}, 'correct': {'empty', 'note'},
                     'verify': {'supported', 'partial', 'unsupported'},
                     'maintain': {'no_change', 'defer', 'change'}}
         for role, outcomes in coverage.items():
             self.assertEqual({case['expected'] for case in cases if case['role'] == role}, outcomes)
-        case = dict(cases[0], input='https://private.example.test', rubric='invented')
+        case = dict(cases[0], input='not a JSON object', rubric='invented')
         with self.assertRaises(ValueError):
             review.validate_case(case)
         path = next((self.repo / 'prompt-evals/cases').glob('*.json'))
@@ -496,7 +513,7 @@ class PromptReviewTests(unittest.TestCase):
         def no_fetch(root, *args, **kwargs):
             self.assertNotEqual(args[0], 'fetch')
             return original(root, *args, **kwargs)
-        for module in (review, review.capture, review.prompt_runtime):
+        for module in (review, review.capture, review.claude_cli, review.prompt_runtime):
             with self.subTest(module=module.__name__):
                 with patch.object(module, 'SOURCE_SHA256', '0' * 64), patch.object(review, 'git', side_effect=no_fetch):
                     with self.assertRaisesRegex(RuntimeError, 'fresh process is required'):
@@ -606,12 +623,19 @@ class PromptReviewTests(unittest.TestCase):
         self.assertFalse((self.repo / 'scripts/unrelated.py').exists())
         self.assertEqual(review.git(self.repo, 'status', '--porcelain'), '')
 
-    def test_verification_summary_source_quotation_is_rejected(self):
+    def test_verification_summary_allows_source_wording_and_identifiers(self):
         case = next(c for c in review.load_cases(self.repo) if c['role'] == 'verify')
-        source = json.loads(case['input'])
-        quoted = source['messages'][-1]['text']
-        with self.assertRaises(ValueError):
-            review.validate_output(case, {'status': case['expected'], 'summary': quoted})
+        quoted = json.loads(case['input'])['messages'][-1]['text']
+        for summary in (quoted, 'See https://example.com/a and /home/alice/x, token=abc123'):
+            output = {'status': case['expected'], 'summary': summary}
+            self.assertEqual(review.validate_output(case, output), output)
+            self.assertTrue(review.output_passes(case, output))
+        for summary in ('First\nsecond', ''):
+            output = {'status': case['expected'], 'summary': summary}
+            with self.subTest(summary=summary):
+                with self.assertRaises(ValueError):
+                    review.validate_output(case, output)
+                self.assertFalse(review.output_passes(case, output))
 
     def test_push_race_leaves_local_main_clean_and_pending(self):
         original = review.git

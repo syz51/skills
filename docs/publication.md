@@ -19,15 +19,15 @@ Publication waits up to five minutes for the shared maintenance lock, checking c
 
 ## Message generation
 
-Configure the Codex executable, authentication home, model, reasoning effort and timeout explicitly in the private generation configuration. Also configure `python_path` for the existing candidate-validation suite. The publisher uses the exact released `codex-commit` library; generation receives the staged public diff, excluding generated manifest noise. Private commit messages and private repository history are never used as message context.
+Configure the Claude Code executable, model, effort and optional timeout explicitly in the private generation configuration. Also configure `python_path` for the existing candidate-validation suite. The publisher runs the Claude Code CLI directly; generation receives the staged public diff, excluding generated manifest noise. Private commit messages and private repository history are never used as message context.
 
-Generation uses an isolated, ephemeral context without repository tools. It can consume Codex account quota. Returned subject/body text must pass validation and privacy checks. Empty, generic or invalid messages stop publication and leave the deadline pending; there is no generic fallback. The exporter retains ownership of all Git operations. Plan and unchanged runs do not generate messages.
+Generation runs in a fresh empty directory with a minimal environment, no tools, MCP servers, slash commands, user settings or instructions, and no saved session. It uses the signed-in Claude subscription and its usage limits. Returned subject/body text must pass quality and attribution checks. Empty, generic or invalid messages stop publication and leave the deadline pending; there is no generic fallback. The exporter retains ownership of all Git operations. Plan and unchanged runs do not generate messages.
 
 Ordinary generation excludes the generated manifest. When an imported public contribution requires only refreshed manifest fingerprints, generation receives that public bookkeeping diff so the reconciliation commit can explain the actual remaining change.
 
 ## Publication boundary
 
-An explicit file inventory selects skills, supporting code, tests, synthetic evaluation cases, and public documentation. New files require an inventory change. Personal host labels are replaced with reference role names; personal backup metadata is removed while upstream provenance is retained. Content checks reject known private identifiers and credential patterns, and the candidate's unit tests must pass before a public commit is pushed.
+An explicit file inventory selects skills, supporting code, tests, synthetic evaluation cases, and public documentation. New files require an inventory change. Personal host labels are replaced with reference role names; personal backup metadata is removed while upstream provenance is retained. Files must be UTF-8 text; their content is not scanned for private identifiers or credentials. The candidate's unit tests must pass before a public commit is pushed.
 
 Changed snapshots containing `Cargo.toml` also run formatting, strict Clippy and locked Rust tests before commit-message generation or push. These checks share a ten-minute deadline; failures retain bounded local diagnostics and stop publication. Rust, Cargo and the pinned toolchain must be available on the publishing host. Public-owned code is excluded from candidate execution.
 
@@ -55,16 +55,15 @@ The Rust configuration retains the existing schema-1 inventory and state paths. 
 {
   "python_path": "python3",
   "generation": {
-    "codex_path": "~/.local/bin/codex",
-    "codex_home": "~/.codex",
-    "model": "gpt-6-luna",
+    "claude_path": "/absolute/path/to/claude",
+    "model": "claude-haiku-5-5",
     "effort": "high",
     "timeout_seconds": 240
   }
 }
 ```
 
-Merge those fields into your reviewed configuration; this fragment is not a complete inventory. The Codex executable must resolve to an absolute existing file after expanding `~`, and the explicit auth home must already contain valid authentication. Generation uses an isolated authentication context, not that home's instructions or plugins. Expired authentication stops publication; authenticate the configured source home with the normal Codex CLI and retry. No generic message is substituted. `plan`, unchanged publication, and a satisfied daily deadline do not call the model.
+Merge those fields into your reviewed configuration; this fragment is not a complete inventory. `claude_path` must be an absolute path to an existing file, and the Claude Code CLI must already be signed in for the publishing user. `effort` is one of `low`, `medium`, `high`, `xhigh` or `max`; `timeout_seconds` (1 to 900, default 120) bounds the whole call. Unknown fields are rejected. Missing or expired authentication stops publication; sign in with the normal Claude Code CLI and retry. No generic message is substituted. `plan`, unchanged publication, and a satisfied daily deadline do not call the model.
 
 ## Daily investigation boundary
 

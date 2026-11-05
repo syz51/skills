@@ -1,7 +1,7 @@
 use codex_skills::{
     CommitMessage,
     config::{Config, relative},
-    export::{Files, git, manifest, prepare, scan, validate_message},
+    export::{Files, git, manifest, prepare, validate_message},
 };
 use std::{fs, path::Path};
 fn g(p: &Path, args: &[&str]) -> String {
@@ -154,7 +154,14 @@ fn input_and_message_boundaries() {
     for p in ["../x", ".GIT/config", "skills//x", "skills/../x"] {
         assert!(relative(p).is_err())
     }
-    assert!(scan("public.txt", format!("{}{}", "roy", "-mac").as_bytes()).is_err());
+    // The commit message has no content scanner; quality and attribution checks remain.
+    assert!(
+        validate_message(&CommitMessage {
+            subject: "Document the host-a reference role".into(),
+            body: "Path /home/alice/file and api_key=example123 are kept.".into()
+        })
+        .is_ok()
+    );
     assert!(
         validate_message(&CommitMessage {
             subject: "Update public skills and evolution tools".into(),

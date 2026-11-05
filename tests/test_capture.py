@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta, timezone
 import importlib.util
-import http.client
 import hashlib
 import json
 import io
@@ -11,7 +10,6 @@ import sys
 import time
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
 import read_guidance
@@ -19,45 +17,27 @@ spec = importlib.util.spec_from_file_location('capture', Path(__file__).parents[
 capture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(capture)
 
-PROFILE = {'command': 'exec', 'standalone': '--no-daemon', 'strict': '--strict-config',
-    'ignore_config': '--ignore-user-config', 'ignore_rules': '--ignore-rules', 'ephemeral': '--ephemeral',
-    'cd': '-C', 'model': '-m', 'config': '-c', 'sandbox': '--sandbox', 'schema': '--output-schema',
-    'output': '-o', 'json': '--json', 'skip_git': '--skip-git-repo-check',
-    'overrides': list(capture.EXTRACTOR_CONFIG) + ['features.' + name + '=false' for name in sorted(capture.TOOL_FEATURES)]}
-ROOT_HELP = '''Commands:
-  exec      Run Codex non-interactively [aliases: e]
-  features  Inspect feature flags
-Options:
-      --no-daemon
-          Run without the shared background server
-'''
-EXEC_HELP = '''Options:
-      --strict-config
-          Error out when config.toml contains fields that are not recognized
-      --ignore-user-config
-          Do not load user config.toml
-      --ignore-rules
-          Do not load user or project execpolicy .rules files
-      --ephemeral
-          Run without persisting session files
-  -C, --cd <DIR>
-          Tell the agent to use the specified directory as its working root
-  -m, --model <MODEL>
-          Model the agent should use
-  -c, --config <key=value>
-          Override a configuration value
-  -s, --sandbox <MODE>
-          Select the sandbox policy for model-generated commands
-          [possible values: read-only, workspace-write, danger-full-access]
-      --output-schema <FILE>
-          Path to a JSON Schema describing the final response
-  -o, --output-last-message <FILE>
-          Specifies file where the last message should be written
-      --json
-          Print events to stdout as JSONL
-      --skip-git-repo-check
-          Allow running Codex outside a Git repository
-'''
+INIT = {'type': 'system', 'subtype': 'init', 'tools': ['StructuredOutput'], 'mcp_servers': []}
+HELP = 'Usage: claude [options]\n' + ''.join('  ' + flag + ' <value>\n' for flag in capture.claude_cli.RESTRICTED_FLAGS)
+
+
+def stream(*events):
+    return ''.join(json.dumps(event) + '\n' for event in events)
+
+
+def answer(output):
+    """Stream-json of a restricted run that answered through StructuredOutput."""
+    return stream(INIT, {'type': 'assistant', 'message': {'content': [
+        {'type': 'tool_use', 'name': 'StructuredOutput', 'input': output}]}},
+        {'type': 'result', 'subtype': 'success', 'is_error': False, 'structured_output': output})
+
+
+def completed(output):
+    return capture.subprocess.CompletedProcess([], 0, answer(output), '')
+
+
+def tool_use(name):
+    return {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': name, 'input': {}}]}}
 
 
 class CaptureTests(unittest.TestCase):
@@ -72,12 +52,12 @@ class CaptureTests(unittest.TestCase):
         self.state = self.root / 'state'
         self.config = {'sessions_root': str(self.sessions), 'archived_sessions_root': str(self.archive),
                        'feedback_dir': str(self.feedback),
-                       'install_root': str(self.root / 'install'), 'codex_path': '/bin/false',
+                       'install_root': str(self.root / 'install'), 'claude_path': '/bin/false',
                        'claude_projects_root': str(self.root / 'claude-projects')}
         self.lesson = {'skill': 'frontend-ui', **{field: 'Verified useful check' for field in capture.FIELDS}}
-        profile = patch.object(capture, 'compatible_profile', return_value=PROFILE)
-        profile.start()
-        self.addCleanup(profile.stop)
+        verified = patch.object(capture, 'verify_cli')
+        verified.start()
+        self.addCleanup(verified.stop)
 
     def record(self, kind, payload, date='2026-10-10T01:00:00Z'):
         return json.dumps({'type': kind, 'payload': payload, 'timestamp': date}) + '\n'
@@ -503,34 +483,41 @@ class CaptureTests(unittest.TestCase):
             capture.capture(self.config, self.state)
             model.assert_not_called()
 
-    def test_schema_and_redaction(self):
+    def test_schema(self):
         turn = {'verified_skills': ['frontend-ui']}
         self.assertEqual(capture.validate_notes({'notes': [self.lesson]}, turn), [self.lesson])
-        for bad in [{'notes': [{**self.lesson, 'skill': 'other'}]}, {'notes': [{**self.lesson, 'evidence': 'token=secret_value'}]}, {'notes': [], 'extra': True}]:
+        for bad in [{'notes': [{**self.lesson, 'skill': 'other'}]}, {'notes': [{**self.lesson, 'evidence': 'two\nlines'}]},
+                    {'notes': [{**self.lesson, 'cause': ' '}]}, {'notes': [{**self.lesson, 'title': 'x' * 1001}]},
+                    {'notes': [self.lesson] * 4}, {'notes': [], 'extra': True}]:
             with self.assertRaises(ValueError):
                 capture.validate_notes(bad, turn)
-        self.assertNotIn('abc@example.com', capture.redact('abc@example.com token=private https://private.example/secret'))
 
-    def test_private_short_and_cjk_source_quotations(self):
-        for source in ('Secret acquisition target has confidential projected revenue', '未公開研究資料には秘密顧客情報が含まれています'):
-            turn = {'verified_skills': ['frontend-ui'], 'messages': [{'text': source}]}
-            with self.assertRaises(ValueError):
-                capture.validate_notes({'notes': [{**self.lesson, 'evidence': source}]}, turn)
+    def test_notes_may_reuse_source_wording_names_and_identifiers(self):
+        run = 'the layout check failed after the header moved'
+        source = ('Claude Code built the Aster Labs page on 2026-11-04 at https://example.com/docs for a@example.com. '
+                  '"The private draft must stay unpublished until launch." ' + run + '. 未公開研究資料には秘密顧客情報が含まれています')
+        turn = {'verified_skills': ['frontend-ui'], 'messages': [{'role': 'assistant', 'text': source}]}
+        for field, text in [('task', 'Claude Code built the Aster Labs page'), ('evidence', 'Checked on 2026-11-04'),
+                            ('evidence', 'Read https://example.com/docs'), ('evidence', 'Mailed a@example.com'),
+                            ('task', 'Edited /Users/alice/project/app.tsx'), ('proposal', 'Call +1 (555) 010-0199 at 12 Main Street'),
+                            ('observation', '"The private draft must stay unpublished until launch."'),
+                            ('cause', '未公開研究資料には秘密顧客情報が含まれています'), ('observation', 'Saw that ' + run)]:
+            note = {**self.lesson, field: text}
+            self.assertEqual(capture.validate_notes({'notes': [note]}, turn), [note])
 
-    def test_short_private_sentences_names_and_generic_technical_feedback(self):
-        for source in ('Aster Labs acquired Cygnus secretly.', 'Project Zephyr launches next Friday.',
-                       '张明患有重病。', '保密项目曙光即将发布。'):
-            turn = {'verified_skills': ['frontend-ui'], 'messages': [{'text': source}]}
-            with self.assertRaises(ValueError):
-                capture.validate_notes({'notes': [{**self.lesson, 'evidence': source}]}, turn)
-        for source, name in [('Build the Aster Labs launch page', 'Aster Labs'),
-                             ('Edit the private draft for customer Rowan Hale', 'Rowan Hale')]:
-            turn = {'verified_skills': ['frontend-ui'], 'messages': [{'text': source}]}
-            with self.assertRaises(ValueError):
-                capture.validate_notes({'notes': [{**self.lesson, 'task': name}]}, turn)
-        turn = {'verified_skills': ['frontend-ui'], 'messages': [{'text': 'Build a Vue and Nuxt page with JSON Schema validation'}]}
-        note = {**self.lesson, 'task': 'Checked Vue and Nuxt integration', 'evidence': 'Verified JSON Schema validation'}
-        self.assertEqual(capture.validate_notes({'notes': [note]}, turn), [note])
+    def test_notes_with_credentials_pass_validation(self):
+        turn = {'verified_skills': ['frontend-ui']}
+        for credential in ('api_key=abc123', 'Bearer abc.def', 'password: hunter2', 'sk-abcdefgh12345', 'ghp_abcdefgh12345'):
+            note = {**self.lesson, 'evidence': 'Used ' + credential}
+            self.assertEqual(capture.validate_notes({'notes': [note]}, turn), [note])
+
+    def test_summary_uses_note_field_rules(self):
+        for summary in ('Quoted "source text" at https://example.com and token=abc123', 'x' * 1000):
+            capture.validate_summary(summary)
+            capture.validate_summary(summary, 'rust')
+        for summary in ('', ' ', 'First\nsecond', 'x' * 1001, None):
+            with self.subTest(summary=summary), self.assertRaises(ValueError):
+                capture.validate_summary(summary)
 
     def test_capture_timestamp_and_turn_provenance(self):
         self.rollout()
@@ -695,11 +682,7 @@ class CaptureTests(unittest.TestCase):
         def run(command, **kwargs):
             self.assertIn('Relevant newest lesson', kwargs['input'])
             self.assertNotIn('Unrelated writer lesson', kwargs['input'])
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': []}))
-            class Result:
-                returncode = 0
-                stdout = ''
-            return Result()
+            return completed({'notes': []})
         with patch.object(capture, 'run_extractor', side_effect=run):
             self.assertEqual(capture.extract(self.config, self.state, turn, existing), [])
 
@@ -741,11 +724,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual({note['skill'] for note in data['existing_notes']}, set(capture.SKILLS))
             self.assertEqual(len(data['existing_notes']), 2 * len(capture.SKILLS))
             self.assertTrue(data['turn']['truncated'])
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': []}))
-            class Result:
-                returncode = 0
-                stdout = ''
-            return Result()
+            return completed({'notes': []})
         with patch.object(capture, 'MAX_INPUT', 20000 + 2000 * len(capture.SKILLS)), patch.object(capture, 'run_extractor', side_effect=run):
             self.assertEqual(capture.extract(self.config, self.state, turn, existing), [])
 
@@ -759,30 +738,24 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual({note['skill'] for note in notes}, set(capture.SKILLS))
         self.assertTrue(all(sum(n['skill'] == skill for n in notes) >= 2 for skill in capture.SKILLS))
 
-    def test_nonfatal_error_metadata_does_not_imply_tool_execution(self):
+    def test_non_tool_events_do_not_imply_tool_execution(self):
         self.state.mkdir()
         turn = {'verified_skills': ['frontend-ui'], 'messages': [], 'calls': []}
-        error = json.dumps({'type': 'item.completed', 'item': {'type': 'error', 'message': capture.STARTUP_DIAGNOSTIC}})
-        started = json.dumps({'type': 'turn.started'})
-        class Result:
-            returncode = 0
-            stdout = error + '\n' + started
-        def run(command, **kwargs):
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': []}))
-            return Result()
-        with patch.object(capture, 'run_extractor', side_effect=run):
+        thinking = {'type': 'assistant', 'error': None, 'message': {'content': [
+            {'type': 'thinking', 'thinking': 'private'}, {'type': 'text', 'text': 'private'}]}}
+        limit = {'type': 'rate_limit_event', 'rate_limit_info': {'status': 'allowed'}}
+        events = answer({'notes': []}).splitlines(keepends=True)
+        result = capture.subprocess.CompletedProcess([], 0, events[0] + stream(thinking, limit) + ''.join(events[1:]), '')
+        with patch.object(capture, 'run_extractor', return_value=result):
             self.assertEqual(capture.extract(self.config, self.state, turn, []), [])
-            Result.stdout = started + '\n' + error
-            self.assertEqual(capture.extract(self.config, self.state, turn, []), [])
-            Result.stdout = error.replace('Code Mode is unavailable', 'Other failure')
-            self.assertEqual(capture.extract(self.config, self.state, turn, []), [])
-            Result.stdout = json.dumps({'type': 'tool_call', 'item': {'type': 'error', 'message': 'failure'}})
-            with self.assertRaises(RuntimeError):
+        result = capture.subprocess.CompletedProcess([], 0, stream(INIT, tool_use('Read')), '')
+        with patch.object(capture, 'run_extractor', return_value=result) as run:
+            with self.assertRaisesRegex(RuntimeError, 'attempted tool execution'):
                 capture.extract(self.config, self.state, turn, [])
+        run.assert_called_once()
 
     def test_static_failure_diagnostics_never_echo_source_text(self):
-        cases = [(ValueError('Capture output includes a source identifying name'), 'privacy source name rejected'),
-                 (ValueError('Capture output quotes a private source sentence'), 'privacy source quotation rejected'),
+        cases = [(ValueError('Invalid capture note field'), 'model schema rejected'),
                  (ValueError('Invalid capture note scope'), 'model scope rejected'),
                  (RuntimeError('Capture model attempted tool execution'), 'model tool event rejected'),
                  (capture.subprocess.TimeoutExpired('private command', 240), 'extractor timeout'),
@@ -795,6 +768,22 @@ class CaptureTests(unittest.TestCase):
         state = (self.state / 'capture-state.json').read_text()
         self.assertNotIn('confidential customer text', state)
         self.assertIn('model or schema extraction failure', state)
+
+    def test_legacy_privacy_deferral_is_retried_without_a_hint(self):
+        self.rollout()
+        with patch.object(capture, 'extract', side_effect=ValueError('Invalid capture output')):
+            capture.capture(self.config, self.state)
+        path = self.state / 'capture-state.json'
+        state = json.loads(path.read_text())
+        [entry] = state['deferred'].values()
+        entry['reason'] = 'privacy source quotation rejected'
+        entry['retry_at'] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        path.write_text(json.dumps(state))
+        with patch.object(capture, 'extract', return_value=[self.lesson]) as model:
+            result = capture.capture(self.config, self.state)
+        self.assertEqual((result['processed'], result['notes'], result['errors']), (1, 1, 0))
+        self.assertNotIn('previous_capture_rejection', model.call_args.args[2])
+        self.assertEqual(json.loads(path.read_text())['deferred'], {})
 
     def test_recovery_clears_pending_and_deferred_transactions(self):
         self.rollout()
@@ -827,48 +816,51 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn('private invalid payload', json.dumps(summary))
         self.assertNotIn(str(self.sessions), json.dumps(summary))
 
-    def test_privacy_retry_informs_model_with_static_reason_only(self):
+    def test_extractor_receives_unredacted_transcript_text(self):
+        user = ('Build a small page; mail a@example.com, open https://example.com/x, read /Users/alice/notes.md, '
+                'use token=abc123 and Bearer abc.def and sk-abcdefgh12345')
+        self.rollout(self.transcript(user=user))
+        inputs = []
+        def run(command, **kwargs):
+            inputs.append(json.loads(kwargs['input'][len(capture.PROMPT) + 1:]))
+            return completed({'notes': []})
+        with patch.object(capture, 'run_extractor', side_effect=run):
+            self.assertEqual(capture.capture(self.config, self.state)['processed'], 1)
+        [data] = inputs
+        self.assertEqual([m['text'] for m in data['turn']['messages']], [user, 'Built page and checked layout.'])
+        self.assertNotIn('redacted', json.dumps(data))
+
+    def test_retry_after_rejection_carries_no_rejection_hint(self):
         self.rollout()
         attempts = []
-        rejected = {**self.lesson, 'evidence': 'Built page and checked layout.'}
+        rejected = {**self.lesson, 'evidence': 'two\nlines'}
         def run(command, **kwargs):
             data = json.loads(kwargs['input'][len(capture.PROMPT) + 1:])
             attempts.append(data['turn'])
             note = rejected if len(attempts) == 1 else self.lesson
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': [note]}))
-            class Result:
-                returncode = 0
-                stdout = ''
-            return Result()
+            return completed({'notes': [note]})
         now = datetime.now(timezone.utc)
         with patch.object(capture, 'run_extractor', side_effect=run):
             first = capture.capture(self.config, self.state, now=now)
-            self.assertEqual(first['errors'], 1)
-            self.assertEqual(first['processed'], 0)
-            self.assertEqual(len(attempts), 1)
+            self.assertEqual((first['errors'], first['processed']), (1, 0))
+            deferred = next(iter(json.loads((self.state / 'capture-state.json').read_text())['deferred'].values()))
+            self.assertEqual(deferred['reason'], 'model schema rejected')
             second = capture.capture(self.config, self.state, now=now + timedelta(hours=2))
-        self.assertEqual(second['errors'], 0)
-        self.assertEqual(second['processed'], 1)
-        self.assertEqual(second['notes'], 1)
+        self.assertEqual((second['errors'], second['processed'], second['notes']), (0, 1, 1))
         self.assertEqual(len(attempts), 2)
-        self.assertNotIn('previous_capture_rejection', attempts[0])
-        self.assertEqual(attempts[1]['previous_capture_rejection'], 'privacy source quotation rejected')
-        self.assertNotIn('previous_rejected_output', attempts[1])
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertNotIn('previous_capture_rejection', attempts[1])
 
-    def test_manual_retry_bypasses_backoff_and_retains_privacy_validation(self):
+    def test_manual_retry_bypasses_backoff_and_retains_note_validation(self):
         self.rollout()
         now = datetime.now(timezone.utc)
-        rejected = {**self.lesson, 'evidence': 'Built page and checked layout.'}
+        rejected = {**self.lesson, 'evidence': 'two\nlines'}
         attempts = []
 
         def run(command, **kwargs):
             data = json.loads(kwargs['input'][len(capture.PROMPT) + 1:])
             attempts.append(data['turn'])
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': [rejected]}))
-            class Result:
-                returncode = 0
-                stdout = ''
-            return Result()
+            return completed({'notes': [rejected]})
 
         with patch.object(capture, 'run_extractor', side_effect=run):
             first = capture.capture(self.config, self.state, now=now)
@@ -878,13 +870,13 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(len(attempts), 1)
             retried = capture.capture(self.config, self.state, now=now, retry_now=True)
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(attempts[1]['previous_capture_rejection'], 'privacy source quotation rejected')
+        self.assertNotIn('previous_capture_rejection', attempts[1])
         self.assertEqual((retried['processed'], retried['notes'], retried['pending'], retried['errors']),
                          (0, 0, 1, 1))
         state = json.loads((self.state / 'capture-state.json').read_text())
         deferred = next(iter(state['deferred'].values()))
         self.assertEqual(deferred['attempts'], 2)
-        self.assertEqual(deferred['reason'], 'privacy source quotation rejected')
+        self.assertEqual(deferred['reason'], 'model schema rejected')
         self.assertEqual(datetime.fromisoformat(deferred['retry_at']), now + timedelta(hours=2))
         with patch.object(capture, 'extract', return_value=[self.lesson]):
             recovered = capture.capture(self.config, self.state, now=now, retry_now=True)
@@ -901,31 +893,28 @@ class CaptureTests(unittest.TestCase):
             self.assertNotIn('confidential arbitrary exception', kwargs['input'])
             data = json.loads(kwargs['input'][len(capture.PROMPT) + 1:])
             self.assertNotIn('previous_capture_rejection', data['turn'])
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': []}))
-            class Result:
-                returncode = 0
-                stdout = ''
-            return Result()
+            return completed({'notes': []})
         with patch.object(capture, 'run_extractor', side_effect=run):
             self.assertEqual(capture.capture(self.config, self.state, now=now + timedelta(hours=2))['processed'], 1)
 
     def test_cli_version_metadata_accepts_future_versions_and_hides_private_output(self):
         class Result:
             returncode = 0
-            stdout = 'codex-cli 0.160.0\n'
+            stdout = '2.1.0 (Claude Code)\n'
         def run(command, **kwargs):
             self.assertEqual(command, ['/bin/false', '--version'])
             self.assertEqual(kwargs['timeout'], 10)
-            self.assertNotIn('CODEX_TEST_UNTRUSTED', kwargs['env'])
+            self.assertNotIn('CLAUDECODE', kwargs['env'])
             return Result()
-        with patch.dict(capture.os.environ, {'CODEX_TEST_UNTRUSTED': 'remove'}), patch.object(capture.subprocess, 'run', side_effect=run):
-            for version in ('0.160.0', '0.162.0-alpha.17.2', '0.162.1', '0.999.0', '1.0.0-beta.1+build.2'):
-                Result.stdout = 'codex-cli ' + version + '\n'
-                self.assertEqual(capture.cli_version(self.config), 'codex-cli ' + version)
-            for output in ('codex-cli 0.999.0 private output', '', 'codex-cli 1.0.0\nprivate output', 'x' * 257):
+        with patch.dict(capture.os.environ, {'CLAUDECODE': '1'}), patch.object(capture.subprocess, 'run', side_effect=run):
+            for version in ('2.1.0', '2.2.0-beta.1', '3.0.0+build.2'):
+                Result.stdout = version + ' (Claude Code)\n'
+                self.assertEqual(capture.cli_version(self.config), version + ' (Claude Code)')
+            for output in ('2.1.0 (Claude Code) private output', '', '2.1.0 (Claude Code)\nprivate output',
+                           'codex-cli 0.160.0', 'x' * 257):
                 Result.stdout = output
                 self.assertEqual(capture.cli_version(self.config), 'unknown')
-            Result.stdout = 'codex-cli 0.999.0'
+            Result.stdout = '2.1.0 (Claude Code)'
             Result.returncode = 1
             self.assertEqual(capture.cli_version(self.config), 'unknown')
         for error in (capture.subprocess.TimeoutExpired('secret command', 10), OSError('private path'),
@@ -936,8 +925,8 @@ class CaptureTests(unittest.TestCase):
     def test_future_or_unknown_version_does_not_block_capture(self):
         self.state.mkdir()
         config = self.state / 'config.json'
-        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'codex_path': sys.executable}))
-        for version in ('codex-cli 0.999.0', 'unknown'):
+        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'claude_path': sys.executable}))
+        for version in ('9.0.0 (Claude Code)', 'unknown'):
             self.rollout(self.transcript(turn=version))
             with patch.object(sys, 'argv', ['capture.py', '--config', str(config)]), \
                     patch.object(capture, 'cli_version', return_value=version), \
@@ -949,13 +938,24 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(status['cli_version'], version)
             self.assertEqual(status['counts']['processed'], 1)
 
+    def test_host_gate_requires_the_claude_executable(self):
+        self.state.mkdir()
+        config = self.state / 'config.json'
+        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'codex_path': sys.executable,
+                                      'claude_path': str(self.root / 'missing-claude')}))
+        with patch.object(sys, 'argv', ['capture.py', '--config', str(config)]), \
+                patch.object(capture, 'capture') as run, patch('builtins.print') as log:
+            self.assertEqual(capture.main(), 1)
+        run.assert_not_called()
+        self.assertIn('invalid host configuration', json.loads(log.call_args.args[0])['error'])
+
     def test_failed_extraction_prints_safe_error_in_worker_log(self):
         self.state.mkdir()
         config = self.state / 'config.json'
-        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'codex_path': sys.executable}))
+        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'claude_path': sys.executable}))
         class Result:
             returncode = 0
-            stdout = 'codex-cli 0.999.0 private output'
+            stdout = '2.1.0 (Claude Code) private output'
         with patch.object(sys, 'argv', ['capture.py', '--config', str(config)]), \
                 patch.object(capture.subprocess, 'run', return_value=Result()), \
                 patch.object(capture, 'capture', side_effect=RuntimeError('Capture model attempted tool execution')), \
@@ -969,60 +969,61 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(status['cli_version'], 'unknown')
         self.assertEqual(summary['error'], status['error'])
 
-    def test_strict_model_command_and_tool_rejection(self):
+    def test_exposed_or_used_tools_are_rejected_without_retry(self):
         self.state.mkdir()
         turn = {'verified_skills': ['frontend-ui'], 'messages': [], 'calls': []}
-        def run(command, **kwargs):
-            self.assertIn('--ignore-user-config', command)
-            self.assertIn('--strict-config', command)
-            self.assertIn('--no-daemon', command)
-            self.assertIn('features.code_mode=false', command)
-            self.assertIn('features.multi_agent_v2.non_code_mode_only=false', command)
-            self.assertIn('features.code_mode.excluded_tool_namespaces=["functions","clock","collaboration"]', command)
-            self.assertNotIn('CODEX_TEST_UNTRUSTED', kwargs['env'])
-            self.assertIn('features.shell_tool=false', command)
-            self.assertEqual(command[-1], '-')
-            Path(command[command.index('-o') + 1]).write_text(json.dumps({'notes': []}))
-            class Result:
-                returncode = 0
-                stdout = '{"type":"item.completed","item":{"type":"command_execution"}}'
-            return Result()
-        with patch.dict(capture.os.environ, {'CODEX_TEST_UNTRUSTED': 'remove'}), patch.object(capture, 'run_extractor', side_effect=run):
-            with self.assertRaises(RuntimeError):
-                capture.extract(self.config, self.state, turn, [])
+        for events, message in (((dict(INIT, tools=['StructuredOutput', 'Bash']),), 'exposed tools'),
+                                ((dict(INIT, mcp_servers=[{'name': 'private'}]),), 'exposed tools'),
+                                ((INIT, tool_use('Bash')), 'attempted tool execution')):
+            result = capture.subprocess.CompletedProcess([], 0, stream(*events) + answer({'notes': []}), '')
+            with self.subTest(message=message), patch.object(capture, 'run_extractor', return_value=result) as run:
+                with self.assertRaisesRegex(RuntimeError, message) as caught:
+                    capture.extract(self.config, self.state, turn, [])
+                run.assert_called_once()
+            self.assertIn(capture.failure_reason(caught.exception),
+                          ('CLI isolation verification exposed tools', 'model tool event rejected'))
 
-    def test_failed_compatibility_check_keeps_evidence_without_sending_private_prompt(self):
+    def test_failed_cli_verification_keeps_evidence_without_sending_private_prompt(self):
         self.rollout(self.transcript(user='Build a page with confidential project evidence'))
-        with patch.object(capture, 'compatible_profile', side_effect=RuntimeError('Capture CLI isolation check exposed tools')), \
-                patch.object(capture.subprocess, 'run') as cli:
+        with patch.object(capture, 'verify_cli', side_effect=RuntimeError('Capture CLI required control is unavailable')), \
+                patch.object(capture, 'run_extractor') as cli:
             result = capture.capture(self.config, self.state)
         cli.assert_not_called()
         self.assertEqual(result['processed'], 0)
         self.assertEqual(result['pending'], 1)
         self.assertEqual(result['errors'], 1)
         state = json.loads((self.state / 'capture-state.json').read_text())
-        self.assertIn('CLI isolation verification exposed tools', [value['reason'] for value in state['deferred'].values()])
+        self.assertIn('CLI safety control unavailable', [value['reason'] for value in state['deferred'].values()])
         self.assertFalse(self.feedback.exists() and list(self.feedback.rglob('*.md')))
 
     def test_transient_timeout_retries_once_without_changing_model_or_controls(self):
         self.state.mkdir()
         calls = []
         def run(command, **kwargs):
-            calls.append((command, kwargs))
-            self.assertIn('model_reasoning_effort="xhigh"', command)
-            self.assertEqual(command[command.index('-m') + 1], 'gpt-6.1-sol')
+            calls.append(command)
+            self.assertEqual(command[command.index('--model') + 1], capture.claude_cli.RESTRICTED_MODEL)
+            self.assertEqual(command[command.index('--effort') + 1], 'xhigh')
             self.assertLessEqual(kwargs['timeout'], 240)
-            output = Path(command[command.index('-o') + 1])
             if len(calls) == 1:
-                output.write_text('{"notes":["stale private output"]}')
                 raise capture.subprocess.TimeoutExpired('private command', 240,
-                    output=b'{"type":"turn.started"}\n', stderr=b'private source text')
-            self.assertFalse(output.exists())
-            output.write_text('{"notes":[]}')
-            return capture.subprocess.CompletedProcess(command, 0, '{"type":"turn.completed"}\n', '')
+                    output=stream(INIT).encode(), stderr=b'private source text')
+            return completed({'notes': []})
         with patch.object(capture, 'run_extractor', side_effect=run):
             self.assertEqual(capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA), {'notes': []})
         self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    def test_repeated_timeout_raises_extractor_timeout(self):
+        self.state.mkdir()
+        error = capture.subprocess.TimeoutExpired('private command', 240, output=stream(INIT) + '{"type":"assis')
+        with patch.object(capture, 'run_extractor', side_effect=error) as run, \
+                patch.object(capture.sys, 'stderr', io.StringIO()):
+            with self.assertRaises(capture.ExtractorFailure) as caught:
+                capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(caught.exception.reason, 'extractor timeout')
+        self.assertEqual(capture.failure_reason(caught.exception), 'extractor timeout')
+        self.assertEqual((caught.exception.diagnostics['phase'], caught.exception.diagnostics['attempts']), ('inference', 2))
 
     def test_recovered_timeout_logs_only_safe_metadata_to_stderr(self):
         self.state.mkdir()
@@ -1031,9 +1032,8 @@ class CaptureTests(unittest.TestCase):
             calls.append(command)
             if len(calls) == 1:
                 raise capture.subprocess.TimeoutExpired('private command', 240,
-                    output=b'{"type":"turn.started"}\n', stderr=b'private source secret')
-            Path(command[command.index('-o') + 1]).write_text('{"notes":[]}')
-            return capture.subprocess.CompletedProcess(command, 0, '', '')
+                    output=stream(INIT).encode(), stderr=b'private source secret')
+            return completed({'notes': []})
         with patch.object(capture, 'run_extractor', side_effect=run), \
                 patch.object(capture.sys, 'stderr', io.StringIO()) as stderr, \
                 patch.object(capture.sys, 'stdout', io.StringIO()) as stdout:
@@ -1041,7 +1041,9 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(result, {'notes': []})
         self.assertEqual(stdout.getvalue(), '')
         metadata = json.loads(stderr.getvalue())
-        self.assertEqual(set(metadata), {'event', 'elapsed_seconds', 'phase', 'failure_class', 'attempts'})
+        self.assertEqual(set(metadata), {'event', 'elapsed_seconds', 'phase', 'failure_class', 'attempts',
+                                         'exit_code', 'result_subtype', 'api_error_status'})
+        self.assertEqual((metadata['exit_code'], metadata['result_subtype'], metadata['api_error_status']), (None, None, None))
         self.assertEqual((metadata['event'], metadata['failure_class'], metadata['phase'], metadata['attempts']),
                          ('extractor_attempt_failed', 'timeout', 'inference', 1))
         self.assertNotIn('private', stderr.getvalue())
@@ -1050,12 +1052,13 @@ class CaptureTests(unittest.TestCase):
     def test_transient_cli_failure_retries_but_authentication_and_limits_do_not(self):
         self.state.mkdir()
         for stderr, expected, attempts in (
-                ('stream disconnected: connection reset; private source', 'connection', 2),
-                ('HTTP 401: authentication failed; private source', 'authentication', 1),
-                ('HTTP 429: usage limit; private source', 'rate limit', 1),
+                ('API Error: Connection error. connection reset; private source', 'connection', 2),
+                ('Invalid API key · Please run /login; private source', 'authentication', 1),
+                ('Claude usage limit reached; private source', 'rate limit', 1),
                 ('private unexpected failure', 'CLI or output', 1)):
             with self.subTest(category=expected), patch.object(capture, 'run_extractor', return_value=
-                    capture.subprocess.CompletedProcess([], 1, '{"type":"turn.started"}\n', stderr)) as run:
+                    capture.subprocess.CompletedProcess([], 1, stream(INIT), stderr)) as run, \
+                    patch.object(capture.sys, 'stderr', io.StringIO()):
                 with self.assertRaises(capture.ExtractorFailure) as caught:
                     capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
             self.assertEqual(run.call_count, attempts)
@@ -1064,24 +1067,46 @@ class CaptureTests(unittest.TestCase):
             self.assertNotIn('private', str(caught.exception))
             self.assertNotIn('private', json.dumps(caught.exception.diagnostics))
 
-    def test_connection_error_item_retries_without_logging_private_error_text(self):
+    def test_error_results_classify_without_logging_private_error_text(self):
         self.state.mkdir()
-        stream = '\n'.join((json.dumps({'type': 'turn.started'}), json.dumps({
-            'type': 'item.completed', 'item': {'type': 'error',
-                'message': 'stream disconnected: connection reset; private source text'}})))
-        with patch.object(capture, 'run_extractor', return_value=
-                capture.subprocess.CompletedProcess([], 1, stream, '')) as run:
-            with self.assertRaises(capture.ExtractorFailure) as caught:
-                capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(caught.exception.diagnostics['failure_class'], 'connection')
-        self.assertNotIn('private source text', str(caught.exception))
-        self.assertNotIn('private source text', json.dumps(caught.exception.diagnostics))
+        for result, expected, attempts in (
+                ({'api_error_status': None, 'result': 'API Error: Connection error. private source text'}, 'connection', 2),
+                ({'api_error_status': 529, 'result': 'Overloaded; private source text'}, 'connection', 2),
+                ({'api_error_status': 401, 'result': 'authentication_error; private source text'}, 'authentication', 1),
+                ({'api_error_status': 429, 'result': 'private source text'}, 'rate limit', 1)):
+            event = {'type': 'result', 'subtype': 'success', 'is_error': True, **result}
+            with self.subTest(category=expected), patch.object(capture, 'run_extractor', return_value=
+                    capture.subprocess.CompletedProcess([], 1, stream(INIT, event), '')) as run, \
+                    patch.object(capture.sys, 'stderr', io.StringIO()) as log:
+                with self.assertRaises(capture.ExtractorFailure) as caught:
+                    capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
+            self.assertEqual(run.call_count, attempts)
+            self.assertEqual(caught.exception.diagnostics['failure_class'], expected)
+            self.assertEqual(caught.exception.diagnostics['phase'], 'completed')
+            self.assertEqual((caught.exception.diagnostics['exit_code'], caught.exception.diagnostics['result_subtype'],
+                              caught.exception.diagnostics['api_error_status']), (1, 'success', result['api_error_status']))
+            self.assertNotIn('private source text', str(caught.exception) + log.getvalue())
+            self.assertNotIn('private source text', json.dumps(caught.exception.diagnostics))
+
+    def test_success_requires_completed_zero_exit_dict_within_output_bound(self):
+        self.state.mkdir()
+        large = {'notes': [{'skill': 'frontend-ui', 'title': 'x' * capture.MAX_OUTPUT}]}
+        for result in (capture.subprocess.CompletedProcess([], 0, answer(large), ''),
+                       capture.subprocess.CompletedProcess([], 1, answer({'notes': []}), ''),
+                       capture.subprocess.CompletedProcess([], 0, stream(INIT), ''),
+                       capture.subprocess.CompletedProcess([], 0, stream(INIT, {'type': 'result', 'subtype': 'success',
+                           'is_error': False, 'result': '{"notes":[]}'}), '')):
+            with self.subTest(result=result.stdout[-80:]), patch.object(capture, 'run_extractor', return_value=result) as run, \
+                    patch.object(capture.sys, 'stderr', io.StringIO()):
+                with self.assertRaises(capture.ExtractorFailure) as caught:
+                    capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
+            run.assert_called_once()
+            self.assertEqual(caught.exception.reason, 'extractor CLI or output failure')
+        self.assertNotIn('x' * 100, json.dumps(caught.exception.diagnostics))
 
     def test_timeout_with_tool_event_is_rejected_without_retry(self):
         self.state.mkdir()
-        error = capture.subprocess.TimeoutExpired('private command', 240,
-            output=b'{"type":"item.started","item":{"type":"command_execution"}}\n')
+        error = capture.subprocess.TimeoutExpired('private command', 240, output=stream(INIT, tool_use('Bash')).encode())
         with patch.object(capture, 'run_extractor', side_effect=error) as run:
             with self.assertRaisesRegex(RuntimeError, 'attempted tool'):
                 capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
@@ -1093,16 +1118,16 @@ class CaptureTests(unittest.TestCase):
         def run(command, **kwargs):
             self.assertEqual(kwargs['timeout'], 3)
             clock[0] = 3
-            raise capture.subprocess.TimeoutExpired('private command', 3, output=b'{"type":"turn.started"}\n')
+            raise capture.subprocess.TimeoutExpired('private command', 3, output=stream(INIT).encode())
         with patch.object(capture.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(capture, 'run_extractor', side_effect=run) as model:
             with self.assertRaises(capture.CaptureBudgetExpired):
                 capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA, deadline=3)
             model.assert_called_once()
-            with patch.object(capture, 'compatible_profile') as profile:
+            with patch.object(capture, 'verify_cli') as verify:
                 with self.assertRaises(capture.CaptureBudgetExpired):
                     capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA, deadline=3)
-                profile.assert_not_called()
+                verify.assert_not_called()
         with patch.object(capture.subprocess, 'run') as cli, patch.object(capture.time, 'monotonic', return_value=3):
             with self.assertRaises(capture.CaptureBudgetExpired):
                 capture.cli_text('/private/cli', '--help', deadline=3)
@@ -1129,16 +1154,53 @@ class CaptureTests(unittest.TestCase):
         path = self.state / 'capture-state.json'
         self.assertTrue(not path.exists() or not json.loads(path.read_text()).get('deferred'))
 
+    def test_crashed_cli_failure_keeps_static_diagnostics(self):
+        self.state.mkdir()
+        crashed = capture.subprocess.CompletedProcess([], -9, stream(INIT) + '{"type": "assis', 'private stderr')
+        with patch.object(capture, 'run_extractor', return_value=crashed) as run, \
+                patch.object(capture.sys, 'stderr', io.StringIO()) as log:
+            with self.assertRaises(capture.ExtractorFailure) as caught:
+                capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
+        self.assertEqual(run.call_count, 1)
+        diagnostics = caught.exception.diagnostics
+        self.assertEqual((diagnostics['phase'], diagnostics['failure_class'], diagnostics['exit_code'],
+                          diagnostics['result_subtype'], diagnostics['api_error_status']),
+                         ('inference', 'CLI or output', -9, None, None))
+        self.assertEqual(json.loads(log.getvalue())['exit_code'], -9)
+        self.assertNotIn('private', log.getvalue())
+
+    def test_timeout_keeps_a_finished_answer_and_the_cli_exit_status(self):
+        self.state.mkdir()
+        finished = capture.subprocess.TimeoutExpired('cli', 240, output=answer({'notes': []}).encode(), stderr=b'')
+        with patch.object(capture, 'run_extractor', side_effect=finished) as run:
+            self.assertEqual(capture.model_response(self.config, self.state, 'p', '{}', capture.SCHEMA), {'notes': []})
+        self.assertEqual(run.call_count, 1)
+        hung = capture.subprocess.TimeoutExpired('cli', 240, output=stream(INIT).encode(), stderr=b'')
+        hung.returncode = 3
+        with patch.object(capture, 'run_extractor', side_effect=[hung, hung]), \
+                patch.object(capture.sys, 'stderr', io.StringIO()):
+            with self.assertRaises(capture.ExtractorFailure) as caught:
+                capture.model_response(self.config, self.state, 'p', '{}', capture.SCHEMA)
+        self.assertEqual((caught.exception.diagnostics['failure_class'], caught.exception.diagnostics['exit_code'],
+                          caught.exception.diagnostics['attempts']), ('timeout', 3, 2))
+
     def test_failed_capture_retains_only_safe_extractor_diagnostics(self):
         self.rollout()
         failed = capture.ExtractorFailure('extractor connection failure',
-            {'elapsed_seconds': 1.25, 'phase': 'startup', 'failure_class': 'connection', 'attempts': 2})
+            {'elapsed_seconds': 1.25, 'phase': 'startup', 'failure_class': 'connection', 'attempts': 2,
+             'exit_code': 1, 'result_subtype': None, 'api_error_status': None})
         with patch.object(capture, 'extract', side_effect=failed):
             counts = capture.capture(self.config, self.state)
         state = json.loads((self.state / 'capture-state.json').read_text())
         pending = next(iter(state['deferred'].values()))
         self.assertEqual(pending['diagnostics'], failed.diagnostics)
         self.assertEqual(counts['errors'], 1)
+
+    def test_timeout_keeps_the_status_of_a_cli_that_left_a_child_running(self):
+        program = 'import os,sys,time; pid=os.fork(); time.sleep(20) if pid == 0 else sys.exit(3)'
+        with self.assertRaises(capture.subprocess.TimeoutExpired) as caught:
+            capture.run_extractor([sys.executable, '-c', program], env=dict(os.environ), input='', timeout=0.5)
+        self.assertEqual(caught.exception.returncode, 3)
 
     def test_timeout_kills_subprocess_group_and_closes_descendant_pipes(self):
         pidfile = self.root / 'child.pid'
@@ -1155,110 +1217,87 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(not state.stdout.strip() or state.stdout.lstrip().startswith('Z'))
 
 
-class CaptureCompatibilityTests(unittest.TestCase):
+FAKE_CLI = """
+import json, os, sys
+from pathlib import Path
+with Path(os.environ['FAKE_CLAUDE_RECORD']).open('a') as record:
+    stdin = '' if sys.argv[1:] == ['--help'] else sys.stdin.read()
+    record.write(json.dumps({'argv': sys.argv[1:], 'stdin': stdin, 'cwd': os.getcwd(), 'env': dict(os.environ)}) + '\\n')
+if sys.argv[1:] == ['--help']:
+    print(os.environ['FAKE_CLAUDE_HELP'])
+else:
+    sys.stdout.write(os.environ['FAKE_CLAUDE_STREAM'])
+"""
+
+
+class ClaudeCliCaptureTests(unittest.TestCase):
+    """Drive model_response through a fake Claude executable."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.cli = self.root / 'codex'
-        self.cli.write_text('fake binary generation one')
-        capture.verified_profile.cache_clear()
-        self.addCleanup(capture.verified_profile.cache_clear)
+        self.state = self.root / 'state'
+        self.state.mkdir()
+        self.cli = self.root / 'claude'
+        self.cli.write_text('#!' + sys.executable + '\n' + FAKE_CLI)
+        self.cli.chmod(0o755)
+        self.record = self.root / 'record.jsonl'
+        self.config = {'claude_path': str(self.cli)}
+        capture.VERIFIED_CLIS.clear()
+        self.addCleanup(capture.VERIFIED_CLIS.clear)
+        environ = patch.dict(os.environ, {'FAKE_CLAUDE_RECORD': str(self.record), 'FAKE_CLAUDE_HELP': HELP,
+                                          'FAKE_CLAUDE_STREAM': answer({'notes': []}), 'CLAUDECODE': '1',
+                                          'CLAUDE_CODE_SESSION_ID': 'parent-session'})
+        environ.start()
+        self.addCleanup(environ.stop)
 
-    def test_discovery_adapts_renamed_commands_flags_aliases_and_removed_features(self):
-        root = ROOT_HELP.replace('exec ', 'run ').replace('features ', 'flags ')
-        help_text = EXEC_HELP.replace('--ignore-user-config', '--ignore-config').replace('--json', '--experimental-json')
-        help_text = help_text.replace('-o, --output-last-message', '--output-last-message')
-        help_text = help_text[:help_text.index('      --skip-git-repo-check')]
-        replies = {('--help',): root, ('run', '--help'): help_text,
-                   ('flags', '--help'): 'Commands:\n  show  List known features with their stage and effective state',
-                   ('flags', 'show'): 'shell_tool  stable  true\ncomputer_use  removed  false\ncode_mode_host  stable  true\n'}
-        with patch.object(capture, 'cli_text', side_effect=lambda cli, *args, **kwargs: replies[args]):
-            profile = capture.discover_profile(str(self.cli))
-        self.assertEqual(profile['command'], 'run')
-        self.assertEqual(profile['ignore_config'], '--ignore-config')
-        self.assertEqual(profile['json'], '--experimental-json')
-        self.assertEqual(profile['output'], '--output-last-message')
-        self.assertIsNone(profile['skip_git'])
-        self.assertIn('features.shell_tool=false', profile['overrides'])
-        self.assertNotIn('features.computer_use=false', profile['overrides'])
-        with patch.object(capture.subprocess, 'run') as git:
-            command = capture.extractor_command(str(self.cli), profile, self.root, self.root / 'schema', self.root / 'output')
-        git.assert_called_once()
-        self.assertEqual(command[:3], [str(self.cli), '--no-daemon', 'run'])
-        self.assertIn('--ignore-config', command)
-        self.assertIn('read-only', command)
-        self.assertIn('--experimental-json', command)
-        self.assertNotIn('--skip-git-repo-check', command)
+    def calls(self):
+        return [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
 
-    def test_discovery_never_drops_missing_safety_control(self):
-        missing = EXEC_HELP.replace('--ignore-user-config', '--unrelated').replace('Do not load user config.toml', 'Unrelated option')
-        with patch.object(capture, 'cli_text', side_effect=[ROOT_HELP, missing]):
-            with self.assertRaisesRegex(RuntimeError, 'required control'):
-                capture.discover_profile(str(self.cli))
+    def test_isolated_command_receives_schema_and_prompt_on_stdin(self):
+        for _ in range(2):
+            result = capture.model_response(self.config, self.state, 'private prompt', '{"data": 1}', capture.SCHEMA)
+            self.assertEqual(result, {'notes': []})
+        help_call, *model_calls = self.calls()
+        self.assertEqual(help_call['argv'], ['--help'])
+        self.assertEqual(help_call['env']['LC_ALL'], 'C')
+        self.assertEqual(len(model_calls), 2, 'help verification is cached per CLI path')
+        call = model_calls[0]
+        argv = call['argv']
+        self.assertEqual(argv, capture.claude_cli.restricted_command(self.cli, capture.SCHEMA)[1:])
+        self.assertEqual(argv[argv.index('--setting-sources') + 1], '')
+        self.assertEqual(argv[argv.index('--tools') + 1], '')
+        for flag in ('--print', '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence'):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[argv.index('--output-format') + 1], 'stream-json')
+        self.assertEqual(json.loads(argv[argv.index('--json-schema') + 1]), capture.SCHEMA)
+        self.assertEqual(call['stdin'], 'private prompt\n{"data": 1}')
+        self.assertNotIn('private prompt', json.dumps(argv))
+        self.assertTrue(Path(call['cwd']).name.startswith('.capture-model-'))
+        self.assertEqual(Path(call['cwd']).parent.resolve(), self.state.resolve())
+        self.assertFalse(Path(call['cwd']).exists())
+        self.assertNotIn('CLAUDECODE', call['env'])
+        self.assertNotIn('CLAUDE_CODE_SESSION_ID', call['env'])
+        self.assertEqual(call['env']['CLAUDE_CODE_DISABLE_AUTO_MEMORY'], '1')
+        self.assertEqual(sorted(path.name for path in self.state.iterdir()), [])
+        self.assertFalse((self.state / 'capture-cli.json').exists())
 
-    def audit_run(self, tools=None, retired=None):
-        def run(command, **kwargs):
-            self.assertEqual(kwargs['input'], 'Compatibility check only. Return {"notes":[]}.')
-            self.assertIn('--ignore-user-config', command)
-            self.assertIn('read-only', command)
-            if retired and any(value.split('=', 1)[0] == retired for value in command):
-                return capture.subprocess.CompletedProcess(command, 1, '', 'unknown configuration field `' + retired + '` in -c/--config override')
-            url = next(value.split('=', 1)[1].strip('"') for value in command if value.startswith('model_providers.capture_audit.base_url='))
-            endpoint = urlsplit(url)
-            connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=5)
-            try:
-                connection.request('POST', endpoint.path + '/responses', body=json.dumps(
-                    {'model': 'gpt-6.1-sol', 'input': [{'role': 'user', 'content': kwargs['input']}], 'tools': tools or []}))
-                response = connection.getresponse()
-                self.assertEqual(response.status, 400)
-                response.read()
-            finally:
-                connection.close()
-            return capture.subprocess.CompletedProcess(command, 1, '', 'Compatibility check complete')
-        return run
+    def test_missing_required_flag_fails_closed_before_any_prompt(self):
+        missing = HELP.replace('  --strict-mcp-config <value>\n', '  --strict-mcp-config-extra\n')
+        with patch.dict(os.environ, {'FAKE_CLAUDE_HELP': missing}):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, 'required control') as caught:
+                    capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
+        self.assertEqual([call['argv'] for call in self.calls()], [['--help'], ['--help']])
+        self.assertEqual(capture.failure_reason(caught.exception), 'CLI safety control unavailable')
 
-    def test_audit_removes_retired_configuration_only_before_evidence(self):
-        profile = {**PROFILE, 'overrides': list(PROFILE['overrides'])}
-        with patch.object(capture.subprocess, 'run', side_effect=self.audit_run(retired='tools.update_plan.enabled')) as cli:
-            capture.audit_profile(str(self.cli), profile, self.root)
-        self.assertEqual(cli.call_count, 2)
-        self.assertNotIn('tools.update_plan.enabled=false', profile['overrides'])
-        self.assertIn('approval_policy="never"', profile['overrides'])
-
-    def test_audit_rejects_exposed_tools_and_does_not_cache_profile(self):
-        profile = {**PROFILE, 'overrides': list(PROFILE['overrides'])}
-        with patch.object(capture, 'discover_profile', return_value=profile), \
-                patch.object(capture.subprocess, 'run', side_effect=self.audit_run(tools=[{'type': 'function', 'name': 'shell'}])):
+    def test_exposed_tools_from_cli_fail_without_retry(self):
+        exposed = stream(dict(INIT, tools=['StructuredOutput', 'Read'])) + answer({'notes': []})
+        with patch.dict(os.environ, {'FAKE_CLAUDE_STREAM': exposed}):
             with self.assertRaisesRegex(RuntimeError, 'exposed tools'):
-                capture.compatible_profile(str(self.cli), self.root)
-        self.assertFalse((self.root / 'capture-cli.json').exists())
-
-    def test_audit_never_removes_required_configuration(self):
-        profile = {**PROFILE, 'overrides': list(PROFILE['overrides'])}
-        with patch.object(capture.subprocess, 'run', side_effect=self.audit_run(retired='approval_policy')) as cli:
-            with self.assertRaisesRegex(RuntimeError, 'isolation check failed'):
-                capture.audit_profile(str(self.cli), profile, self.root)
-        cli.assert_called_once()
-        self.assertIn('approval_policy="never"', profile['overrides'])
-
-    def test_verified_profile_reuses_audit_and_rechecks_replaced_binary_or_bad_cache(self):
-        def discover(cli, **kwargs):
-            return {**PROFILE, 'overrides': list(PROFILE['overrides'])}
-        def audit(cli, profile, root, **kwargs):
-            profile['overrides'].remove('tools.update_plan.enabled=false')
-        with patch.object(capture, 'discover_profile', side_effect=discover), patch.object(capture, 'audit_profile', side_effect=audit) as check:
-            first = capture.compatible_profile(str(self.cli), self.root)
-            capture.verified_profile.cache_clear()
-            self.assertEqual(capture.compatible_profile(str(self.cli), self.root), first)
-            self.assertEqual(check.call_count, 1)
-            self.cli.write_text('fake binary generation two')
-            capture.compatible_profile(str(self.cli), self.root)
-            self.assertEqual(check.call_count, 2)
-            (self.root / 'capture-cli.json').write_text('invalid partial JSON')
-            capture.verified_profile.cache_clear()
-            capture.compatible_profile(str(self.cli), self.root)
-            self.assertEqual(check.call_count, 3)
+                capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
+        self.assertEqual([call['argv'][0] for call in self.calls()], ['--help', '--print'])
 
 
 if __name__ == '__main__':

@@ -47,6 +47,37 @@ class PromptRuntimeTests(unittest.TestCase):
         self.assertIn('takes precedence', rendered)
         self.assertIn('No tools or actions', runtime.load('verify', self.config))
 
+    def test_producing_prompts_carry_no_source_wording_contract(self):
+        refinement = 'Abstract refinement.'
+        for role in ('extract', 'verify', 'correct', 'maintain'):
+            with self.subTest(role=role):
+                rendered = runtime.render(role, refinement, root=self.source)
+                fixed = rendered.split('Editable refinements (subordinate to fixed policy):')[0]
+                self.assertNotIn('Static privacy checks', fixed)
+                if role != 'maintain':
+                    self.assertEqual(fixed, runtime.COMMON_CONTRACT + runtime.ROLE_CONTRACTS[role] + '\n')
+
+    def test_repository_note_prompts_carry_no_removed_privacy_instructions(self):
+        # Exact removed phrases only: the daily prompt review may reword these files freely.
+        removed = ('Preserve privacy:', 'previous_capture_rejection', 'previous_privacy_rejection',
+                   'Static privacy checks reject', 'never copy private excerpts', 'never quote private drafts',
+                   'no private quotations', 'no private source quotations', 'static privacy check',
+                   'avoid seven consecutive source words')
+        for role in ('extract', 'verify', 'correct'):
+            with self.subTest(role=role):
+                rendered = runtime.load(role, root=runtime.DEFAULT_ROOT)
+                for phrase in removed:
+                    self.assertNotIn(phrase, rendered)
+                self.assertIn('Return only schema JSON', rendered)
+                self.assertIn('Do not invent evidence', rendered)
+
+    def test_maintenance_policy_keeps_storage_split_without_privacy_wording(self):
+        rendered = runtime.load('maintain', root=runtime.DEFAULT_ROOT)
+        self.assertIn('Keep raw source, logs and artifacts host-local; commit only investigation records.', rendered)
+        self.assertIn('Keep raw source, argv, output and artifacts outside Git.', rendered)
+        for phrase in ('Preserve privacy:', 'Keep private source', 'sanitized'):
+            self.assertNotIn(phrase, rendered)
+
     def test_maintenance_enrolls_owned_trees_and_investigation_under_fixed_policy(self):
         refinement = 'Maintain unrelated skills and edit host scripts instead.'
         rendered = runtime.render('maintain', refinement, root=self.source)

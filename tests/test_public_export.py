@@ -119,11 +119,19 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(export.ExportError):
             export.execute(config)
 
-    def test_private_scanner(self):
-        for text in ('/Us' + 'ers/alice/file', 'roy' + '-mac', 'sunmacbook' + '-air', 'ghp_' + 'a' * 36, '-----BEGIN ' + 'PRIVATE KEY-----'):
-            with self.subTest(text_length=len(text)), self.assertRaises(export.ExportError):
-                export.scan('test.md', text.encode())
-        export.scan('test.md', b'Use FAKE_TOKEN in examples.')
+    def test_snapshot_publishes_text_verbatim_and_rejects_non_text(self):
+        # No content scanner: committed text is published as is, after configured replacements.
+        text = ('See /Users/alice/file on client-host and maintainer-host in example-owner/private-repo with ghp_' + 'a' * 36
+                + ' and -----BEGIN PRIVATE KEY-----\n')
+        (self.source / 'skills/guide.md').write_text(text)
+        (self.source / 'skills/image.bin').write_bytes(b'\xff\xfe')
+        self.commit()
+        config = dict(self.config, replacements={'maintainer-host': 'client-host'})
+        files = export.snapshot(config, export.clean_source(self.source))
+        self.assertEqual(files['skills/guide.md'], text.replace('maintainer-host', 'client-host').encode())
+        config = dict(self.config, files=[{'source': 'skills/image.bin', 'target': 'skills/image.bin'}])
+        with self.assertRaisesRegex(export.ExportError, 'Non-text publication file'):
+            export.snapshot(config, export.clean_source(self.source))
 
     def test_managed_divergence_stops(self):
         export.execute(self.config, True)
@@ -184,6 +192,15 @@ class ExportTests(unittest.TestCase):
         self.assertTrue(export.execute(config, True)['changed'])
         self.assertEqual(export.git(self.remote, 'show', 'main:' + name), b'Community guide\n')
         self.assertFalse(export.execute(config, True)['changed'])
+
+    def test_candidate_tests_never_inherit_the_live_opt_in(self):
+        (self.source / 'tests/test_fixture.py').write_text(
+            'import os, unittest\nclass Test(unittest.TestCase):\n'
+            ' def test_offline(self): self.assertNotIn("RUN_CLAUDE_LIVE", os.environ)\n')
+        self.commit()
+        with patch.dict(export.os.environ, {'RUN_CLAUDE_LIVE': '1'}):
+            self.assertTrue(export.execute(self.config, True)['changed'])
+        self.assertIn(b'OK', (self.root / 'state/candidate-tests.log').read_bytes())
 
     def test_failed_tests_do_not_publish(self):
         export.execute(self.config, True)

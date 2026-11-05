@@ -83,35 +83,44 @@ if (root / 'fail-evidence').exists(): sys.exit(1)
 state = pathlib.Path(sys.argv[sys.argv.index('--config') + 1]).parent
 (state / 'evidence-status.json').write_text(json.dumps({'finished_at': datetime.now(timezone.utc).isoformat(), 'success': True, 'counts': {'pending': 1 if (root / 'evidence-backlog').exists() else 0}}))
 ''')
-        self.codex = self.root / 'codex'
-        self.codex.write_text(f'''#!{sys.executable}
-import pathlib, sys
-generation = 'renamed' if pathlib.Path({str(self.root / 'renamed')!r}).exists() else 'current'
-command = 'run' if generation == 'renamed' else 'exec'
-json_flag = '--experimental-json' if generation == 'renamed' else '--json'
-output_flag = '--output-last-message' if generation == 'renamed' else '-o'
+        (self.root / 'bin').mkdir()
+        self.claude = self.root / 'bin/claude'
+        self.calls = self.root / 'claude-calls.jsonl'
+        self.claude.write_text(f'''#!{sys.executable}
+import json, os, pathlib, sys
+root = pathlib.Path({str(self.root)!r})
+def record(**fields):
+    with (root / 'claude-calls.jsonl').open('a') as stream:
+        stream.write(json.dumps(dict(fields, argv=sys.argv[1:], cwd=os.getcwd(), env=dict(os.environ))) + '\\n')
 if sys.argv[1:] == ['--help']:
-    print('Commands:\\n  ' + command + '  Run Codex non-interactively')
+    record(kind='help')
+    missing = root / 'missing-flag'
+    flags = [flag for flag in ('--print', '--no-session-persistence', '--model', '--effort', '--permission-mode',
+                               '--output-format', '--verbose', '--json-schema', '--tools')
+             if not missing.exists() or flag != missing.read_text()]
+    print('Usage: claude [options] [prompt]\\n\\nOptions:\\n' + '\\n'.join('  ' + flag + ' <value>  Fixture option' for flag in flags))
     sys.exit(0)
-if sys.argv[1:] == [command, '--help']:
-    print('Options:\\n      --ephemeral\\n          Run without persisting session files\\n  -C, --cd <DIR>\\n          Set the working root\\n  -m, --model <MODEL>\\n          Model the agent should use\\n  -c, --config <key=value>\\n          Override a configuration value\\n  -s, --sandbox <MODE>\\n          Sandbox policy for model-generated commands\\n          read-only | workspace-write | danger-full-access\\n      ' + json_flag + '\\n          Print events as JSONL\\n  ' + output_flag + ' <FILE>\\n          File where the last message should be written')
-    sys.exit(0)
-assert sys.stdin.read() == 'Review evidence only.'
-assert '--ephemeral' in sys.argv and sys.argv[-1] == '-'
-assert sys.argv[1] == command and json_flag in sys.argv
-assert sys.argv[sys.argv.index('--sandbox') + 1] == 'danger-full-access'
-assert 'approval_policy="never"' in sys.argv and 'model_reasoning_effort="xhigh"' in sys.argv
-with pathlib.Path({str(self.trace)!r}).open('a') as stream: stream.write('codex\\n')
-if pathlib.Path({str(self.root / 'fail-review')!r}).exists(): sys.exit(1)
-if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
-    pathlib.Path(sys.argv[sys.argv.index(output_flag) + 1]).write_text('Verified review report.')
+record(kind='review', stdin=sys.stdin.read())
+with pathlib.Path({str(self.trace)!r}).open('a') as stream: stream.write('claude\\n')
+def emit(event): print(json.dumps(event), flush=True)
+emit({{'type': 'system', 'subtype': 'init', 'session_id': 'fixture'}})
+if (root / 'long-stream').exists():
+    for _ in range(300):
+        emit({{'type': 'assistant', 'message': {{'content': [{{'type': 'text', 'text': 'x' * 5000}}]}}}})
+if (root / 'fail-review').exists():
+    print('review crashed', file=sys.stderr)
+    sys.exit(1)
+if (root / 'error-result').exists():
+    emit({{'type': 'result', 'subtype': 'error_during_execution', 'is_error': True, 'result': 'Partial notes.'}})
+elif not (root / 'missing-report').exists():
+    emit({{'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'Verified review report.'}})
 ''')
-        self.codex.chmod(0o755)
+        self.claude.chmod(0o755)
         self.config = self.state / 'config.json'
         self.config.write_text(json.dumps({'repo_path': str(self.repo), 'host_id': 'maintainer-host',
             'install_root': str(self.root / 'install'),
-            'python_path': sys.executable, 'uv_path': sys.executable, 'codex_path': str(self.codex),
-            'validator_path': sys.executable, 'role': 'maintainer'}))
+            'python_path': sys.executable, 'uv_path': sys.executable, 'claude_path': str(self.claude),
+            'role': 'maintainer'}))
         for command in (['init', '-b', 'main'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'fixture']):
             subprocess.run(['git', '-C', str(self.repo), *command], check=True, capture_output=True)
         self.args = argparse.Namespace(command='weekly', config=self.config, check=False, run_now=False)
@@ -319,7 +328,7 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
         self.initialize()
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
-        self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'collect', 'codex', 'publish', 'deploy'])
+        self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'collect', 'claude', 'publish', 'deploy'])
         status = json.loads((self.state / 'weekly-status.json').read_text())
         self.assertEqual(status['stages'], {name: {'success': True} for name in
                          ('capture', 'evidence', 'upload', 'collect', 'review', 'publish', 'deploy')})
@@ -337,67 +346,131 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
         self.assertEqual(self.trace.read_text().splitlines()[-1], 'publish')
         self.assertFalse(json.loads((self.state / 'weekly-status.json').read_text())['success'])
 
-    def test_cli_upgrade_changes_commands_and_aliases_without_changing_review_permissions(self):
+    def calls_of(self, kind):
+        lines = self.calls.read_text().splitlines() if self.calls.exists() else []
+        return [call for call in map(json.loads, lines) if call['kind'] == kind]
+
+    def test_review_runs_claude_with_full_access_and_publishes_result(self):
         self.initialize()
-        (self.root / 'renamed').touch()
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
-        self.assertEqual(jobs.execute(self.args, tuesday), 0)
-        self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'collect', 'codex', 'publish', 'deploy'])
+        with patch.dict(os.environ, {'CLAUDECODE': '1', 'CLAUDE_CODE_ENTRYPOINT': 'cli'}):
+            self.assertEqual(jobs.execute(self.args, tuesday), 0)
+        self.assertEqual(self.trace.read_text().splitlines(),
+                         ['capture', 'evidence', 'upload', 'collect', 'claude', 'publish', 'deploy'])
+        [help_call] = self.calls_of('help')
+        self.assertEqual(help_call['env']['LC_ALL'], 'C')
+        [call] = self.calls_of('review')
+        argv = call['argv']
+        self.assertEqual(call['stdin'], 'Review evidence only.')
+        self.assertIn('--print', argv)
+        self.assertIn('--no-session-persistence', argv)
+        self.assertEqual(argv[argv.index('--permission-mode') + 1], 'bypassPermissions')
+        self.assertEqual(argv[argv.index('--model') + 1], 'claude-opus-5-5')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'xhigh')
+        self.assertEqual(argv[argv.index('--output-format') + 1], 'stream-json')
+        self.assertNotIn('--setting-sources', argv)
+        self.assertEqual(os.path.realpath(call['cwd']), os.path.realpath(self.repo))
+        self.assertNotIn('CLAUDECODE', call['env'])
+        self.assertNotIn('CLAUDE_CODE_ENTRYPOINT', call['env'])
+        self.assertEqual(call['env']['CLAUDE_CODE_DISABLE_AUTO_MEMORY'], '1')
+        self.assertEqual(call['env']['PATH'].split(os.pathsep)[2], str(self.claude.parent))
         self.assertEqual((self.state / 'latest-weekly-report.md').read_text(), 'Verified review report.')
+        log = (self.state / 'weekly.log').read_text()
+        self.assertIn('"subtype": "init"', log)
+        self.assertIn('"result": "Verified review report."', log)
+        self.assertEqual(list(self.state.glob('.weekly-review-*')), [])
         self.assertIn('completed_due', self.state_data())
+
+    def test_review_keeps_investigation_environment_and_checkout(self):
+        work = self.root / 'work'
+        work.mkdir()
+        env = dict(os.environ, SKILL_INVESTIGATION_CYCLE='/cycle', SKILL_INVESTIGATION_CONFIG='/config',
+                   CLAUDECODE='1')
+        with (self.root / 'review.log').open('a') as log:
+            jobs.review(self.claude, work, self.state, 'Review evidence only.', log, env, 30)
+        [call] = self.calls_of('review')
+        self.assertEqual(os.path.realpath(call['cwd']), os.path.realpath(work))
+        self.assertEqual(call['env']['SKILL_INVESTIGATION_CYCLE'], '/cycle')
+        self.assertEqual(call['env']['SKILL_INVESTIGATION_CONFIG'], '/config')
+        self.assertNotIn('CLAUDECODE', call['env'])
+        self.assertEqual((self.state / 'latest-weekly-report.md').read_text(), 'Verified review report.')
+
+    def test_long_event_stream_still_yields_final_report(self):
+        (self.root / 'long-stream').touch()
+        with (self.root / 'review.log').open('a') as log:
+            jobs.review(self.claude, self.repo, self.state, 'Review evidence only.', log, dict(os.environ), 30)
+        self.assertGreater((self.root / 'review.log').stat().st_size, 1000000)
+        self.assertEqual((self.state / 'latest-weekly-report.md').read_text(), 'Verified review report.')
 
     def test_missing_report_or_review_failure_preserves_previous_report_and_due(self):
         self.initialize()
         report = self.state / 'latest-weekly-report.md'
         report.write_text('Previous successful report.')
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
-        for marker in ('missing-report', 'fail-review'):
+        for marker in ('missing-report', 'error-result', 'fail-review'):
             with self.subTest(marker=marker):
                 (self.root / marker).touch()
                 self.assertEqual(jobs.execute(self.args, tuesday), 1)
                 self.assertEqual(report.read_text(), 'Previous successful report.')
                 self.assertNotIn('completed_due', self.state_data())
+                self.assertEqual(self.trace.read_text().splitlines()[-1], 'claude')
                 self.assertNotIn('publish', self.trace.read_text().splitlines())
+                self.assertIn('"subtype": "init"', (self.state / 'weekly.log').read_text())
+                self.assertEqual(list(self.state.glob('.weekly-review-*')), [])
                 (self.root / marker).unlink()
                 self.trace.unlink()
 
-    def test_missing_required_control_blocks_review_and_publication(self):
+    def test_missing_required_flag_blocks_review_and_publication(self):
         self.initialize()
+        report = self.state / 'latest-weekly-report.md'
+        report.write_text('Previous successful report.')
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
-        with patch.object(jobs, 'help_flag', side_effect=RuntimeError('Capture CLI required control is unavailable')):
-            self.assertEqual(jobs.execute(self.args, tuesday), 1)
-        self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'collect'])
-        self.assertNotIn('completed_due', self.state_data())
-        self.assertIn('CLI adaptation failed', json.loads((self.state / 'weekly-status.json').read_text())['error'])
+        for flag in jobs.claude_cli.REVIEW_FLAGS:
+            with self.subTest(flag=flag):
+                (self.root / 'missing-flag').write_text(flag)
+                self.assertEqual(jobs.execute(self.args, tuesday), 1)
+                self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'collect'])
+                self.assertEqual(self.calls_of('review'), [])
+                self.assertEqual(report.read_text(), 'Previous successful report.')
+                self.assertNotIn('completed_due', self.state_data())
+                self.assertIn('CLI adaptation failed', json.loads((self.state / 'weekly-status.json').read_text())['error'])
+                self.trace.unlink()
 
-    def test_review_uses_advertised_reasoning_and_approval_controls(self):
-        options = '''Options:
-      --ephemeral
-          Run without persisting session files
-  -C, --cd <DIR>
-          Set the working root
-  -m, --model <MODEL>
-          Model the agent should use
-      --sandbox <MODE>
-          Sandbox policy for model-generated commands: danger-full-access
-      --events
-          Print events as JSONL
-      --report <FILE>
-          File where the last message should be written
-      --reasoning-effort <LEVEL>
-          Set reasoning effort
-      --ask-for-approval <POLICY>
-          Configure when human approval is needed
-'''
-        with patch.object(jobs, 'cli_text', side_effect=['Commands:\n  run  Run Codex non-interactively', options]):
-            command = jobs.review_command(str(self.codex), self.repo, self.state / 'report')
-        self.assertEqual(command[1], 'run')
-        self.assertIn('--events', command)
-        self.assertIn('--report', command)
-        self.assertEqual(command[command.index('--reasoning-effort') + 1], 'xhigh')
-        self.assertEqual(command[command.index('--ask-for-approval') + 1], 'never')
-        self.assertNotIn('model_reasoning_effort="xhigh"', command)
-        self.assertNotIn('approval_policy="never"', command)
+    def test_legacy_codex_keys_are_ignored_and_claude_path_is_optional(self):
+        config = json.loads(self.config.read_text())
+        config.update(codex_path=str(self.root / 'removed-codex'), validator_path=str(self.root / 'removed-validator'))
+        self.config.write_text(json.dumps(config))
+        self.args.check = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(jobs.execute(self.args), 0)
+            del config['claude_path']
+            self.config.write_text(json.dumps(config))
+            with patch.object(jobs.claude_cli, 'DEFAULT_CLI', self.claude):
+                self.assertEqual(jobs.execute(self.args), 0)
+            with patch.object(jobs.claude_cli, 'DEFAULT_CLI', self.root / 'missing-claude'), \
+                    self.assertRaisesRegex(ValueError, 'claude_path'):
+                jobs.execute(self.args)
+            for invalid in ('', None, 3):
+                with self.subTest(claude_path=invalid):
+                    self.config.write_text(json.dumps(dict(config, claude_path=invalid)))
+                    with self.assertRaisesRegex(ValueError, 'invalid host configuration'):
+                        jobs.execute(self.args)
+
+    def test_sync_steps_use_the_repository_validator_default(self):
+        self.args.command = 'sync'
+        commands = []
+        def recorded(command, *args, **kwargs):
+            commands.append(command)
+            stage = Path(command[1]).stem
+            if stage in ('capture', 'evidence'):
+                (self.state / (stage + '-status.json')).write_text(json.dumps({
+                    'finished_at': datetime.now(timezone.utc).isoformat(),
+                    'success': True, 'counts': {'pending': 0}}))
+        with patch.object(jobs, 'run', side_effect=recorded):
+            self.assertEqual(jobs.execute(self.args), 0)
+        sync_commands = [command for command in commands if command[1].endswith('/sync.py')]
+        self.assertEqual([command[2] for command in sync_commands], ['upload', 'deploy'])
+        self.assertTrue(all('--validator' not in command for command in sync_commands))
 
     def test_dirty_or_non_main_checkout_blocks_review_and_publication(self):
         self.initialize()
@@ -497,7 +570,7 @@ if not pathlib.Path({str(self.root / 'missing-report')!r}).exists():
         self.assertIn('backlog remains', json.loads((self.state / 'weekly-status.json').read_text())['error'])
         (self.root / 'backlog').unlink()
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
-        self.assertEqual(self.trace.read_text().splitlines()[-7:], ['capture', 'evidence', 'upload', 'collect', 'codex', 'publish', 'deploy'])
+        self.assertEqual(self.trace.read_text().splitlines()[-7:], ['capture', 'evidence', 'upload', 'collect', 'claude', 'publish', 'deploy'])
         self.assertIn('completed_due', self.state_data())
 
     def test_source_failure_or_backlog_defers_weekly_but_preserves_transport(self):

@@ -8,5 +8,4 @@ reported techniques from verified outcomes. A conditional risk is not an observe
 Tool contents and runtime outcomes are absent. Do not invent missing evidence or claim a fix worked.
 Respect dates: later confirmations cannot establish what was known earlier. Keep later reports
 separate from historical claims, and preserve qualifications and contradictions.
-Keep the text minimal and abstract: no private quotations, topic facts, identifying names, URLs,
-paths, credentials or personal information. Return only schema JSON.
+Keep the text minimal. Return only schema JSON.

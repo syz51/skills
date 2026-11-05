@@ -10,7 +10,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
-from activation_trace import SOURCE_SHA256, node_read_observations, score_trace
+from activation_trace import SOURCE_SHA256, node_read_observations, score_claude_trace, score_trace
 from read_guidance import PROTOCOL
 
 
@@ -863,3 +863,213 @@ class ActivationTraceTests(unittest.TestCase):
         for identity in ({'unhashable': True}, [], False, ''):
             with self.subTest(identity=identity):
                 self.assertFalse(self.score(trace(command('cat ' + TS, id=identity)))['passed'])
+
+
+CLAUDE_SAMPLE = Path(__file__).parent / 'fixtures/skill_activation/claude_candidate_trace.jsonl'
+SAMPLE_SKILL = ('---\nname: typescript\ndescription: Use for any TypeScript review, implementation or tooling work, including .ts files.\n---\n'
+                '# TypeScript sample guidance\nMarker line: TS-BODY-7731.\n'
+                'For tooling questions, read references/tooling.md completely before answering.\n')
+SAMPLE_BODY = SAMPLE_SKILL.split('---\n', 2)[2]
+SAMPLE_REFERENCE = '# Tooling reference\nMarker: TS-REF-4410.\nLine three.\nLine four.\n'
+SKILL_DIR = '/fixture/.claude/skills/typescript'
+UI_DIR = '/fixture/.claude/skills/frontend-ui'
+REFERENCE = SKILL_DIR + '/references/tooling.md'
+
+
+class ClaudeStream:
+    """Builds Claude Code stream-json in the shapes a live session emits."""
+
+    def __init__(self):
+        self.events, self.count = [{'type': 'system', 'subtype': 'init', 'tools': ['Read', 'Skill'], 'skills': []}], 0
+
+    def use(self, name, arguments, *more):
+        blocks = []
+        for tool, values in ((name, arguments), *zip(more[::2], more[1::2])):
+            self.count += 1
+            blocks.append({'type': 'tool_use', 'id': 'toolu_' + str(self.count), 'name': tool, 'input': values})
+        self.events.append({'type': 'assistant', 'message': {'role': 'assistant', 'content': blocks}, 'parent_tool_use_id': None})
+        return [block['id'] for block in blocks] if more else blocks[0]['id']
+
+    def result(self, identity, text, data=None, error=False):
+        block = {'type': 'tool_result', 'tool_use_id': identity, 'content': text, **({'is_error': True} if error else {})}
+        event = {'type': 'user', 'message': {'role': 'user', 'content': [block]}, 'parent_tool_use_id': None}
+        if data is not None:
+            event['tool_use_result'] = data
+        self.events.append(event)
+
+    def skill(self, name, base, body, args=None):
+        identity = self.use('Skill', {'skill': name, **({'args': args} if args else {})})
+        self.result(identity, 'Launching skill: ' + name, {'success': True, 'commandName': name})
+        return self.inject(base, body + ('\n\nARGUMENTS: ' + args if args else ''))
+
+    def inject(self, base, body):
+        self.events.append({'type': 'user', 'message': {'role': 'user', 'content': [
+            {'type': 'text', 'text': 'Base directory for this skill: ' + base + '\n\n' + body}]},
+            'parent_tool_use_id': None, 'isSynthetic': True})
+        return self
+
+    def read(self, path, content, start=1, count=None, requested=None):
+        lines = content.split('\n')
+        count = len(lines) if count is None else count
+        text = '\n'.join(lines[start - 1:start - 1 + count])
+        numbered = '\n'.join(f'{start + i}\t{line}' for i, line in enumerate(text.split('\n')))
+        partial = {'offset': start, 'limit': count} if count != len(lines) else {}
+        identity = self.use('Read', {'file_path': requested or path, **partial})
+        self.result(identity, numbered, {'type': 'text', 'file': {'filePath': path, 'content': text, 'numLines': count,
+                                                                 'startLine': start, 'totalLines': len(lines)}})
+        return self
+
+    def denied(self, path):
+        self.result(self.use('Read', {'file_path': path}),
+                    "Permission to use Read has been denied because Claude Code is running in don't ask mode.",
+                    'Error: permission denied', error=True)
+        return self
+
+    def say(self, text):
+        self.events.append({'type': 'assistant', 'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': text}]},
+                            'parent_tool_use_id': None})
+        return self
+
+    def done(self, subtype='success', error=False):
+        self.events.append({'type': 'result', 'subtype': subtype, 'is_error': error})
+        return '\n'.join(json.dumps(event, ensure_ascii=False) for event in self.events)
+
+
+class ClaudeTraceTests(unittest.TestCase):
+    def setUp(self):
+        self.targets = {'typescript': {'path': '/skills/typescript/SKILL.md', 'content': SAMPLE_SKILL,
+                                       'aliases': [SKILL_DIR + '/SKILL.md']},
+                        'typescript/tooling': {'path': '/skills/typescript/references/tooling.md',
+                                               'content': SAMPLE_REFERENCE, 'aliases': [REFERENCE]},
+                        'frontend-ui': {'path': UI_DIR + '/SKILL.md', 'content': '---\nname: frontend-ui\n---\n\n' + UI_CONTENT}}
+
+    def score(self, value, required=('typescript',), forbidden=(), before=()):
+        return score_claude_trace(value, self.targets, required, forbidden, before)
+
+    def test_live_sample_skill_injection_and_full_read_pass(self):
+        # Sanitized from a live candidate-mode session: Skill with arguments,
+        # failed reads of a wrong path, a full Read and a two-line Read.
+        sample = CLAUDE_SAMPLE.read_text()
+        result = self.score(sample, ('typescript', 'typescript/tooling'), before=[['typescript', 'typescript/tooling']])
+        self.assertTrue(result['passed'], result)
+        self.assertEqual([(r['target'], r['coverage']) for r in result['reads']],
+                         [('typescript', 'complete'), ('typescript/tooling', 'complete'), ('typescript/tooling', 'partial')])
+        self.assertEqual(result['reads'][0]['sha256'], hashlib.sha256(SAMPLE_BODY.encode()).hexdigest())
+        negative = self.score(sample, ('typescript',), ('typescript/tooling',))
+        self.assertIn('Forbidden guidance was read: typescript/tooling', negative['failures'])
+
+    def test_skill_injection_requires_the_snapshot_body_after_frontmatter(self):
+        for injected, args, passed in ((SAMPLE_BODY, None, True), (SAMPLE_BODY, 'review parser.ts', True),
+                                       (SAMPLE_BODY[:-1], None, False), (SAMPLE_BODY + 'Extra.\n', None, False),
+                                       (SAMPLE_SKILL, None, False)):
+            with self.subTest(injected=injected, args=args):
+                value = ClaudeStream().skill('typescript', SKILL_DIR, injected, args).done()
+                self.assertEqual(self.score(value)['passed'], passed)
+        # Observed injections drop the blank line after the frontmatter.
+        loaded = ClaudeStream().skill('frontend-ui', UI_DIR, UI_CONTENT).done()
+        self.assertTrue(self.score(loaded, ('frontend-ui',))['passed'])
+
+    def test_skill_injection_needs_its_successful_skill_call_and_directory(self):
+        orphan = ClaudeStream().inject(SKILL_DIR, SAMPLE_BODY).done()
+        elsewhere = ClaudeStream().skill('typescript', '/home/user/.claude/skills/typescript', SAMPLE_BODY).done()
+        stream = ClaudeStream()
+        stream.result(stream.use('Skill', {'skill': 'typescript'}), 'Unknown skill: typescript', error=True)
+        failed = stream.inject(SKILL_DIR, SAMPLE_BODY).done()
+        for value in (orphan, elsewhere, failed):
+            with self.subTest(value=value[-200:]):
+                self.assertFalse(self.score(value)['passed'])
+                self.assertFalse(self.score(value, (), ('typescript',))['passed'])
+
+    def test_full_read_passes_and_partial_reads_need_complete_coverage(self):
+        path = SKILL_DIR + '/SKILL.md'
+        self.assertTrue(self.score(ClaudeStream().read(path, SAMPLE_SKILL).done())['passed'])
+        partial = self.score(ClaudeStream().read(path, SAMPLE_SKILL, count=3).done())
+        self.assertFalse(partial['passed'])
+        self.assertEqual(partial['reads'][0]['coverage'], 'partial')
+        tiled = ClaudeStream().read(path, SAMPLE_SKILL, count=3).read(path, SAMPLE_SKILL, start=4, count=5).done()
+        self.assertTrue(self.score(tiled)['passed'])
+        gap = ClaudeStream().read(path, SAMPLE_SKILL, count=3).read(path, SAMPLE_SKILL, start=5, count=4).done()
+        self.assertFalse(self.score(gap)['passed'])
+
+    def test_read_evidence_is_the_raw_structured_content_only(self):
+        path = SKILL_DIR + '/SKILL.md'
+        mismatch = ClaudeStream().read(path, SAMPLE_SKILL.replace('7731', '0000')).done()
+        stream = ClaudeStream()
+        stream.result(stream.use('Read', {'file_path': path}),
+                      '\n'.join(f'{i + 1}\t{line}' for i, line in enumerate(SAMPLE_SKILL.split('\n'))))
+        text_only = stream.done()
+        redirected = ClaudeStream().read(path, SAMPLE_SKILL, requested='/fixture/other.md').done()
+        for value in (mismatch, text_only, redirected):
+            with self.subTest(value=value[-120:]):
+                self.assertFalse(self.score(value)['passed'])
+
+    def test_multiple_results_in_one_event_are_not_split(self):
+        stream = ClaudeStream()
+        first, second = stream.use('Read', {'file_path': SKILL_DIR + '/SKILL.md'}, 'Read', {'file_path': '/fixture/a.ts'})
+        file = {'filePath': SKILL_DIR + '/SKILL.md', 'content': SAMPLE_SKILL, 'numLines': 6, 'startLine': 1, 'totalLines': 6}
+        stream.events.append({'type': 'user', 'parent_tool_use_id': None, 'tool_use_result': {'type': 'text', 'file': file},
+                              'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': first, 'content': 'x'},
+                                                                      {'type': 'tool_result', 'tool_use_id': second, 'content': 'y'}]}})
+        self.assertFalse(self.score(stream.done())['passed'])
+
+    def test_forbidden_reads_and_attempts_fail(self):
+        read = ClaudeStream().read(REFERENCE, SAMPLE_REFERENCE).done()
+        self.assertIn('Forbidden guidance was read: typescript/tooling', self.score(read, (), ('typescript/tooling',))['failures'])
+        for value in (ClaudeStream().denied(REFERENCE).done(),
+                      ClaudeStream().read(REFERENCE, SAMPLE_REFERENCE, count=1).done()):
+            with self.subTest(value=value[-120:]):
+                self.assertFalse(self.score(value, (), ('typescript/tooling',))['passed'])
+        stream = ClaudeStream()
+        stream.result(stream.use('Skill', {'skill': 'typescript'}), 'Launching skill: typescript',
+                      {'success': True, 'commandName': 'typescript'})
+        self.assertIn('Unverified forbidden read attempt: typescript', self.score(stream.done(), (), ('typescript',))['failures'])
+        unrelated = ClaudeStream().read('/fixture/parser.ts', 'export const x = 1;\n').denied('/fixture/missing.ts').done()
+        self.assertTrue(self.score(unrelated, (), ('typescript', 'typescript/tooling'))['passed'])
+
+    def test_other_tools_and_subagents_leave_forbidden_guidance_unverified(self):
+        stream = ClaudeStream()
+        stream.result(stream.use('Bash', {'command': 'cat ' + REFERENCE}), SAMPLE_REFERENCE)
+        relative = ClaudeStream().denied('.claude/skills/typescript/references/tooling.md').done()
+        self.assertTrue(self.score(ClaudeStream().denied('src/parser.ts').done(), (), ('typescript/tooling',))['passed'])
+        self.assertFalse(self.score(ClaudeStream().denied('../outside.md').done(), (), ('typescript/tooling',))['passed'])
+        relative_read = ClaudeStream().read('.claude/skills/typescript/references/tooling.md', SAMPLE_REFERENCE).done()
+        self.assertFalse(self.score(relative_read, ('typescript/tooling',))['passed'])
+        child = ClaudeStream().read('/fixture/parser.ts', 'x\n')
+        child.events[-1]['parent_tool_use_id'] = 'toolu_task'
+        for value in (stream.done(), relative, child.done()):
+            with self.subTest(value=value[-120:]):
+                self.assertFalse(self.score(value, (), ('typescript/tooling',))['passed'])
+
+    def test_prose_is_not_evidence(self):
+        for text in ('I loaded the typescript skill.', SAMPLE_SKILL, 'Read ' + SKILL_DIR + '/SKILL.md'):
+            with self.subTest(text=text):
+                result = self.score(ClaudeStream().say(text).done())
+                self.assertFalse(result['passed'])
+                self.assertEqual(result['reads'], [])
+                self.assertTrue(self.score(ClaudeStream().say(text).done(), (), ('typescript',))['passed'])
+
+    def test_unsuccessful_or_missing_result_fails(self):
+        for subtype, error in (('error_during_execution', True), ('error_max_turns', True), ('success', True)):
+            with self.subTest(subtype=subtype):
+                result = self.score(ClaudeStream().skill('typescript', SKILL_DIR, SAMPLE_BODY).done(subtype, error))
+                self.assertFalse(result['passed'])
+                self.assertFalse(result['completed'])
+                self.assertIn('Claude session did not complete successfully', result['failures'])
+        unfinished = ClaudeStream().skill('typescript', SKILL_DIR, SAMPLE_BODY).done().rsplit('\n', 1)[0]
+        self.assertFalse(self.score(unfinished)['passed'])
+        self.assertIn('Malformed JSONL at line 2', self.score('{}\nnot json\n' + ClaudeStream().done())['failures'])
+
+    def test_ordering_counts_from_the_later_request(self):
+        pair = ('frontend-ui', 'typescript')
+        ordered = ClaudeStream().skill('frontend-ui', UI_DIR, UI_CONTENT).skill('typescript', SKILL_DIR, SAMPLE_BODY).done()
+        self.assertTrue(self.score(ordered, pair, before=[pair])['passed'])
+        backwards = ClaudeStream().skill('typescript', SKILL_DIR, SAMPLE_BODY).skill('frontend-ui', UI_DIR, UI_CONTENT).done()
+        self.assertFalse(self.score(backwards, pair, before=[pair])['passed'])
+        stream = ClaudeStream()
+        ui, ts = stream.use('Skill', {'skill': 'frontend-ui'}, 'Skill', {'skill': 'typescript'})
+        stream.result(ui, 'Launching skill: frontend-ui', {'success': True, 'commandName': 'frontend-ui'})
+        stream.inject(UI_DIR, UI_CONTENT)
+        stream.result(ts, 'Launching skill: typescript', {'success': True, 'commandName': 'typescript'})
+        stream.inject(SKILL_DIR, SAMPLE_BODY)
+        concurrent = self.score(stream.done(), pair, before=[pair])
+        self.assertIn('Read order not established: frontend-ui before typescript', concurrent['failures'])

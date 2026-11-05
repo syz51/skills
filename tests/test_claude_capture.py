@@ -96,6 +96,12 @@ class ClaudeCaptureTests(unittest.TestCase):
         self.assertNotIn('filter', turn)
         self.assertEqual(turn['evidence_id'], hashlib.sha256((SESSION + ':prompt-1').encode()).hexdigest())
 
+    def test_message_text_is_kept_verbatim(self):
+        prompt = 'Find a skill; mail a@example.com, see https://example.com/x and /home/alice/notes, token=abc123'
+        reply = 'Found one for Bearer abc.def at /home/alice/notes.'
+        [turn] = self.scan(ClaudeTranscript().prompt(prompt).skill().reply(reply))
+        self.assertEqual([m['text'] for m in turn['messages'] if m['role'] != 'tool'], [prompt, reply])
+
     def test_slash_command_load_is_recognized(self):
         transcript = ClaudeTranscript().prompt('<command-message>find-skills</command-message>\n<command-name>/find-skills</command-name>\n<command-args>changelog</command-args>')
         transcript.add('user', [{'type': 'text', 'text': 'Base directory for this skill: /x/find-skills\n\n' + GUIDANCE}], promptId='prompt-1', isMeta=True)
@@ -320,7 +326,7 @@ class ClaudeCaptureTests(unittest.TestCase):
         (sessions / 'rollout.jsonl').write_text(''.join(json.dumps(record) + '\n' for record in codex))
         config = {'sessions_root': str(sessions), 'archived_sessions_root': str(self.root / 'archive'),
                   'feedback_dir': str(feedback), 'install_root': str(self.root / 'install'),
-                  'codex_path': '/bin/false', 'claude_projects_root': str(self.projects)}
+                  'claude_path': '/bin/false', 'claude_projects_root': str(self.projects)}
         def lessons(config, state_root, turn, existing, *, deadline=None):
             return [{'skill': turn['verified_skills'][0], **{field: 'Verified useful check' for field in capture.FIELDS}}]
         with patch.object(capture, 'extract', side_effect=lessons) as extract:

@@ -207,6 +207,18 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'predecessor'):
             evidence.assessment_inventory(self.feedback)
 
+    def test_claude_invocation_source_is_part_of_the_checker_fingerprint(self):
+        baseline = evidence.checker_fingerprint(self.config)
+        cli_path = Path(evidence.claude_cli.__file__)
+        real_read = Path.read_bytes
+        def drift(path):
+            return real_read(path) + b'\n# changed model\n' if path == cli_path else real_read(path)
+        with patch.object(Path, 'read_bytes', drift):
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                evidence.checker_fingerprint(self.config)
+            with patch.object(evidence.claude_cli, 'SOURCE_SHA256', evidence.hashlib.sha256(drift(cli_path)).hexdigest()):
+                self.assertNotEqual(evidence.checker_fingerprint(self.config), baseline)
+
     def test_reader_dependency_fingerprint_drift_and_receipt_invalidation(self):
         baseline = evidence.checker_fingerprint(self.config)
         original_path = Path(evidence.read_guidance.__file__)
@@ -364,15 +376,18 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(set(scanner.call_args.args[0]), {canonical.resolve() / name / 'source.jsonl' for name in ('sessions', 'archived_sessions')})
         self.assertEqual(len(list((canonical / 'skill-feedback/frontend-ui/verifications').glob('*.json'))), 1)
 
-    def test_unsupported_feedback_is_preserved_and_private_summary_is_rejected(self):
+    def test_unsupported_feedback_is_preserved_and_invalid_summary_is_rejected(self):
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',
                 side_effect=[{'status': 'unsupported', 'summary': 'The stated correction does not match the original request.'}, {'notes': []}]):
             evidence.verify(self.config, self.root)
         value = json.loads(next(self.feedback.rglob('*.json')).read_text())
         self.assertEqual(value['status'], 'unsupported')
-        with patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': 'https://private.example/source'}):
-            with self.assertRaises(ValueError):
-                evidence.verify_note(self.config, self.root, self.path.read_text(), self.turn, 'frontend-ui')
+        for summary in ('First line\nsecond line', '', 'x' * 1001):
+            with self.subTest(summary=summary), patch.object(evidence, 'model_response',
+                                                             return_value={'status': 'supported', 'summary': summary}) as model:
+                with self.assertRaises(ValueError):
+                    evidence.verify_note(self.config, self.root, self.path.read_text(), self.turn, 'frontend-ui')
+            self.assertEqual(model.call_count, 1)
 
     def test_unverified_correction_is_not_published_or_retried_hourly(self):
         responses = [{'status': 'unsupported', 'summary': 'The observation misstates the reported result.'},
@@ -499,12 +514,69 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(value['supersedes'], hashlib.sha256(data).hexdigest())
 
     def test_correction_failures_preserve_history_and_fail_the_job(self):
-        for failure in (RuntimeError('Service unavailable'), {'notes': [{**self.correction, 'evidence': 'https://private.example/text'}]}):
-            with self.subTest(failure=failure), patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(
-                    evidence, 'model_response', side_effect=[{'status': 'partial', 'summary': 'The result is overstated.'}, failure]):
+        unsafe = {'notes': [{**self.correction, 'evidence': 'two\nlines'}]}
+        # A rejected correction is not retried; the job fails without a receipt.
+        for failures in ([RuntimeError('Service unavailable')], [unsafe]):
+            with self.subTest(failures=failures), patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(
+                    evidence, 'model_response', side_effect=[{'status': 'partial', 'summary': 'The result is overstated.'}, *failures]) as model:
                 result = evidence.verify(self.config, self.root)
             self.assertEqual(result['errors'], 1)
+            self.assertEqual(model.call_count, 1 + len(failures))
             self.assertEqual(list(self.feedback.rglob('*.json')), [])
+
+    def test_summary_reusing_source_wording_is_accepted_after_one_call(self):
+        turn = {**self.turn, 'messages': [*self.turn['messages'],
+                {'role': 'assistant', 'text': 'Claude Code moved the status indicator into a fixed slot on 2026-11-04.'}]}
+        summary = 'Claude Code moved the status indicator into a fixed slot on 2026-11-04, see https://example.com/a, token=abc123.'
+        with patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': summary}) as model:
+            result = evidence.verify_note(self.config, self.root, 'Abstract note', turn, 'frontend-ui')
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual(result['summary'], summary)
+        sent = model.call_args.args[3]
+        self.assertEqual(set(json.loads(sent)), {'note', 'original_turn'})
+        self.assertEqual(result['inputSha256'], hashlib.sha256(sent.encode()).hexdigest())
+
+    def test_correction_is_drafted_and_checked_with_one_call_each(self):
+        # Wording, names and URLs shared with the source no longer reject a correction.
+        candidate = {**self.correction, 'evidence': 'See https://example.com/text; Claude Code reported it on 2026-11-04.'}
+        responses = [{'status': 'partial', 'summary': 'The result is overstated.'}, {'notes': [candidate]},
+                     {'status': 'supported', 'summary': 'The revised note keeps attribution qualified.'}]
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=responses) as model:
+            result = evidence.verify(self.config, self.root)
+        self.assertEqual((result['errors'], result['corrected']), (0, 1))
+        self.assertEqual(model.call_count, 3)
+        generation, checked = (call.args[3] for call in model.call_args_list[1:])
+        self.assertIn(candidate['evidence'], json.loads(checked)['note'])
+        value = evidence.assessment_inventory(self.feedback)['latest'][0]
+        self.assertEqual(value['correction']['note'], candidate)
+        self.assertEqual(value['correction']['generationInputSha256'], hashlib.sha256(generation.encode()).hexdigest())
+        self.assertEqual(value['correction']['inputSha256'], hashlib.sha256(checked.encode()).hexdigest())
+
+    def test_invalid_summary_or_correction_fails_without_retry(self):
+        with patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': 'two\nlines'}) as model:
+            with self.assertRaises(ValueError):
+                evidence.verify_note(self.config, self.root, 'Abstract note', self.turn, 'frontend-ui')
+        self.assertEqual(model.call_count, 1)
+        with patch.object(evidence, 'model_response', return_value={'notes': [{**self.correction, 'cause': ''}]}) as model:
+            with self.assertRaises(ValueError):
+                evidence.correct_note(self.config, self.root, 'Abstract note', self.turn, 'frontend-ui',
+                                      {'status': 'partial', 'summary': 'The result is unverified.'})
+        self.assertEqual(model.call_count, 1)
+
+    def test_failures_are_not_retried(self):
+        for failure in ({'status': 'maybe', 'summary': 'The attribution holds.'}, evidence.ExtractorFailure('model schema rejected', {}),
+                        evidence.CaptureBudgetExpired('Budget exhausted')):
+            with self.subTest(failure=failure), patch.object(evidence, 'model_response', side_effect=[failure]) as model:
+                with self.assertRaises((ValueError, RuntimeError)) as caught:
+                    evidence.verify_note(self.config, self.root, 'Abstract note', self.turn, 'frontend-ui')
+            self.assertEqual(model.call_count, 1)
+            if isinstance(failure, Exception):
+                self.assertIs(caught.exception, failure)
+        with patch.object(evidence, 'model_response', side_effect=[{'notes': [{**self.correction, 'skill': 'rust'}]}]) as model:
+            with self.assertRaises(ValueError):
+                evidence.correct_note(self.config, self.root, 'Abstract note', self.turn, 'frontend-ui',
+                                      {'status': 'partial', 'summary': 'The result is unverified.'})
+        self.assertEqual(model.call_count, 1)
 
     def test_budget_exhaustion_during_correction_keeps_whole_assessment_pending(self):
         partial = {'status': 'partial', 'summary': 'The result remains a reported attribution.'}

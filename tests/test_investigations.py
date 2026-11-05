@@ -47,6 +47,18 @@ class InvestigationTests(unittest.TestCase):
             'evidence_scope': 'synthetic_behavior'}))
         return case
 
+    def test_summary_and_follow_up_may_name_urls_and_paths_but_stay_single_line(self):
+        base = {'schema_version': 1, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                'action': 'investigate', 'state': 'open', 'baseline_commit': 'c' * 40, 'change': None, 'experiments': [],
+                'cycle_id': 'd' * 64, 'recorded_at': '2026-11-04T00:00:00+00:00',
+                'summary': 'Compare https://example.com/a with /home/alice/project, token=abc123',
+                'follow_up': {'next_action': 'Rerun /tmp/case against https://example.com/a', 'next_due': '2026-11-09T00:00:00+00:00'}}
+        inv.validate_event(base)
+        for changes in ({'summary': 'two\nlines here'}, {'summary': 'short'},
+                        {'follow_up': {'next_action': 'Rerun\nthe case now', 'next_due': '2026-11-09T00:00:00+00:00'}}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                inv.validate_event({**base, **changes})
+
     def test_cycle_fingerprint_rejects_tampering(self):
         path = self.cycle(); data = inv.read(path); data['required'].append(self.binding); path.write_text(json.dumps(data))
         with self.assertRaisesRegex(ValueError, 'modified'): inv.validate_cycle(self.config, self.state, path)

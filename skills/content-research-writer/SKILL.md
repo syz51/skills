@@ -5,7 +5,7 @@ description: Research, draft, edit, and review articles, reports, newsletters, t
 
 # Content research writer
 
-For shell reads of this skill or its references, use `uv run --script ~/.local/share/codex-skills/repository/scripts/read_guidance.py <file>` when available, with one file per invocation and an output budget of at least 8000 tokens. The returned `content` is the guidance; follow `next_start` with `--start <offset>` when more is needed. This preserves the path, exact-content hash, and complete/excerpt status in the saved session. If the helper is unavailable, read each file separately with `cat` or a clearly bounded `sed -n` excerpt.
+Read this skill's references with the Read tool, one complete file per call. For a shell read, use `uv run --script ~/.local/share/codex-skills/repository/scripts/read_guidance.py <file>` when available, one file per invocation: the returned `content` is the guidance, and `next_start` with `--start <offset>` continues a partial read. Both record the path, exact-content hash, and complete or excerpt status in the saved session.
 
 ## Start with the requested task
 

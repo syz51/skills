@@ -19,6 +19,7 @@ from evidence import latest_receipt, parse_receipt
 from capture import SKILLS, codex_home
 
 HOSTS = ('client-host', 'maintainer-host')
+VALIDATOR = Path(__file__).resolve().with_name('validate_skill.py')
 
 class SyncError(Exception):
     pass
@@ -680,7 +681,7 @@ def main():
     parser.add_argument('--host-id', choices=HOSTS, default='client-host')
     parser.add_argument('--feedback-dir', type=Path, default=codex_home() / 'skill-feedback')
     parser.add_argument('--install-root', type=Path, default=Path.home() / '.local/share/codex-skills')
-    parser.add_argument('--validator', type=Path)
+    parser.add_argument('--validator', type=Path, default=VALIDATOR)
     parser.add_argument('--bootstrap', action='store_true', help='Allow initial skill population without prior reviews')
     args = parser.parse_args()
     try:

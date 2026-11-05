@@ -5,7 +5,7 @@ description: Design, build, polish, and review frontend/web interfaces and their
 
 # Frontend and UI
 
-For shell reads of this skill or its references, use `uv run --script ~/.local/share/codex-skills/repository/scripts/read_guidance.py <file>` when available, with one file per invocation and an output budget of at least 8000 tokens. The returned `content` is the guidance; follow `next_start` with `--start <offset>` when more is needed. This preserves the path, exact-content hash, and complete/excerpt status in the saved session. If the helper is unavailable, read each file separately with `cat` or a clearly bounded `sed -n` excerpt.
+Read this skill's references with the Read tool, one complete file per call. For a shell read, use `uv run --script ~/.local/share/codex-skills/repository/scripts/read_guidance.py <file>` when available, one file per invocation: the returned `content` is the guidance, and `next_start` with `--start <offset>` continues a partial read. Both record the path, exact-content hash, and complete or excerpt status in the saved session.
 
 ## Start from the task
 
@@ -37,7 +37,7 @@ For shell reads of this skill or its references, use `uv run --script ~/.local/s
 - Use content-driven layout with consistent alignment and spacing. Reflow for narrow screens rather than shrinking everything. Handle long labels, localization, empty content, and overflow.
 - Distinguish structure from elevation. Borders and dividers define boundaries; shadows can communicate depth on overlays and raised surfaces. Choose contrast, radius, and shadow strength within the product's system.
 - Align nested rounded shapes and asymmetric icons optically. Keep icon family, weight, size, and placement consistent. Avoid adding decoration that weakens hierarchy or usability.
-- Reuse suitable supplied or existing assets. Choose code-native geometry for controls, diagrams, and existing vector systems; use image search or image generation for appropriate imagery. Preserve provenance and verify factual subjects rather than inventing sources.
+- Reuse suitable supplied or existing assets. Choose code-native geometry for controls, diagrams, and existing vector systems; use image search, or image generation where the host provides it, for appropriate imagery. Preserve provenance and verify factual subjects rather than inventing sources.
 - Give images intrinsic dimensions or a stable aspect ratio, meaningful alternative text when informative, and suitable responsive sizing. Verify asset loading and copy project-bound assets into the project.
 - See [Polish details](references/polish.md) for targeted refinements. Use them when they improve the interface.
 
@@ -69,5 +69,5 @@ For shell reads of this skill or its references, use `uv run --script ~/.local/s
 ## Load only the relevant specialization
 
 - React, Next.js, TanStack Start/Router/Query, Vue, Nuxt, Pinia, VueUse, Vite, Vitest, VitePress, Slidev, Nitro, Turborepo, and tsdown: [Frameworks and tooling](references/frameworks.md).
-- UnoCSS, Sites, inline Visualize artifacts, image generation, and browser verification: [Platforms and styling](references/platforms.md).
+- UnoCSS, hosted pages and inline visuals, images, and browser verification: [Platforms and styling](references/platforms.md).
 - The former standalone frontend/framework skills are supporting references inside this skill. Their examples describe APIs, not mandatory scaffolding or visual policy. Keep plugin runtime/deployment documentation in its maintained plugin, resolve the current installed version, and preserve actual runtime/tool contracts. Use package-version-matched documentation; do not migrate a project merely to match a reference snapshot.

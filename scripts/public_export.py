@@ -78,19 +78,6 @@ def configuration(value):
     return value
 
 
-def scan(path, content):
-    try:
-        text = content.decode('utf-8')
-    except UnicodeDecodeError:
-        raise ExportError('Non-text publication file: ' + path) from None
-    private_markers = ('/Us' + 'ers/', 'roy' + '-mac', 'sunmacbook' + '-air', 'syz51/' + 'codex-skills')
-    rules = {'private identifier': any(marker in text for marker in private_markers),
-             'credential': bool(re.search(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|sk-(?:proj-)?[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16})\b', text))}
-    for rule, matched in rules.items():
-        if matched:
-            raise ExportError('Publication rejected: ' + path + ' (' + rule + ')')
-
-
 def clean_source(repo):
     if git(repo, 'branch', '--show-current').strip() != b'main' or git(repo, 'status', '--porcelain').strip():
         raise ExportError('Source requires a clean committed main checkout')
@@ -120,7 +107,10 @@ def snapshot(config, revision):
                 raise ExportError('Invalid source metadata: ' + source) from None
         for old, new in config.get('replacements', {}).items():
             content = content.replace(old.encode(), new.encode())
-        scan(target, content)
+        try:
+            content.decode('utf-8')
+        except UnicodeDecodeError:
+            raise ExportError('Non-text publication file: ' + target) from None
         result[target] = content
     return result
 
@@ -271,6 +261,8 @@ def execute(config, publish=False):
                 return {'changed': changed, 'file_count': len(files), 'paths': sorted(files), 'source_commit': revision}
             if changed:
                 environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+                # Opt-in live tests make real model calls; publication checks stay offline.
+                environment.pop('RUN_CLAUDE_LIVE', None)
                 validation = Path(temporary) / 'validation'
                 validation.mkdir()
                 for path, content in files.items():

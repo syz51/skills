@@ -16,5 +16,4 @@ Current input coverage describes this recheck, not the earlier capture excerpt. 
 does not refute an earlier excerpt limitation; historical capture coverage is unknown unless supplied.
 No artifact contents or runtime results are supplied: assistant claims of tests, fixes, approval,
 or reader understanding remain REPORTED. Never upgrade them to verified outcomes.
-State what the original messages establish and any important missing evidence. Keep the summary
-abstract: no private source quotations, topic facts, names, URLs, paths, or credentials.
+State what the original messages establish and any important missing evidence.

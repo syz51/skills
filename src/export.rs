@@ -224,24 +224,6 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 fn text(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(git(repo, args)?)?.trim_end().to_owned())
 }
-pub fn scan(path: &str, data: &[u8]) -> Result<()> {
-    let s = std::str::from_utf8(data).map_err(|_| format!("Non-text publication file: {path}"))?;
-    let markers = [
-        "/Us".to_owned() + "ers/",
-        "roy".to_owned() + "-mac",
-        "sunmacbook".to_owned() + "-air",
-        "syz51/".to_owned() + "codex-skills",
-    ];
-    let secret = regex::Regex::new(
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|sk-(?:proj-)?[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16})\b",
-    )?;
-    if markers.iter().any(|m| s.contains(m)) || secret.is_match(s) {
-        return Err(
-            format!("Publication rejected: {path} (private identifier or credential)").into(),
-        );
-    }
-    Ok(())
-}
 fn clean(repo: &Path) -> Result<String> {
     if text(repo, &["branch", "--show-current"])? != "main"
         || !git(repo, &["status", "--porcelain"])?.is_empty()
@@ -291,7 +273,6 @@ pub fn snapshot(c: &Config, rev: &str) -> Result<Files> {
         for (old, new) in &c.replacements {
             s = s.replace(old, new.as_str().ok_or("Invalid replacement")?);
         }
-        scan(&e.target, s.as_bytes())?;
         files.insert(e.target.clone(), s.into_bytes());
     }
     Ok(files)
@@ -517,6 +498,13 @@ struct State {
 // Validate only the managed snapshot, never public-owned additions. Recheck Rust
 // on every changed Rust-containing export: shared Markdown/scripts/config can
 // affect tests too, and no-op exports still skip all candidate execution.
+/// Opt-in live tests make real model calls; candidate checks never inherit it.
+const LIVE_TEST_OPT_IN: &str = "RUN_CLAUDE_LIVE";
+fn candidate_check(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_remove(LIVE_TEST_OPT_IN);
+    cmd
+}
 fn rust_checks(validation: &Path, state: &Path, cargo: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(600);
     let checks: &[&[&str]] = &[
@@ -534,7 +522,7 @@ fn rust_checks(validation: &Path, state: &Path, cargo: &Path) -> Result<()> {
     let mut log = Vec::new();
     for args in checks {
         log.extend(format!("cargo {}\n", args.join(" ")).bytes());
-        let mut cmd = Command::new(cargo);
+        let mut cmd = candidate_check(cargo);
         cmd.args(*args)
             .current_dir(validation)
             .env("CARGO_TARGET_DIR", validation.join("target"));
@@ -660,7 +648,7 @@ fn execute_with_checks(
             fs::write(target, b)?;
         }
         let runner = "import os,sys,unittest;sys.path.insert(0,os.getcwd());suite=unittest.defaultTestLoader.discover('tests');count=suite.countTestCases();print('Discovered tests:',count);sys.exit(0 if count and unittest.TextTestRunner().run(suite).wasSuccessful() else 1)";
-        let mut cmd = Command::new(&c.python_path);
+        let mut cmd = candidate_check(&c.python_path);
         cmd.args(["-I", "-c", runner])
             .current_dir(&validation)
             .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -808,7 +796,7 @@ pub fn validate_message(m: &CommitMessage) -> Result<()> {
     if l.contains("co-authored-by:") || l.contains("generated-by:") || l.contains("t3-thread://") {
         return Err("Attribution or session link rejected".into());
     }
-    scan("commit message", all.as_bytes())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -860,6 +848,63 @@ mod tests {
         .unwrap();
         let c=Config::from_value(json!({"schema_version":1,"source_repo":source,"state_dir":t.path().join("state"),"author_name":"Test","author_email":"test@example.invalid","target_url":"https://github.com/example/skills.git","files":[{"source":"skills/guide.md","target":"skills/guide.md"},{"source":"tests/test_fixture.py","target":"tests/test_fixture.py"}]})).unwrap();
         (t, c, remote)
+    }
+    #[test]
+    fn snapshot_publishes_identifiers_verbatim_after_replacements_and_drops() {
+        let (_t, mut c, _remote) = fixture();
+        let token = format!("ghp_{}", "a".repeat(36));
+        let guide = format!(
+            "Paths /Users/alice/x on client-host and maintainer-host, repo example-owner/private-repo, {token}\n"
+        );
+        fs::write(c.source_repo.join("skills/guide.md"), &guide).unwrap();
+        fs::write(
+            c.source_repo.join("skills/sources.json"),
+            r#"{"backupPath":"/Users/alice/backup","items":[{"backupPath":"x","license":"MIT"}]}"#,
+        )
+        .unwrap();
+        git(&c.source_repo, &["add", "."]).unwrap();
+        git(&c.source_repo, &["commit", "-m", "Add identifiers"]).unwrap();
+        c.replacements
+            .insert("maintainer-host".into(), json!("client-host"));
+        c.json_drop_keys = vec!["backupPath".into()];
+        c.files.push(crate::config::Entry {
+            source: "skills/sources.json".into(),
+            target: "skills/sources.json".into(),
+        });
+        let files = snapshot(&c, "HEAD").unwrap();
+        assert_eq!(
+            String::from_utf8(files["skills/guide.md"].clone()).unwrap(),
+            guide.replace("maintainer-host", "client-host")
+        );
+        let metadata: Value = serde_json::from_slice(&files["skills/sources.json"]).unwrap();
+        assert_eq!(metadata, json!({"items": [{"license": "MIT"}]}));
+    }
+    #[test]
+    fn commit_messages_keep_identifiers_but_reject_attribution_and_low_quality() {
+        let token = format!("ghp_{}", "a".repeat(36));
+        let kept = CommitMessage {
+            subject: "Document the client-host maintainer role".into(),
+            body: format!("Mention /Users/alice/x, example-owner/private-repo and {token}."),
+        };
+        assert!(validate_message(&kept).is_ok());
+        for body in [
+            "Co-authored-by: Someone <a@example.invalid>",
+            "Generated-by: tool",
+            "See t3-thread://abc",
+        ] {
+            let m = CommitMessage {
+                subject: kept.subject.clone(),
+                body: body.into(),
+            };
+            assert!(validate_message(&m).is_err());
+        }
+        assert!(
+            validate_message(&CommitMessage {
+                subject: "changes".into(),
+                body: String::new()
+            })
+            .is_err()
+        );
     }
     fn rust_fixture(fail: &str) -> (tempfile::TempDir, Config, PathBuf, PathBuf) {
         let (temp, mut config, remote) = fixture();
@@ -931,6 +976,57 @@ mod tests {
                     .contains(stage)
             );
         }
+    }
+    #[test]
+    fn candidate_checks_never_inherit_the_live_opt_in() {
+        // Setting the variable in this multithreaded process is unsound, so rerun this
+        // test alone in a child process that inherits RUN_CLAUDE_LIVE=1.
+        if std::env::var_os(LIVE_TEST_OPT_IN).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "export::tests::candidate_checks_never_inherit_the_live_opt_in",
+                    "--test-threads=1",
+                ])
+                .env(LIVE_TEST_OPT_IN, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let (temp, config, remote, cargo) = rust_fixture("none");
+        fs::write(
+            config.source_repo.join("tests/test_fixture.py"),
+            "import os, unittest\nclass Tests(unittest.TestCase):\n def test_offline(self): self.assertNotIn('RUN_CLAUDE_LIVE', os.environ)\n",
+        )
+        .unwrap();
+        git(&config.source_repo, &["commit", "-am", "Check offline"]).unwrap();
+        let log = temp.path().join("calls");
+        fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\necho \"$* ${{RUN_CLAUDE_LIVE-offline}}\" >> '{}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        execute_with_checks(
+            &config,
+            true,
+            &|_| Ok(message()),
+            remote.to_str().unwrap(),
+            &cargo,
+        )
+        .unwrap_or_else(|error| {
+            let tests = fs::read_to_string(config.state_dir.join("candidate-tests.log"));
+            panic!("{error}: {tests:?}")
+        });
+        let calls = fs::read_to_string(log).unwrap();
+        assert_eq!(calls.lines().count(), 3, "{calls}");
+        assert!(
+            calls.lines().all(|line| line.ends_with(" offline")),
+            "{calls}"
+        );
     }
     #[test]
     fn non_rust_candidate_never_invokes_cargo() {

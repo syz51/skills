@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import capture
+import claude_cli
 import read_guidance
 
 from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, FIELDS, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
@@ -188,10 +189,6 @@ def evidence_fingerprint(turn):
     return hashlib.sha256(json.dumps(records, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
-def privacy_source(turn):
-    return {**turn, 'messages': [message for item in (turn, *turn.get('follow_ups', [])) for message in item['messages']]}
-
-
 def source_input(note, turn, **extra):
     follow_ups = turn.get('follow_ups', [])
     def build(compact):
@@ -220,9 +217,7 @@ def verify_note(config, state_root, note, turn, skill, correction_of=None, *, de
     result = model_response(config, state_root, prompt_runtime.load('verify', config), data, SCHEMA, deadline=deadline)
     if not isinstance(result, dict) or set(result) != {'status', 'summary'} or result['status'] not in SCHEMA['properties']['status']['enum']:
         raise ValueError('Invalid source verification result')
-    privacy_note = {'skill': skill, **{key: 'Source evidence assessment' for key in FIELDS}}
-    privacy_note['evidence'] = result['summary']
-    validate_notes({'notes': [privacy_note]}, {**privacy_source(turn), 'verified_skills': [skill]})
+    capture.validate_summary(result['summary'], skill)
     return {**result, 'inputSha256': hashlib.sha256(data.encode()).hexdigest(),
             'inputTruncated': truncated}
 
@@ -232,8 +227,8 @@ def correct_note(config, state_root, note, turn, skill, assessment, *, deadline=
                                   assessment={key: assessment[key] for key in ('status', 'summary')})
     if truncated:
         return None
-    result = model_response(config, state_root, prompt_runtime.load('correct', config), data, CORRECTION_SCHEMA, deadline=deadline)
-    candidates = validate_notes(result, {**privacy_source(turn), 'verified_skills': [skill]})
+    candidates = validate_notes(model_response(config, state_root, prompt_runtime.load('correct', config), data,
+                                               CORRECTION_SCHEMA, deadline=deadline), {'verified_skills': [skill]})
     if len(candidates) > 1:
         raise ValueError('Too many correction candidates')
     if not candidates:
@@ -264,6 +259,7 @@ def checker_fingerprint(config):
     digest = hashlib.sha256()
     for module, imported_hash in ((sys.modules[__name__], SOURCE_SHA256),
                                   (capture, capture.SOURCE_SHA256),
+                                  (claude_cli, claude_cli.SOURCE_SHA256),
                                   (prompt_runtime, prompt_runtime.SOURCE_SHA256),
                                   (read_guidance, read_guidance.SOURCE_SHA256),
                                   (capture.activation_trace, capture.activation_trace.SOURCE_SHA256)):

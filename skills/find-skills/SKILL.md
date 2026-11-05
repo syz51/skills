@@ -5,7 +5,7 @@ description: Find and recommend installable agent skills when the user is lookin
 
 # Find Skills
 
-For shell reads of this skill or its references, use `uv run --script ~/.local/share/codex-skills/repository/scripts/read_guidance.py <file>` when available, with one file per invocation and an output budget of at least 8000 tokens. The returned `content` is the guidance; follow `next_start` with `--start <offset>` when more is needed. This preserves the path, exact-content hash, and complete/excerpt status in the saved session. If the helper is unavailable, read each file separately with `cat` or a clearly bounded `sed -n` excerpt.
+Read this skill's references with the Read tool, one complete file per call. For a shell read, use `uv run --script ~/.local/share/codex-skills/repository/scripts/read_guidance.py <file>` when available, one file per invocation: the returned `content` is the guidance, and `next_start` with `--start <offset>` continues a partial read. Both record the path, exact-content hash, and complete or excerpt status in the saved session.
 
 This skill helps you discover and install skills from the open agent skills ecosystem.
 
@@ -21,13 +21,13 @@ Ordinary requests such as "how do I improve performance?", "can you review this?
 
 ## What is the Skills CLI?
 
-The Skills CLI (`npx skills`) is the package manager for the open agent skills ecosystem. Skills are modular packages that extend agent capabilities with specialized knowledge, workflows, and tools.
+The Skills CLI (`bunx skills`) is the package manager for the open agent skills ecosystem. Skills are modular packages that extend agent capabilities with specialized knowledge, workflows, and tools.
 
 **Key commands:**
 
-- `npx skills find [query] [--owner <owner>]` - Search for skills interactively or by keyword, optionally scoped to a GitHub owner
-- `npx skills add <package>` - Install a skill from GitHub or other sources
-- `npx skills update` - Update all installed skills
+- `bunx skills find [query] [--owner <owner>]` - Search for skills interactively or by keyword, optionally scoped to a GitHub owner
+- `bunx skills add <package>` - Install a skill from GitHub or other sources
+- `bunx skills update` - Update all installed skills
 
 **Browse skills at:** https://skills.sh/
 
@@ -54,14 +54,14 @@ For example, top skills for web development include:
 If the leaderboard doesn't cover the user's need, run the find command:
 
 ```bash
-npx skills find [query] [--owner <owner>]
+bunx skills find [query] [--owner <owner>]
 ```
 
 For example:
 
-- User asks "find a skill for React performance" → `npx skills find react performance`
-- User asks "is there a skill for PR reviews?" → `npx skills find pr review`
-- User asks "recommend a changelog-writing skill" → `npx skills find changelog`
+- User asks "find a skill for React performance" → `bunx skills find react performance`
+- User asks "is there a skill for PR reviews?" → `bunx skills find pr review`
+- User asks "recommend a changelog-writing skill" → `bunx skills find changelog`
 
 ### Step 4: Verify Quality Before Recommending
 
@@ -88,7 +88,7 @@ React and Next.js performance optimization guidelines from Vercel Engineering.
 Source: vercel-labs/agent-skills; inspect its current guidance for your project's fit.
 
 To install it:
-npx skills add vercel-labs/agent-skills@react-best-practices
+bunx skills add vercel-labs/agent-skills@react-best-practices
 
 Learn more: https://skills.sh/vercel-labs/agent-skills/react-best-practices
 ```
@@ -98,12 +98,12 @@ Learn more: https://skills.sh/vercel-labs/agent-skills/react-best-practices
 If the user wants to proceed, you can install the skill for them:
 
 ```bash
-npx skills add <owner/repo@skill> -g -y
+bunx skills add <owner/repo@skill> -g -y
 ```
 
 The `-g` flag installs globally (user-level) and `-y` skips confirmation prompts.
 
-Never install over a locally maintained skill (`frontend-ui`, `content-research-writer`, `find-skills`, `tauri`, or `typescript`); those discovery paths link into a managed release, and overwriting one blocks later deployments. Report the name conflict instead.
+Never install over a locally maintained skill (`frontend-ui`, `content-research-writer`, `find-skills`, `tauri`, `typescript`, or `rust`); those discovery paths link into a managed release, and overwriting one blocks later deployments. Report the name conflict instead.
 
 ## Common Skill Categories
 
@@ -131,7 +131,7 @@ If no relevant skills exist:
 
 1. Acknowledge that no existing skill was found
 2. Offer to help with the task directly using your general capabilities
-3. Suggest the user could create their own skill with `npx skills init`
+3. Suggest the user could create their own skill with `bunx skills init`
 
 Example:
 
@@ -140,7 +140,7 @@ I searched for skills related to "xyz" but didn't find any matches.
 I can still help you with this task directly! Would you like me to proceed?
 
 If this is something you do often, you could create your own skill:
-npx skills init my-xyz-skill
+bunx skills init my-xyz-skill
 ```
 
 ## Learn from real use

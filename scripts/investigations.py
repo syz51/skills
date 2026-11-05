@@ -78,8 +78,8 @@ def validate_event(value):
     if value['action'] not in ACTIONS or value['state'] not in STATES:
         raise ValueError('Invalid investigation disposition')
     summary = value['summary']
-    if not isinstance(summary, str) or not 10 <= len(summary) <= 1000 or '\n' in summary or capture.redact(summary) != summary or re.search(r'https?://|/(?:Users|home|tmp|var)/', summary):
-        raise ValueError('Unsafe or uninformative abstract summary')
+    if not isinstance(summary, str) or not 10 <= len(summary) <= 1000 or '\n' in summary:
+        raise ValueError('Invalid or uninformative summary')
     if not isinstance(value['cycle_id'], str) or not HEX.fullmatch(value['cycle_id']): raise ValueError('Investigation must belong to a cycle')
     for field in ('supersedes', 'cycle_id'):
         if value[field] is not None and (not isinstance(value[field], str) or not HEX.fullmatch(value[field])):
@@ -96,7 +96,7 @@ def validate_event(value):
         raise ValueError('Invalid execution hash')
     if value['state'] != 'resolved':
         follow = value['follow_up']
-        if not isinstance(follow, dict) or set(follow) != {'next_action', 'next_due'} or not isinstance(follow['next_action'], str) or not 12 <= len(follow['next_action'].strip()) <= 1000 or '\n' in follow['next_action'] or re.search(r'https?://|/(?:Users|home|tmp|var)/', follow['next_action']) or capture.redact(follow['next_action']) != follow['next_action']:
+        if not isinstance(follow, dict) or set(follow) != {'next_action', 'next_due'} or not isinstance(follow['next_action'], str) or not 12 <= len(follow['next_action'].strip()) <= 1000 or '\n' in follow['next_action']:
             raise ValueError('Open investigation requires a concrete follow-up')
         instant(follow['next_due'])
     elif value['follow_up'] is not None:

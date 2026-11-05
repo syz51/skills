@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in, trace-scored Codex activation evaluations; importing never calls a model."""
+"""Opt-in, trace-scored Claude Code activation evaluations; importing never calls a model."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -7,12 +7,11 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
-import shlex
 import signal
 import subprocess
 import sys
-import tempfile
 
+import claude_cli
 from read_guidance import SKILLS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,18 +28,30 @@ REFERENCES = {
 SAFETY = '''
 Work directly without delegates. Read-only: do not edit files, install dependencies,
 browse, connect accounts, or run project commands. This task is self-contained:
-use only this fixture, applicable skill guidance and its guidance reader; do not
-consult user memory or unrelated saved history. Prefer the canonical guidance
-reader in a separate command per file, with at least 8000 output tokens, and
-follow next_start until the file is complete. If the reader cannot run because
-of sandbox, cache or runtime restrictions, use separate single-file cat or sed
-reads with complete visible output. Do not change permissions, install tools or
-claim loading from a failed read. Do not combine guidance reads
-with project-file reads or inventory commands. Preserve the configured skill
-selection and frontend-before-language order; loading is not runtime proof.
-For project-file inspection in this bounded evaluation, use literal single-file
-reads rather than content searches; filename listing is allowed. This keeps
-negative read-scope evidence attributable and does not constrain ordinary work.
+use only this fixture and applicable skill guidance; do not consult user memory
+or unrelated saved history. Load a skill with the Skill tool. Read any further
+guidance file with its own Read call, without offset or limit, and finish it
+before reading later guidance. Do not claim loading from a failed read. Preserve
+the configured skill selection and frontend-before-language order; loading is
+not runtime proof. For project-file inspection in this bounded evaluation, read
+single files by path rather than searching content. This keeps negative
+read-scope evidence attributable and does not constrain ordinary work.
+'''
+# Read-only built-ins: Skill loads guidance and Read returns files. The session
+# has no tool that writes, runs commands, browses or delegates.
+TOOLS = ('Read', 'Skill')
+# dontAsk denies anything that would prompt; no exposed tool can write.
+PERMISSION_MODE = 'dontAsk'
+CLI_FLAGS = ('--print', '--output-format', '--verbose', '--no-session-persistence', '--strict-mcp-config',
+             '--tools', '--permission-mode', '--setting-sources', '--add-dir', '--model', '--effort')
+# Project configuration a fixture or an ancestor directory could inject
+# (the built-in AGENTS.md plugin also reads AGENTS.md).
+PROJECT_CONFIG = ('.claude', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md')
+SKILL_BASE = 'Base directory for this skill: '
+DISPATCH = '''For frontend/UI work, use the frontend-ui skill first.
+For TypeScript implementation, review, debugging or configuration work, use the typescript skill. When that TypeScript task also involves frontend/UI work, complete frontend-ui first and apply both. Frontend work without TypeScript does not require the TypeScript skill.
+For Rust implementation, review, debugging, migration or Cargo/toolchain configuration work, use the rust skill. For Tauri integration work, also use the tauri skill; Rust owns language and Cargo decisions. Unrelated work in a Rust repository does not require rust.
+Read each skill reference a skill routes you to with its own complete Read call. Complete frontend-ui before reading TypeScript guidance for frontend work.
 '''
 
 
@@ -81,7 +92,7 @@ def load_cases(path=CASES):
             raise ValueError('Invalid prompt/files')
         for name, content in case['files'].items():
             relative(name)
-            if 'AGENTS.md' in PurePosixPath(name).parts or any(part in ('.agents', '.codex') for part in PurePosixPath(name).parts) or not isinstance(content, str):
+            if any(part in PROJECT_CONFIG for part in PurePosixPath(name).parts) or not isinstance(content, str):
                 raise ValueError('Fixture may not override guidance/discovery')
         for field in ('required', 'forbidden'):
             if not isinstance(case[field], list) or any(not isinstance(t, str) for t in case[field]) or len(set(case[field])) != len(case[field]):
@@ -95,13 +106,16 @@ def load_cases(path=CASES):
     return cases
 
 
+def user_skills_dir():
+    """Claude Code's user skill directory, following a relocated configuration."""
+    return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').expanduser() / 'skills'
+
+
 def skill_folders(skills_root=None):
     folders = {}
-    codex_home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser()
     for name in SKILLS:
-        choices = [Path(skills_root) / name] if skills_root else [codex_home / 'skills' / name, Path.home() / '.agents/skills' / name]
-        folder = next((p for p in choices if (p / 'SKILL.md').is_file()), None)
-        if folder is None:
+        folder = (Path(skills_root) if skills_root else user_skills_dir()) / name
+        if not (folder / 'SKILL.md').is_file():
             raise ValueError('Required skill is not installed: ' + name)
         folders[name] = folder.absolute()
     return folders
@@ -129,11 +143,12 @@ def tree_snapshot(root):
     return result
 
 
-def run_process(command, timeout):
-    with subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+def run_process(command, timeout, *, input=None, cwd=None, env=None):
+    with subprocess.Popen(command, text=True, stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env,
                           start_new_session=True) as process:
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            stdout, stderr = process.communicate(input, timeout=timeout)
             return process.returncode, stdout, stderr, False
         except subprocess.TimeoutExpired:
             for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -153,16 +168,103 @@ def run_process(command, timeout):
 def check_cli(executable):
     resolved = shutil.which(str(executable))
     if resolved is None:
-        raise ValueError('Codex executable unavailable')
-    code, stdout, stderr, timed_out = run_process([resolved, 'exec', '--help'], 20)
-    required = ('--ephemeral', '--json', '--sandbox', '--skip-git-repo-check', '--config', '--cd')
-    if code or timed_out or any(flag not in stdout for flag in required):
-        raise ValueError('Codex CLI lacks required safe evaluation controls')
+        raise ValueError('Claude Code executable unavailable')
+    code, stdout, stderr, timed_out = run_process([resolved, '--help'], 20, env=claude_cli.child_env())
+    if code or timed_out or claude_cli.missing_flags(stdout, CLI_FLAGS) or PERMISSION_MODE not in stdout:
+        raise ValueError('Claude Code CLI lacks required safe evaluation controls')
     return resolved
 
 
-def run_case(case, output_dir, folders, executable, timeout=240, model=None, candidate=False):
-    from activation_trace import score_trace
+def isolated_location(output):
+    """Claude Code loads CLAUDE.md and .claude/ from the cwd's ancestors too.
+
+    The user's own Claude Code home (~/.claude or CLAUDE_CONFIG_DIR) is user configuration, not a project.
+    """
+    home = user_skills_dir().parent.resolve()
+    for parent in (output, *output.parents):
+        for name in PROJECT_CONFIG:
+            path = parent / name
+            if path.exists() and not (name == '.claude' and path.resolve() == home):
+                raise ValueError('Output directory is inside a Claude Code project: ' + str(parent))
+
+
+def injected_skill_dirs(stdout):
+    """Base directories of the skills the Skill tool injected during the session."""
+    found = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        message = event.get('message') if isinstance(event, dict) and event.get('isSynthetic') is True else None
+        content = message.get('content') if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else ():
+            text = block.get('text') if isinstance(block, dict) else None
+            if isinstance(text, str) and text.startswith(SKILL_BASE):
+                found.append(text.partition('\n\n')[0][len(SKILL_BASE):])
+    return found
+
+
+def evaluation_command(executable, folders, model=None, candidate=False, effort=None):
+    command = [executable, '--print', '--output-format', 'stream-json', '--verbose', '--no-session-persistence',
+               '--strict-mcp-config', '--tools', ','.join(TOOLS), '--permission-mode', PERMISSION_MODE]
+    if candidate:
+        # Project skills and CLAUDE.md only: user skills, CLAUDE.md, settings and plugins cannot shadow candidates.
+        command += ['--setting-sources', 'project']
+    if model:
+        command += ['--model', model]
+    if effort:
+        command += ['--effort', effort]
+    # Read outside the fixture would otherwise be denied, including through the
+    # candidate discovery links, which resolve to the skill tree.
+    for directory in dict.fromkeys(str(path.resolve()) for path in folders.values()):
+        command += ['--add-dir', directory]
+    return command
+
+
+def session_failures(stdout, candidate, folders=None):
+    """Check the tools and skills the session reported before any turn ran.
+
+    The scorer reports malformed lines; a long trace may exceed the bound that
+    claude_cli.events applies to structured calls, so only the first init is decoded.
+    """
+    init = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('type') == 'system' and event.get('subtype') == 'init':
+            init = event
+            break
+    if init is None:
+        return ['Claude session did not start']
+    failures = []
+    if not isinstance(init.get('tools'), list) or set(init['tools']) - set(TOOLS):
+        failures.append('Claude session exposed tools beyond ' + ', '.join(TOOLS))
+    if init.get('mcp_servers'):
+        failures.append('Claude session exposed MCP servers')
+    if init.get('permissionMode') != PERMISSION_MODE:
+        failures.append('Claude session did not use the ' + PERMISSION_MODE + ' permission mode')
+    skills = set(init.get('skills') or ())
+    if set(SKILLS) - skills:
+        failures.append('Maintained skills not exposed: ' + ', '.join(sorted(set(SKILLS) - skills)))
+    if candidate:
+        directory = user_skills_dir()
+        user = {path.name for path in directory.iterdir()} if directory.is_dir() else set()
+        if (user - set(SKILLS)) & skills:
+            failures.append('User skills leaked into the candidate session')
+        # Same-named user skills hide behind the candidates' names; their injected base directory gives them away.
+        installed = {(directory / name).resolve() for name in user}
+        candidates = {Path(folder).resolve() for folder in (folders or {}).values()}
+        leaked = sorted({base for base in injected_skill_dirs(stdout) if Path(base).resolve() in installed - candidates})
+        if leaked:
+            failures.append('Skills loaded from the user skill folder instead of the candidates: ' + ', '.join(leaked))
+    return failures
+
+
+def run_case(case, output_dir, folders, executable, timeout=240, model=None, candidate=False, effort=None):
+    from activation_trace import score_claude_trace
     targets = snapshot_targets(folders, [*case['required'], *case['forbidden']])
     directory = output_dir / case['id']
     directory.mkdir(mode=0o700)
@@ -173,24 +275,13 @@ def run_case(case, output_dir, folders, executable, timeout=240, model=None, can
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
     if candidate:
-        discovery = fixture / '.agents/skills'
+        # Candidate trees become the session's only non-built-in skills; the
+        # project CLAUDE.md stands in for the user's dispatch instructions.
+        discovery = fixture / '.claude/skills'
         discovery.mkdir(parents=True)
         for owner, source in folders.items():
             (discovery / owner).symlink_to(source, target_is_directory=True)
-        (fixture / 'AGENTS.md').write_text(
-            f'For frontend/UI work, read {folders["frontend-ui"] / "SKILL.md"} first.\n'
-            f'For TypeScript implementation, review, debugging or configuration work, read {folders["typescript"] / "SKILL.md"}. '
-            'When that TypeScript task also involves frontend/UI work, complete frontend-ui first and apply both. '
-            'Frontend work without TypeScript does not require the TypeScript skill.\n'
-            f'For Rust implementation, review, debugging, migration or Cargo/toolchain configuration work, read {folders["rust"] / "SKILL.md"}. '
-            f'For Tauri integration work, also read {folders["tauri"] / "SKILL.md"}; Rust owns language and Cargo decisions. '
-            'Unrelated work in a Rust repository does not require rust.\n'
-            f'Prefer reading guidance with uv run --script {shlex.quote(str(ROOT / "scripts/read_guidance.py"))} '
-            '<absolute-guidance-path>, one file per command with at least 8000 output tokens. '
-            'Follow every next_start continuation before reading later guidance. '
-            'If sandbox, cache or runtime restrictions prevent the reader from running, use separate '
-            'single-file cat or sed reads with complete visible output; keep permissions unchanged. '
-            'Complete frontend-ui before reading TypeScript for frontend work.\n')
+        (fixture / 'CLAUDE.md').write_text(DISPATCH)
     before_fixture = tree_snapshot(fixture)
     before_skills = {name: tree_snapshot(path.resolve()) for name, path in folders.items()}
     if candidate:
@@ -199,25 +290,23 @@ def run_case(case, output_dir, folders, executable, timeout=240, model=None, can
             # macOS may canonicalize /var to /private/var in the CLI's cwd.
             # Resolve the fixture parent, retaining the discovery-link path.
             for base in (fixture, fixture.resolve()):
-                alias = str(base / '.agents/skills' / owner / relative_path)
+                alias = str(base / '.claude/skills' / owner / relative_path)
                 if alias not in targets[key]['aliases']:
                     targets[key]['aliases'].append(alias)
     (directory / 'targets.json').write_text(json.dumps(targets, indent=2) + '\n')
     (directory / 'case.json').write_text(json.dumps(case, indent=2) + '\n')
-    command = [executable, 'exec', '--ephemeral', '--json', '--sandbox', 'read-only', '--skip-git-repo-check',
-               '-C', str(fixture), '-c', 'log_dir=' + json.dumps(str(directory / 'logs'))]
-    if model:
-        command += ['--model', model]
-    command += [case['prompt'] + SAFETY]
-    code, stdout, stderr, timed_out = run_process(command, timeout)
+    command = evaluation_command(executable, folders, model, candidate, effort)
+    # The prompt goes through stdin: --add-dir and --tools take variadic values.
+    code, stdout, stderr, timed_out = run_process(command, timeout, input=case['prompt'] + SAFETY, cwd=fixture,
+                                                  env=claude_cli.child_env())
     (directory / 'trace.jsonl').write_text(stdout)
     (directory / 'stderr.txt').write_text(stderr)
-    result = score_trace(stdout, targets, case['required'], case['forbidden'], case['before'])
-    failures = list(result['failures'])
+    result = score_claude_trace(stdout, targets, case['required'], case['forbidden'], case['before'])
+    failures = list(result['failures']) + session_failures(stdout, candidate, folders)
     if code:
-        failures.append('Codex exited unsuccessfully')
+        failures.append('Claude Code exited unsuccessfully')
     if timed_out:
-        failures.append('Codex timed out; process group terminated')
+        failures.append('Claude Code timed out; process group terminated')
     if before_fixture != tree_snapshot(fixture):
         failures.append('Read-only fixture changed')
     if any(before_skills[name] != tree_snapshot(path.resolve()) for name, path in folders.items()):
@@ -238,8 +327,9 @@ def main(argv=None):
     parser.add_argument('--case', action='append', default=[])
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--skills-root', type=Path)
-    parser.add_argument('--codex', default='codex')
+    parser.add_argument('--claude', default=str(claude_cli.DEFAULT_CLI))
     parser.add_argument('--model')
+    parser.add_argument('--effort', choices=('low', 'medium', 'high', 'xhigh', 'max'))
     parser.add_argument('--timeout', type=int, default=240)
     parser.add_argument('--jobs', type=int, default=2)
     args = parser.parse_args(argv)
@@ -259,13 +349,14 @@ def main(argv=None):
         output = args.output_dir.expanduser().absolute()
         if output.exists():
             raise ValueError('Output directory must be new')
-        executable = check_cli(args.codex)
+        isolated_location(output)
+        executable = check_cli(args.claude)
         folders = skill_folders(args.skills_root)
         for case in selected:
             snapshot_targets(folders, [*case['required'], *case['forbidden']])
         output.mkdir(parents=True, mode=0o700)
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            records = list(pool.map(lambda c: run_case(c, output, folders, executable, args.timeout, args.model, args.skills_root is not None), selected))
+            records = list(pool.map(lambda c: run_case(c, output, folders, executable, args.timeout, args.model, args.skills_root is not None, args.effort), selected))
         summary = {'passed': all(r['passed'] for r in records), 'cases': records}
         (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         print(json.dumps(summary, indent=2))
