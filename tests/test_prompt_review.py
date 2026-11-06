@@ -464,7 +464,9 @@ class PromptReviewTests(unittest.TestCase):
         case = dict(cases[0], input='not a JSON object', rubric='invented')
         with self.assertRaises(ValueError):
             review.validate_case(case)
-        path = next((self.repo / 'prompt-evals/cases').glob('*.json'))
+        # Pick a case the edit really changes; directory order differs between platforms.
+        path = next(p for p in sorted((self.repo / 'prompt-evals/cases').glob('*.json'))
+                    if json.loads(p.read_text())['expected'] != 'unsupported')
         case = json.loads(path.read_text())
         case['expected'] = 'unsupported'
         path.write_text(json.dumps(case))
