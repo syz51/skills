@@ -34,6 +34,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install the required test runner
         run: python -m pip install uv==0.13.6
+      # The tests run offline, and the skill validator gets PyYAML through `uv run --with
+      # pyyaml`; fetch it into the uv cache first so the offline run can resolve it.
+      - name: Fetch the skill validator's PyYAML
+        env:
+          UV_OFFLINE: '0'
+          UV_PYTHON: ${{ matrix.python-version }}
+        run: uv run --no-project --with pyyaml python -c 'import yaml'
       - name: Run offline tests and repository release gates
         env:
           UV_PYTHON: ${{ matrix.python-version }}
