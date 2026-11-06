@@ -111,7 +111,7 @@ fn export_lock_defers_real_publication_without_completing_deadline() {
     let lock = codex_skills::export::acquire(&[root.path().join("export.lock")]).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
     // No Git repository or candidate exists: reaching source inspection would fail.
-    let result = daily::run(&config, now, &|_| panic!("must not generate while busy")).unwrap();
+    let result = daily::run(&config, now, &|_, _| panic!("must not generate while busy")).unwrap();
     assert_eq!(
         result,
         json!({"outcome": "deferred", "reason": "publication_lock_held"})
@@ -149,7 +149,7 @@ fn lock_io_failure_is_not_a_deferral() {
     assert!(!error.is::<codex_skills::export::LockBusy>());
     assert!(error.is::<std::io::Error>());
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
-    assert!(daily::run(&config, now, &|_| panic!("must not generate")).is_err());
+    assert!(daily::run(&config, now, &|_, _| panic!("must not generate")).is_err());
     // Failure to acquire cycle.lock releases the already acquired export.lock.
     assert!(codex_skills::export::acquire(&[root.path().join("export.lock")]).is_ok());
     let status: Value =

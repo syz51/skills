@@ -1,7 +1,7 @@
 use codex_skills::{
     CommitMessage,
     config::{Config, relative},
-    export::{Files, git, manifest, prepare, validate_message},
+    export::{Files, git, manifest, prepare, scan, snapshot, validate_message},
 };
 use std::{fs, path::Path};
 fn g(p: &Path, args: &[&str]) -> String {
@@ -154,13 +154,14 @@ fn input_and_message_boundaries() {
     for p in ["../x", ".GIT/config", "skills//x", "skills/../x"] {
         assert!(relative(p).is_err())
     }
-    // The commit message has no content scanner; quality and attribution checks remain.
+    assert!(scan("public.txt", format!("{}{}", "roy", "-mac").as_bytes()).is_err());
+    assert!(scan("public.txt", b"Use FAKE_TOKEN in examples.").is_ok());
     assert!(
         validate_message(&CommitMessage {
             subject: "Document the host-a reference role".into(),
-            body: "Path /home/alice/file and api_key=example123 are kept.".into()
+            body: format!("Path {}{}alice/file is private.", "/Us", "ers/")
         })
-        .is_ok()
+        .is_err()
     );
     assert!(
         validate_message(&CommitMessage {
@@ -176,6 +177,25 @@ fn input_and_message_boundaries() {
         })
         .is_ok()
     );
+}
+/// The real exporter over the committed inventory at HEAD, so a marker in an exported file
+/// fails `cargo test` before the daily export rejects it. The public repository and the
+/// candidate validation directory have no private configuration or Git checkout and skip.
+#[test]
+fn committed_inventory_passes_the_publication_scanner() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let inventory = root.join("public/export.json");
+    if !inventory.is_file() || !root.join(".git").exists() {
+        eprintln!("skipped: needs the private export configuration and source checkout");
+        return;
+    }
+    // The inventory and the file contents both come from HEAD.
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&git(root, &["show", "HEAD:public/export.json"]).unwrap()).unwrap();
+    value["source_repo"] = root.to_str().unwrap().into();
+    let config = Config::from_value(value).unwrap();
+    let files = snapshot(&config, "HEAD").unwrap();
+    assert_eq!(files.len(), config.files.len());
 }
 #[test]
 fn manifest_matches_existing_python_encoding() {

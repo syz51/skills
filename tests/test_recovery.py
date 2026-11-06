@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
@@ -84,6 +85,25 @@ class RecoveryTests(unittest.TestCase):
             "  try: os.link(temp,final);break\n"
             "  except FileExistsError: continue\n"
             "finally: os.unlink(temp)\nprint('Saved local feedback')\n")
+
+    def test_saved_code_with_invalid_escapes_matches_without_warnings(self):
+        body = self.body + "pattern='a\\|b'\n"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            matched = capture.creation_matches(self.raw(body), self.output(), self.notes, '2026-10-08T09:17:22Z')
+        self.assertEqual(matched, [self.digest])
+        self.assertEqual([str(item.message) for item in caught], [])
+
+    def test_saved_code_written_with_javascript_only_escapes_still_matches(self):
+        # JavaScript accepts \' inside double quotes, which JSON and Python literals read differently.
+        raw = self.raw().replace("<<'PY'", "<<\\'PY\\'")
+        self.assertIn("\\'PY\\'", raw)
+        self.assertEqual(capture.creation_matches(raw, self.output(), self.notes, '2026-10-08T09:17:22Z'), [self.digest])
+
+    def test_a_command_expression_cannot_borrow_saved_code_provenance(self):
+        # JavaScript runs only the right-hand string of &&; the saved code never ran.
+        forged = 'text(await tools.exec_command({cmd:' + json.dumps(self.command()) + ' && "printf done"}));'
+        self.assertEqual(capture.creation_matches(forged, self.output(), self.notes, '2026-10-08T09:17:22Z'), [])
 
     def test_atomic_writer_recovers_unknown_identity_without_replaying_saved_code(self):
         body = self.atomic_body()

@@ -78,6 +78,24 @@ def configuration(value):
     return value
 
 
+def scan(path, content):
+    try:
+        text = content.decode('utf-8')
+    except UnicodeDecodeError:
+        raise ExportError('Non-text publication file: ' + path) from None
+    # Markers match in any case, but replacements do not, so an unreplaced case variant is
+    # rejected. A lowercase users segment is also a common web route, so its case variants
+    # count only where a home path would start: not after a path segment, and followed by a
+    # name rather than a route parameter.
+    private = re.compile('/Us' + 'ers/|(?i:' + '|'.join(map(re.escape, ('roy' + '-mac', 'sunmacbook' + '-air', 'syz51/' + 'codex-skills')))
+                         + r'|(?<![\w.-])/us' + r'ers/[a-z_])')
+    rules = {'private identifier': bool(private.search(text)),
+             'credential': bool(re.search(r'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|sk-(?:proj-)?[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16})\b', text))}
+    for rule, matched in rules.items():
+        if matched:
+            raise ExportError('Publication rejected: ' + path + ' (' + rule + ')')
+
+
 def clean_source(repo):
     if git(repo, 'branch', '--show-current').strip() != b'main' or git(repo, 'status', '--porcelain').strip():
         raise ExportError('Source requires a clean committed main checkout')
@@ -107,10 +125,7 @@ def snapshot(config, revision):
                 raise ExportError('Invalid source metadata: ' + source) from None
         for old, new in config.get('replacements', {}).items():
             content = content.replace(old.encode(), new.encode())
-        try:
-            content.decode('utf-8')
-        except UnicodeDecodeError:
-            raise ExportError('Non-text publication file: ' + target) from None
+        scan(target, content)
         result[target] = content
     return result
 

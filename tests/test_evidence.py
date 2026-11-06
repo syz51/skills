@@ -1,6 +1,7 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -59,6 +60,25 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(checked['correction_of'], original.decode())
         self.assertIn(self.correction['observation'], checked['note'])
 
+    def test_note_under_check_is_redacted_for_verification_and_correction(self):
+        private = 'Read /Us' + 'ers/alice/app.tsx via https://example.com/x for a@example.com with token=abc123'
+        redacted = 'Read [local path] via [redacted URL] for [redacted email] with [redacted credential]'
+        self.path.write_text(self.path.read_text() + '- Cause: ' + private + '\n')
+        candidate = {**self.correction, 'evidence': private}
+        responses = [{'status': 'partial', 'summary': 'The observation overstates the reported result.'}, {'notes': [candidate]},
+                     {'status': 'supported', 'summary': 'The revised note keeps attribution qualified.'}]
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=responses) as model:
+            self.assertEqual(evidence.verify(self.config, self.root)['corrected'], 1)
+        verify, correct, recheck = (json.loads(call.args[3]) for call in model.call_args_list)
+        for data in (verify, correct, recheck):
+            self.assertIn(redacted, data['note'])
+        self.assertIn(redacted, recheck['correction_of'])
+        for call in model.call_args_list:
+            for part in ('alice', 'example.com', 'abc123'):
+                self.assertNotIn(part, call.args[3])
+        # Only model inputs are redacted; the saved correction keeps the model's text.
+        self.assertEqual(evidence.assessment_inventory(self.feedback)['latest'][0]['correction']['note'], candidate)
+
     def test_original_turn_assessment_is_immutable_and_not_repeated(self):
         result = {'status': 'supported', 'summary': 'The correction is present; execution success is only reported.'}
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]) as scanner, patch.object(evidence, 'model_response', return_value=result) as model:
@@ -77,6 +97,24 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(value['sourceSha256'], self.turn['source_sha256'])
         self.assertIn('runtime outcomes not replayed', value['scope'])
         self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+
+    def test_source_checker_receives_redacted_transcript_text(self):
+        def record(kind, payload):
+            return json.dumps({'type': kind, 'payload': payload, 'timestamp': '2026-10-14T01:00:00Z'}) + '\n'
+        sessions = self.root / 'sessions'
+        sessions.mkdir()
+        (sessions / 'rollout.jsonl').write_text(
+            record('session_meta', {'id': 'session1', 'source': 'desktop'})
+            + record('event_msg', {'type': 'task_started', 'turn_id': 'turn1'})
+            + record('event_msg', {'type': 'user_message', 'message': 'Fix /Us' + 'ers/alice/app.tsx; token=abc123'})
+            + record('response_item', {'type': 'message', 'role': 'assistant', 'content': [{'text': 'Mailed a@example.com via https://example.com/x.'}]})
+            + record('event_msg', {'type': 'task_complete', 'turn_id': 'turn1'}))
+        result = {'status': 'supported', 'summary': 'The correction is present; execution success is only reported.'}
+        with patch.object(evidence, 'model_response', return_value=result) as model:
+            self.assertEqual(evidence.verify(self.config, self.root)['checked'], 1)
+        request = json.loads(model.call_args.args[3])
+        self.assertEqual([m['text'] for m in request['original_turn']['messages']],
+                         ['Fix [local path] [redacted credential]', 'Mailed [redacted email] via [redacted URL]'])
 
     def test_note_text_and_receipt_hash_use_one_atomic_byte_snapshot(self):
         original = self.path.read_bytes()
@@ -546,7 +584,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual((result['errors'], result['corrected']), (0, 1))
         self.assertEqual(model.call_count, 3)
         generation, checked = (call.args[3] for call in model.call_args_list[1:])
-        self.assertIn(candidate['evidence'], json.loads(checked)['note'])
+        self.assertIn('See [redacted URL] Claude Code reported it on 2026-11-04.', json.loads(checked)['note'])
         value = evidence.assessment_inventory(self.feedback)['latest'][0]
         self.assertEqual(value['correction']['note'], candidate)
         self.assertEqual(value['correction']['generationInputSha256'], hashlib.sha256(generation.encode()).hexdigest())
@@ -608,6 +646,59 @@ class EvidenceTests(unittest.TestCase):
         model.assert_not_called()
         self.assertEqual((counts['checked'], counts['pending'], counts['errors']), (0, 1, 0))
         self.assertEqual(list(self.feedback.rglob('*.json')), [])
+
+    def test_usage_limit_leaves_checks_pending_and_fails_only_after_the_grace_period(self):
+        now = datetime.now(timezone.utc)
+        limit = {'since': now.isoformat(), 'retry_at': (now + timedelta(hours=1)).isoformat(), 'window': 'five_hour'}
+        failure = evidence.RateLimited('extractor rate limit failure', {'failure_class': 'rate limit'}, limit)
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=failure):
+            counts = evidence.verify(self.config, self.root)
+        self.assertEqual((counts['checked'], counts['pending'], counts['errors'], counts['rate_limited']), (0, 1, 0, 1))
+        self.assertEqual(counts['rate_limit'], {**limit, 'deferred': 1, 'overdue': False})
+        self.assertNotIn('extractor_diagnostics', counts)
+        # While a recorded limit is active no check calls the CLI, and past the grace period the wait is an error.
+        record = self.root / 'rate-limit.json'
+        config = self.root / 'config.json'
+        config.write_text(json.dumps(self.config))
+        for since, errors in ((now, 0), (now - timedelta(hours=25), 1)):
+            record.write_text(json.dumps({**limit, 'since': since.isoformat()}))
+            with self.subTest(errors=errors), patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                    patch.object(evidence.capture, 'run_extractor') as run, \
+                    patch.object(sys, 'argv', ['evidence.py', '--config', str(config)]), patch('builtins.print'):
+                self.assertEqual(evidence.main(), errors)
+            run.assert_not_called()
+            status = json.loads((self.root / 'evidence-status.json').read_text())
+            self.assertEqual((status['counts']['pending'], status['counts']['errors'], status['counts']['rate_limited']),
+                             (1, errors, 1))
+            if errors:
+                self.assertEqual(status['error'], 'The Claude usage limit has blocked 1 source checks for more than 24 hours.')
+                self.assertNotIn('warning', status)
+            else:
+                self.assertEqual(status['warning'], 'Claude usage limit reached; 1 source checks wait for its reset at '
+                                 + limit['retry_at'] + '.')
+        self.assertEqual(list(self.feedback.rglob('*.json')), [])
+
+    def test_a_requested_check_runs_despite_a_recorded_limit_and_fails_when_rejected(self):
+        now = datetime.now(timezone.utc)
+        (self.root / 'rate-limit.json').write_text(json.dumps(
+            {'since': now.isoformat(), 'retry_at': (now + timedelta(hours=1)).isoformat(), 'window': None}))
+        digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        config = self.root / 'config.json'
+        config.write_text(json.dumps(self.config))
+        rejected = evidence.capture.subprocess.CompletedProcess([], 1, json.dumps(
+            {'type': 'result', 'subtype': 'success', 'is_error': True, 'api_error_status': 429, 'result': 'limit'}) + '\n', '')
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence.capture, 'verify_cli'), \
+                patch.object(evidence.capture, 'run_extractor', return_value=rejected) as run, \
+                patch.object(evidence.capture.sys, 'stderr', io.StringIO()), \
+                patch.object(sys, 'argv', ['evidence.py', '--config', str(config), '--note-sha', digest, '--recheck']), \
+                patch('builtins.print'):
+            self.assertEqual(evidence.main(), 1)
+        run.assert_called_once()
+        status = json.loads((self.root / 'evidence-status.json').read_text())
+        self.assertEqual((status['success'], status['counts']['errors'], status['counts']['rate_limited']), (False, 1, 1))
+        self.assertTrue(status['error'].startswith('The Claude usage limit rejected the requested source check; retry after '))
 
     def test_extractor_failure_keeps_assessment_pending_and_reports_safe_metadata(self):
         diagnostic = {'elapsed_seconds': 2.5, 'phase': 'startup', 'failure_class': 'authentication', 'attempts': 1}

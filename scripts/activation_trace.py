@@ -18,13 +18,14 @@ from pathlib import Path
 import posixpath
 import re
 import shlex
+import warnings
 
 from read_guidance import observed, request
 
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
-_STRING = r'''(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')'''
+_STRING = r'''(?:"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*')'''
 _TRUNCATED = re.compile(r'(?im)^(?:warning:\s*)?(?:truncated output\b|output[^\n]*truncated\b|.*tokens truncated\b|.*lines omitted\b)')
 
 
@@ -32,12 +33,53 @@ def _digest(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def _string(token):
-    if token.startswith('"'):
-        return json.loads(token)
-    if re.search(r'\\(?![\\\x27"bfnrtv])', token):
-        raise ValueError('Unsupported JavaScript string escape')
-    return ast.literal_eval(token)
+_JS_ESCAPES = {'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t', 'v': '\v'}
+_JS_STRING = re.compile(r'\\(?:u\{([0-9A-Fa-f]{1,6})\}|u([0-9A-Fa-f]{4})|x([0-9A-Fa-f]{2})|(0)(?![0-9])|(\r\n?|[\n\u2028\u2029])|([^0-9xu]))')
+
+
+def js_string(token):
+    """Decode a JavaScript string literal from a tool call exactly as strict-mode JavaScript would, or raise ValueError.
+
+    Escapes pair from the left, so '\\\\|' is an escaped backslash and a literal bar, and an escape with no
+    meaning of its own, such as '\\|', is that character. Legacy octal and malformed escapes, unescaped
+    quotes or line breaks and lone surrogates stay unknown rather than adopting another language's semantics.
+    """
+    if len(token) < 2 or token[0] not in '"\'' or token[-1] != token[0]:
+        raise ValueError('Not a JavaScript string literal')
+    body, position, parts = token[1:-1], 0, []
+    for match in _JS_STRING.finditer(body):
+        parts.append(body[position:match.start()])
+        braced, unicode, hexadecimal, zero, continuation, character = match.groups()
+        if braced or unicode or hexadecimal:
+            value = int(braced or unicode or hexadecimal, 16)
+            if value > 0x10FFFF:
+                raise ValueError('Invalid JavaScript code point')
+            parts.append(chr(value))
+        else:
+            parts.append('' if continuation else '\0' if zero else _JS_ESCAPES.get(character, character))
+        position = match.end()
+    parts.append(body[position:])
+    # Unmatched text may hold no closing quote, raw line break or unpaired backslash.
+    if any(re.search(r'[\n\r\\]|' + token[0], part) for part in parts[::2]):
+        raise ValueError('Invalid JavaScript string')
+    # JavaScript strings are UTF-16: join escaped surrogate pairs and refuse lone halves.
+    text = re.sub('[\ud800-\udbff][\udc00-\udfff]',
+                  lambda pair: chr(0x10000 + ((ord(pair[0][0]) - 0xD800) << 10) + ord(pair[0][1]) - 0xDC00), ''.join(parts))
+    if re.search('[\ud800-\udfff]', text):
+        raise ValueError('Lone surrogate in JavaScript string')
+    return text
+
+
+def quiet_parse(parse, text):
+    """Parse transcript text that really is Python syntax, such as a tool envelope's
+    repr or a saved Python heredoc, without warnings for invalid escapes like '\\|'.
+
+    Python 3.12 emits SyntaxWarning for them, and older versions DeprecationWarning.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', SyntaxWarning)
+        warnings.simplefilter('ignore', DeprecationWarning)
+        return parse(text)
 
 
 def _split(text, separator=';'):
@@ -403,7 +445,7 @@ def _slice_range(content, start, end):
 def _value(expression, bindings):
     expression = expression.strip()
     if re.fullmatch(_STRING, expression):
-        return _string(expression)
+        return js_string(expression)
     if re.fullmatch(r'[A-Za-z_$][\w$]*', expression):
         return bindings.get(expression)
     if expression == 'nodeRepl.cwd':
@@ -459,13 +501,13 @@ class _Inspect:
             raise ValueError('Inspect output nesting exceeds bound')
         token = self.take()
         if token[0] in ('"', "'"):
-            result = _string(token)
+            result = js_string(token)
             while self.pos < len(self.text) and self.text[self.pos:].strip() and self.peek() == '+':
                 self.take()
                 following = self.take()
                 if following[0] not in ('"', "'"):
                     raise ValueError('Inspect concatenation is not literal')
-                result += _string(following)
+                result += js_string(following)
             return result
         if token in ('[', '{'):
             closing, result = (']', []) if token == '[' else ('}', {})
@@ -475,7 +517,7 @@ class _Inspect:
             while True:
                 if token == '{':
                     key = self.take()
-                    key = _string(key) if key[0] in ('"', "'") else key
+                    key = js_string(key) if key[0] in ('"', "'") else key
                     if not re.fullmatch(r'[A-Za-z_$][\w$]*', key) or key in result or self.take() != ':':
                         raise ValueError('Invalid inspect object key')
                     result[key] = self.value(depth + 1)
@@ -522,7 +564,7 @@ def _results(value, source_index=None, depth=0):
             value = json.loads(value)
         except (ValueError, RecursionError):
             try:
-                value = ast.literal_eval(value)
+                value = quiet_parse(ast.literal_eval, value)
             except (ValueError, SyntaxError, RecursionError):
                 return []
     if isinstance(value, list):

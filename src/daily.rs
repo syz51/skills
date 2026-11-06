@@ -36,7 +36,7 @@ struct State {
 pub fn run(
     config: &Config,
     now: DateTime<Utc>,
-    generate: &dyn Fn(&str) -> Result<CommitMessage>,
+    generate: &dyn Fn(&str, Option<&str>) -> Result<CommitMessage>,
 ) -> Result<Value> {
     run_with(config, now, || {
         Ok(serde_json::to_value(export::execute(

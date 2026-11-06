@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily maintenance and host sync; retain legacy weekly command/state names."""
+"""Hourly host sync and the weekly maintenance review (Mondays 09:00 Tokyo)."""
 import argparse
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -21,12 +21,11 @@ TOKYO = ZoneInfo('Asia/Tokyo')
 
 def latest_due(now):
     local = now.astimezone(TOKYO)
-    due = local.replace(hour=9, minute=0, second=0, microsecond=0)
-    return due if due <= local else due - timedelta(days=1)
+    due = (local - timedelta(days=local.weekday())).replace(hour=9, minute=0, second=0, microsecond=0)
+    return due if due <= local else due - timedelta(days=7)
 
 
 def weekly_due(now, state):
-    """Daily eligibility using the existing persisted-state/command contract."""
     due = latest_due(now)
     started = datetime.fromisoformat(state['setup_started_at'])
     completed = state.get('completed_due')
@@ -312,7 +311,7 @@ def execute(args, now=None):
     if config['host_id'] not in ('client-host', 'maintainer-host') or config['role'] not in ('client', 'maintainer'):
         raise ValueError('Invalid host or role')
     if args.command == 'weekly' and (config['role'] != 'maintainer' or config['host_id'] != 'maintainer-host'):
-        raise ValueError('Daily maintenance is restricted to the remote maintainer')
+        raise ValueError('Weekly maintenance is restricted to the remote maintainer')
     repo = Path(config['repo_path']).expanduser().resolve()
     executables = {'python_path': Path(config['python_path']), 'uv_path': Path(config['uv_path']),
                    'claude_path': claude_cli.cli_path(config)}
@@ -327,7 +326,7 @@ def execute(args, now=None):
     if args.check:
         print(json.dumps({'host_id': config['host_id'], 'role': config['role'], 'repo_path': str(repo),
                           'weekly_due': weekly_due(now, state), 'latest_due': due.isoformat(),
-                          'next_due': (due + timedelta(days=1)).isoformat()}, indent=2))
+                          'next_due': (due + timedelta(days=7)).isoformat()}, indent=2))
         return 0
     with (state_root / 'cycle.lock').open('a') as lock:
         try:
@@ -357,6 +356,8 @@ def execute(args, now=None):
                 run(command[:2] + [name] + command[2:], log, env, timeout=remaining)
             status['stages'] = {}
             errors = []
+            # Deferred work that does not fail a stage, such as calls waiting for a usage limit's reset.
+            warnings = []
 
             def stage(name, action, message, backlog_message=None, defer=False):
                 try:
@@ -381,6 +382,8 @@ def execute(args, now=None):
                 if (completed.get('success') is not True or type(pending) is not int or pending < 0 or
                         finished.tzinfo is None or not began_at <= finished <= datetime.now(timezone.utc)):
                     raise RuntimeError('Invalid or stale source stage result')
+                if isinstance(completed.get('warning'), str):
+                    warnings.append(completed['warning'][:300])
                 return pending == 0 if args.command == 'weekly' else True
 
             def capture():
@@ -391,9 +394,9 @@ def execute(args, now=None):
 
             try:
                 stage('capture', capture, 'Feedback capture failed',
-                      backlog_message='Feedback capture backlog remains; daily review deferred', defer=True)
+                      backlog_message='Feedback capture backlog remains; weekly review deferred', defer=True)
                 stage('evidence', evidence, 'Source feedback verification failed',
-                      backlog_message='Source verification backlog remains; daily review deferred', defer=True)
+                      backlog_message='Source verification backlog remains; weekly review deferred', defer=True)
                 stage('upload', lambda: step('upload'), 'Feedback upload failed')
                 if args.command == 'weekly' and not errors:
                     dirty = subprocess.run(['git', '-C', str(repo), 'status', '--porcelain'], capture_output=True, check=True).stdout
@@ -436,7 +439,11 @@ def execute(args, now=None):
                     # Deployment is idempotent; never trust review state alone to skip it.
                     if result.get('commit'):
                         stage('prompt_deploy', lambda: step('deploy'), 'Prompt release deployment failed')
-                if not errors and args.command == 'weekly' and due >= datetime.fromisoformat(state['setup_started_at']):
+                # A manual run for an earlier deadline (such as the week after the daily period)
+                # never moves completion back.
+                completed = state.get('completed_due')
+                if (not errors and args.command == 'weekly' and due >= datetime.fromisoformat(state['setup_started_at'])
+                        and (not completed or due > datetime.fromisoformat(completed))):
                     state['completed_due'] = due.isoformat()
                     save(state_path, state)
                 status['success'] = not errors
@@ -450,6 +457,8 @@ def execute(args, now=None):
                                   else 'Maintenance cycle failed')
             if errors:
                 status['error'] = '; '.join(errors)
+            if warnings:
+                status['warnings'] = warnings
             status['finished_at'] = datetime.now(timezone.utc).isoformat()
             status['phase'] = 'finished'
             status['last_success_finished_at' if status['success'] else 'last_failure_finished_at'] = status['finished_at']
@@ -465,7 +474,7 @@ def main():
     parser.add_argument('--run-now', action='store_true')
     args = parser.parse_args()
     if args.run_now and args.command != 'weekly':
-        parser.error('--run-now is only for daily maintenance')
+        parser.error('--run-now is only for weekly maintenance')
     try:
         return execute(args)
     except (OSError, ValueError, KeyError) as error:

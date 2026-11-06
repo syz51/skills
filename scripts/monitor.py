@@ -59,7 +59,7 @@ def probe(root):
         except (OSError, ValueError):
             result['weekly_state'] = None
             result['errors'].append('maintenance schedule state is unreadable')
-    # Never block or change the worker's lock; it can legitimately span a daily review.
+    # Never block or change the worker's lock; it can legitimately span a weekly review.
     if not (root / 'cycle.lock').exists():
         result['errors'].append('cycle lock is missing')
     else:
@@ -131,7 +131,7 @@ def health(snapshot, now, grace=False):
             completed = state.get('completed_due')
             if (due >= stamp(state['setup_started_at']) and now - due > timedelta(hours=3)
                     and (not completed or stamp(completed) < due)):
-                problems[host + ':weekly:overdue'] = host + ': Daily skill review is more than three hours overdue'
+                problems[host + ':weekly:overdue'] = host + ': Monday skill review is more than three hours overdue'
     return problems
 
 

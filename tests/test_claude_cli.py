@@ -65,7 +65,8 @@ class ClaudeCliTests(unittest.TestCase):
 
     def test_structured_run_returns_validated_output(self):
         self.assertEqual(cli.structured_run(stream(INIT, ANSWER, {'type': 'rate_limit_event'}, RESULT)),
-                         ('completed', {'notes': []}, '', {'result_subtype': 'success', 'api_error_status': None}))
+                         ('completed', {'notes': []}, '', {'result_subtype': 'success', 'api_error_status': None,
+                                                           'rate_limit_type': None, 'rate_limit_resets_at': None}))
 
     def test_structured_run_rejects_exposed_or_used_tools(self):
         exposed = {**INIT, 'tools': ['StructuredOutput', 'Bash']}
@@ -81,7 +82,8 @@ class ClaudeCliTests(unittest.TestCase):
         failed = {'type': 'result', 'subtype': 'success', 'is_error': True, 'api_error_status': 429,
                   'result': 'API Error: rate limited'}
         phase, output, errors, facts = cli.structured_run(stream(INIT, failed))
-        self.assertEqual(facts, {'result_subtype': 'success', 'api_error_status': 429})
+        self.assertEqual(facts, {'result_subtype': 'success', 'api_error_status': 429,
+                                 'rate_limit_type': None, 'rate_limit_resets_at': None})
         self.assertEqual((phase, output), ('completed', None))
         self.assertEqual(cli.failure_class(errors), 'rate limit')
         self.assertEqual(cli.structured_run(stream(INIT))[0], 'inference')
@@ -121,11 +123,31 @@ class ClaudeCliTests(unittest.TestCase):
         self.assertEqual(cli.result_facts({'type': 'result', 'is_error': True}), {'result_subtype': 'missing', 'api_error_status': None})
         odd = {'type': 'result', 'subtype': 'Private Text!', 'api_error_status': 'private'}
         self.assertEqual(cli.result_facts(odd), {'result_subtype': 'other', 'api_error_status': None})
-        self.assertEqual(cli.structured_run(stream(INIT))[3], {'result_subtype': None, 'api_error_status': None})
+        self.assertEqual(cli.structured_run(stream(INIT))[3], {'result_subtype': None, 'api_error_status': None,
+                                                               'rate_limit_type': None, 'rate_limit_resets_at': None})
+
+    def test_rejecting_usage_limit_reports_its_window_and_reset_but_no_text(self):
+        allowed = {'type': 'rate_limit_event', 'rate_limit_info': {'status': 'allowed', 'rateLimitType': 'seven_day',
+                                                                   'resetsAt': 1793000000}}
+        rejected = {'type': 'rate_limit_event', 'rate_limit_info': {'status': 'rejected', 'rateLimitType': 'five_hour',
+                                                                    'resetsAt': 1793853000}}
+        failed = {'type': 'result', 'subtype': 'success', 'is_error': True, 'api_error_status': 429,
+                  'result': "You've hit your 5-hour limit · resets 1:30pm (Asia/Tokyo)"}
+        phase, output, errors, facts = cli.structured_run(stream(INIT, allowed, rejected, failed))
+        self.assertEqual(facts, {'result_subtype': 'success', 'api_error_status': 429,
+                                 'rate_limit_type': 'five_hour', 'rate_limit_resets_at': 1793853000})
+        self.assertEqual(cli.failure_class(errors), 'rate limit')
+        # Only rejections count, and only static values are kept.
+        self.assertEqual(cli.structured_run(stream(INIT, allowed, RESULT))[3]['rate_limit_type'], None)
+        odd = {'type': 'rate_limit_event', 'rate_limit_info': {'status': 'rejected', 'rateLimitType': 'Private Text',
+                                                               'resetsAt': 'soon'}}
+        self.assertEqual({key: value for key, value in cli.structured_run(stream(INIT, odd))[3].items() if 'rate' in key},
+                         {'rate_limit_type': 'other', 'rate_limit_resets_at': None})
 
     def test_failure_classes(self):
         for text, label in (('401 authentication_failed', 'authentication'), ('Not logged in · Please run /login', 'authentication'),
-                            ('usage limit reached', 'rate limit'), ('529 overloaded_error', 'connection'),
+                            ('usage limit reached', 'rate limit'), ("You've hit your 5-hour limit", 'rate limit'),
+                            ("You've hit your weekly limit", 'rate limit'), ('529 overloaded_error', 'connection'),
                             ('Request timed out', 'connection'), ('weird', 'CLI or output'), ('', 'CLI or output')):
             self.assertEqual(cli.failure_class(text), label, text)
 

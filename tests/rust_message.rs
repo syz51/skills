@@ -85,6 +85,7 @@ fn generate(output: &str, code: i32) -> Result<codex_skills::CommitMessage, Gene
     let root = TempDir::new().unwrap();
     generate_message(
         DIFF,
+        None,
         &options(printing(&root, output, code), Duration::from_secs(20)),
     )
 }
@@ -97,6 +98,7 @@ fn success_uses_isolated_invocation_and_returns_validated_message() {
     );
     let message = generate_message(
         DIFF,
+        None,
         &options(printing(&root, &output, 0), Duration::from_secs(20)),
     )
     .unwrap();
@@ -166,10 +168,32 @@ fn success_uses_isolated_invocation_and_returns_validated_message() {
     assert!(stdin.starts_with("Generate an informative Git commit message"));
     let payload: Value = serde_json::from_str(stdin.lines().last().unwrap()).unwrap();
     assert_eq!(payload, json!({"public_diff": DIFF}));
+    assert!(!stdin.contains("was rejected"));
+}
+
+#[test]
+fn retry_instruction_joins_the_trusted_prompt_before_the_diff() {
+    let root = TempDir::new().unwrap();
+    let output = result(subject());
+    let instruction = "Do not include local paths, host names or credentials.";
+    generate_message(
+        DIFF,
+        Some(instruction),
+        &options(printing(&root, &output, 0), Duration::from_secs(20)),
+    )
+    .unwrap();
+    let stdin = fs::read_to_string(root.path().join("rec/stdin")).unwrap();
+    let (prompt, data) = stdin.trim_end().rsplit_once('\n').unwrap();
+    assert!(
+        prompt.ends_with(&format!("Body may be empty. {instruction}")),
+        "{prompt}"
+    );
+    let payload: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(payload, json!({"public_diff": DIFF}));
 
     // --help is checked once per executable per process.
     let opts = options(root.path().join("claude"), Duration::from_secs(20));
-    generate_message(DIFF, &opts).unwrap();
+    generate_message(DIFF, None, &opts).unwrap();
     let helped = fs::read_to_string(root.path().join("helped")).unwrap();
     assert_eq!(helped.lines().count(), 1);
 }
@@ -180,7 +204,7 @@ fn missing_help_flag_fails_before_generation() {
     let ran = root.path().join("ran");
     let help = HELP.replace("--verbose ", "");
     let path = fake_with_help(&root, &help, &format!("touch '{}'", ran.display()));
-    let e = generate_message(DIFF, &options(path, Duration::from_secs(20))).unwrap_err();
+    let e = generate_message(DIFF, None, &options(path, Duration::from_secs(20))).unwrap_err();
     assert!(e.to_string().contains("--verbose"), "{e}");
     assert!(!ran.exists());
 
@@ -193,7 +217,7 @@ fn missing_help_flag_fails_before_generation() {
     .unwrap();
     fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(matches!(
-        generate_message(DIFF, &options(failing, Duration::from_secs(20))),
+        generate_message(DIFF, None, &options(failing, Duration::from_secs(20))),
         Err(GenerationError::Backend(_))
     ));
 }
@@ -307,7 +331,7 @@ fn oversized_output_fails() {
     let root = TempDir::new().unwrap();
     let path = fake(&root, "cat > /dev/null\nhead -c 3000000 /dev/zero");
     assert!(matches!(
-        generate_message(DIFF, &options(path, Duration::from_secs(20))),
+        generate_message(DIFF, None, &options(path, Duration::from_secs(20))),
         Err(GenerationError::OutputTooLarge)
     ));
 }
@@ -318,7 +342,7 @@ fn timeout_kills_the_cli() {
     let path = fake(&root, "exec sleep 30");
     let start = Instant::now();
     assert!(matches!(
-        generate_message(DIFF, &options(path, Duration::from_secs(1))),
+        generate_message(DIFF, None, &options(path, Duration::from_secs(1))),
         Err(GenerationError::Timeout)
     ));
     assert!(start.elapsed() < Duration::from_secs(10));
@@ -434,7 +458,7 @@ fn live_generator_returns_a_validated_message() {
         )
     });
     let before = claude_projects();
-    let message = generate_message(DIFF, &options(cli, Duration::from_secs(180))).unwrap();
+    let message = generate_message(DIFF, None, &options(cli, Duration::from_secs(180))).unwrap();
     assert!(!message.subject.is_empty());
     codex_skills::message::validate(&message).unwrap();
 

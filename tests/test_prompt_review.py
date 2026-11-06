@@ -51,7 +51,7 @@ class PromptReviewTests(unittest.TestCase):
         self.approval = True
         self.proposal_change = {}
 
-    def responder(self, config, state, prompt, data, schema, *, deadline):
+    def responder(self, config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None):
         self.assertGreater(deadline, time.monotonic())
         self.calls.append((prompt, json.loads(data), deadline))
         value = json.loads(data)
@@ -236,7 +236,17 @@ class PromptReviewTests(unittest.TestCase):
         self.assertEqual(request.name.split('.')[0], response.name.split('.')[0])
         self.assertEqual(json.loads(response.read_text())['response'], result)
         self.assertEqual(json.loads(request.read_text())['evaluator_hash'], review.SOURCE_SHA256)
+        self.assertEqual(json.loads(request.read_text())['backend'], 'cli')
+        # The whole case input is the cache prefix, so its repeat run reads it from the cache.
+        with patch.object(review.capture, 'model_response', return_value={'notes': []}) as response:
+            review.model(self.config, self.state, 'Synthetic check 3', {'case': 'x'}, review.capture.SCHEMA, time.monotonic()+30)
+        self.assertEqual(response.call_args.kwargs['cache_prefix'], len(response.call_args.args[3]))
         self.assertEqual(request.stat().st_mode & 0o777, 0o600)
+        with patch.object(review.capture, 'model_response', return_value={'notes': []}):
+            review.model({**self.config, 'api_key_file': '/unused'}, self.state, 'Synthetic check 2', {}, review.capture.SCHEMA,
+                         time.monotonic()+30)
+        backends = sorted(json.loads(path.read_text())['backend'] for path in directory.glob('*.request.json'))
+        self.assertEqual(backends, ['api', 'cli', 'cli'])
 
     def test_model_failure_preserves_request_without_exception_secrets(self):
         with patch.object(review.capture, 'model_response', side_effect=RuntimeError('private credentials in diagnostic')):
@@ -666,20 +676,20 @@ class PromptReviewTests(unittest.TestCase):
 
     def test_semantically_unrelated_valid_notes_and_bad_grade_ids_fail_closed(self):
         original = self.responder
-        def semantic(config, state, prompt, data, schema, *, deadline):
+        def semantic(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None):
             value = json.loads(data)
             if schema is review.GRADE_SCHEMA:
                 return {'grades': [{'item_id': item['item_id'], 'passed': False} for item in value['items']]}
-            return original(config, state, prompt, data, schema, deadline=deadline)
+            return original(config, state, prompt, data, schema, deadline=deadline, role=role)
         with patch.object(review.capture, 'model_response', side_effect=semantic):
             result = review.run(self.config, self.state, due=self.due)
         self.assertEqual(result['outcome'], 'no_change')
         self.assertTrue(all(not any(v) for v in result['candidate'].values()))
         (self.state / 'prompt-review-state.json').unlink()
-        def wrong_ids(config, state, prompt, data, schema, *, deadline):
+        def wrong_ids(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None):
             if schema is review.GRADE_SCHEMA:
                 return {'grades': [{'item_id': 'wrong', 'passed': True} for _ in json.loads(data)['items']]}
-            return original(config, state, prompt, data, schema, deadline=deadline)
+            return original(config, state, prompt, data, schema, deadline=deadline, role=role)
         with patch.object(review.capture, 'model_response', side_effect=wrong_ids):
             with self.assertRaises(RuntimeError):
                 review.run(self.config, self.state, due=self.due)
@@ -701,6 +711,28 @@ class PromptReviewTests(unittest.TestCase):
                     self.assertIn('assessment', data)
         self.assertTrue(any(c['expected'] == 'partial' for c in review.load_cases(self.repo)))
 
+    def test_task_envelopes_redact_messages_notes_and_note_context_like_production(self):
+        private = 'Read /Us' + 'ers/alice/app.tsx via https://example.com/x with token=abc123'
+        redacted = 'Read [local path] via [redacted URL] with [redacted credential]'
+        templates = review.load_cases(self.repo)
+        for role in ('extract', 'verify', 'correct'):
+            with self.subTest(role=role):
+                case = dict(next(c for c in templates if c['role'] == role))
+                source = json.loads(case['input'])
+                source['messages'] = [{'role': 'user', 'text': private}]
+                if role == 'extract':
+                    source['existing_notes'] = [{'skill': 'frontend-ui', 'text': private}]
+                else:
+                    source['note'] = dict(source['note'], evidence=private)
+                data = review.task_input(dict(case, input=json.dumps(source)))
+                if role == 'extract':
+                    self.assertEqual(data['existing_notes'], [{'skill': 'frontend-ui', 'text': redacted}])
+                    self.assertEqual(data['turn']['messages'][0]['text'], redacted)
+                else:
+                    self.assertIn('- Evidence: ' + redacted, data['note'])
+                    self.assertEqual(data['original_turn']['messages'][0]['text'], redacted)
+                self.assertNotIn('abc123', json.dumps(data))
+
     def test_symlink_artifact_directories_rejected(self):
         shutil.rmtree(self.repo / 'prompt-evals/cases')
         (self.repo / 'prompt-evals/cases').symlink_to(SOURCE / 'prompt-evals/cases')
@@ -710,37 +742,61 @@ class PromptReviewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             review.published_record(self.repo, self.due, 'extract')
 
-    def test_due_tracks_daily_tokyo_deadline_and_explicit_date(self):
-        self.assertEqual(review.due_key('2026-11-02T23:59:59Z'), '2026-11-02')
-        self.assertEqual(review.due_key('2026-11-03T00:00:00Z'), '2026-11-03')
-        self.assertEqual(review.due_key('2026-11-07T12:00:00+09:00'), '2026-11-07')
-        self.assertEqual(review.due_key('2026-10-28'), '2026-10-28')
+    def test_due_is_tokyo_monday_deadline_and_explicit_date(self):
+        self.assertEqual(review.due_key('2026-11-09T09:00:00+09:00'), '2026-11-09')
+        self.assertEqual(review.due_key('2026-11-09T00:00:00Z'), '2026-11-09')
+        self.assertEqual(review.due_key('2026-11-08T23:59:59Z'), '2026-11-02')
+        self.assertEqual(review.due_key('2026-11-09T08:59:59+09:00'), '2026-11-02')
+        self.assertEqual(review.due_key('2026-11-15T12:00:00+09:00'), '2026-11-09')
+        self.assertEqual(review.due_key('2026-10-28'), '2026-10-26')
         with self.assertRaises(ValueError):
             review.due_key('2026-11-03T09:00:00')
         with self.assertRaises(ValueError):
             review.due_key('2026-02-30')
 
-    def test_daily_rotation_preserves_historical_and_migration_targets(self):
-        self.assertEqual(review.target_role('2026-10-26'), review.ROLES[42 % len(review.ROLES)])
-        self.assertEqual(review.target_role('2026-11-02'), review.ROLES[43 % len(review.ROLES)])
-        roles = [review.target_role('2026-11-' + str(n).zfill(2)) for n in range(3, 7)]
-        self.assertEqual(len(set(roles)), len(review.ROLES))
-        self.assertEqual(review.target_role('2026-11-07'), review.target_role('2026-11-03'))
+    def test_rotation_keeps_past_weekly_targets_and_resumes_after_daily_period(self):
+        roles = review.ROLES
+        self.assertEqual(review.target_role('2026-10-26'), roles[42 % len(roles)])
+        self.assertEqual(review.target_role('2026-11-02'), roles[43 % len(roles)])
+        # The daily period reviewed indexes 43 to 46 (2026-11-02 to 2026-11-05); Mondays from
+        # 2026-11-09 continue with 47, so no role repeats before every other role has had a turn.
+        mondays = ['2026-11-09', '2026-11-16', '2026-11-23', '2026-11-30']
+        self.assertEqual([review.target_role(day) for day in mondays], [roles[i % len(roles)] for i in range(47, 51)])
+        self.assertEqual(review.target_role(mondays[0]), review.target_role('2026-11-02'))
+        self.assertEqual(review.target_role('2026-12-07'), review.target_role(mondays[0]))
 
-    def test_saved_weekly_completion_suppresses_today_but_not_next_day(self):
-        saved = {'completed_due': '2026-11-02', 'result': {'outcome': 'no_change'}}
+    def test_saved_completion_suppresses_this_week_but_not_next_monday(self):
+        saved = {'completed_due': '2026-11-09', 'result': {'outcome': 'no_change'}}
         path = self.state / 'prompt-review-state.json'
         path.write_text(json.dumps(saved))
         with patch.object(review, 'review', return_value={'outcome': 'no_change'}) as work:
-            result = review.run(self.config, self.state, due='2026-11-02T09:00:00+09:00')
+            result = review.run(self.config, self.state, due='2026-11-09T09:00:00+09:00')
             self.assertEqual(result['outcome'], 'already_reviewed')
             work.assert_not_called()
-            review.run(self.config, self.state, due='2026-11-03T09:00:00+09:00')
+            review.run(self.config, self.state, due='2026-11-16T09:00:00+09:00')
             work.assert_called_once()
-            self.assertEqual(work.call_args.args[4], review.target_role('2026-11-03'))
-            self.assertEqual(json.loads(path.read_text())['completed_due'], '2026-11-03')
-            review.run(self.config, self.state, due='2026-11-03T23:00:00+09:00')
+            self.assertEqual(work.call_args.args[4], review.target_role('2026-11-16'))
+            self.assertEqual(json.loads(path.read_text())['completed_due'], '2026-11-16')
+            review.run(self.config, self.state, due='2026-11-18T23:00:00+09:00')
             work.assert_called_once()
+
+    def test_earlier_due_than_completion_is_already_reviewed_and_keeps_marker(self):
+        saved = {'completed_due': '2026-11-05', 'result': {'outcome': 'no_change'}}
+        path = self.state / 'prompt-review-state.json'
+        path.write_text(json.dumps(saved))
+        with patch.object(review, 'review', return_value={'outcome': 'no_change'}) as work:
+            result = review.run(self.config, self.state, due='2026-11-06T12:00:00+09:00')
+            self.assertEqual(result['outcome'], 'already_reviewed')
+            work.assert_not_called()
+            self.assertEqual(json.loads(path.read_text()), saved)
+
+    def test_daily_period_completion_does_not_suppress_next_monday(self):
+        saved = {'completed_due': '2026-11-05', 'result': {'outcome': 'no_change'}}
+        (self.state / 'prompt-review-state.json').write_text(json.dumps(saved))
+        with patch.object(review, 'review', return_value={'outcome': 'no_change'}) as work:
+            review.run(self.config, self.state, due='2026-11-09T09:00:00+09:00')
+            work.assert_called_once()
+            self.assertEqual(work.call_args.args[4], review.target_role('2026-11-09'))
 
 
     def test_regression_growth_cannot_exceed_evaluation_budget(self):

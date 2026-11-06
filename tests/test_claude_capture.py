@@ -96,11 +96,25 @@ class ClaudeCaptureTests(unittest.TestCase):
         self.assertNotIn('filter', turn)
         self.assertEqual(turn['evidence_id'], hashlib.sha256((SESSION + ':prompt-1').encode()).hexdigest())
 
-    def test_message_text_is_kept_verbatim(self):
+    def test_skill_injection_with_a_null_text_block_still_loads_the_skill(self):
+        transcript = ClaudeTranscript().prompt('Find a skill').skill()
+        transcript.records[-1]['message']['content'].insert(0, {'type': 'text', 'text': None})
+        [turn] = self.scan(transcript.reply('Found one.'))
+        self.assertEqual(turn['verified_skills'], ['find-skills'])
+
+    def test_text_block_without_text_does_not_break_the_turn(self):
+        [turn] = self.scan(ClaudeTranscript().prompt([{'type': 'text', 'text': None}, {'type': 'text', 'text': 'Find a skill'}])
+                           .skill().reply('Found one.'))
+        self.assertEqual([m['text'] for m in turn['messages'] if m['role'] != 'tool'], ['Find a skill', 'Found one.'])
+
+    def test_message_text_stays_raw_for_filters_and_is_redacted_for_models(self):
         prompt = 'Find a skill; mail a@example.com, see https://example.com/x and /home/alice/notes, token=abc123'
-        reply = 'Found one for Bearer abc.def at /home/alice/notes.'
+        reply = 'Found one for Bearer abc.def at /Us' + 'ers/alice/notes with sk-abcdefgh12345.'
         [turn] = self.scan(ClaudeTranscript().prompt(prompt).skill().reply(reply))
         self.assertEqual([m['text'] for m in turn['messages'] if m['role'] != 'tool'], [prompt, reply])
+        self.assertEqual([m['text'] for m in capture.message_context(turn['messages'])['messages']], [
+            'Find a skill; mail [redacted email], see [redacted URL] and [local path] [redacted credential]',
+            'Found one for [redacted credential] at [local path] with [redacted credential].'])
 
     def test_slash_command_load_is_recognized(self):
         transcript = ClaudeTranscript().prompt('<command-message>find-skills</command-message>\n<command-name>/find-skills</command-name>\n<command-args>changelog</command-args>')
@@ -327,7 +341,7 @@ class ClaudeCaptureTests(unittest.TestCase):
         config = {'sessions_root': str(sessions), 'archived_sessions_root': str(self.root / 'archive'),
                   'feedback_dir': str(feedback), 'install_root': str(self.root / 'install'),
                   'claude_path': '/bin/false', 'claude_projects_root': str(self.projects)}
-        def lessons(config, state_root, turn, existing, *, deadline=None):
+        def lessons(config, state_root, turn, existing, *, deadline=None, wait_for_rate_limit=True):
             return [{'skill': turn['verified_skills'][0], **{field: 'Verified useful check' for field in capture.FIELDS}}]
         with patch.object(capture, 'extract', side_effect=lessons) as extract:
             summary = capture.capture(config, self.root / 'state', now=LATER)

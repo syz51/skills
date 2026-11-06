@@ -22,33 +22,38 @@ jobs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(jobs)
 
 
-class DailyCadenceTests(unittest.TestCase):
-    def test_daily_deadline_boundaries_and_timezone(self):
+class WeeklyCadenceTests(unittest.TestCase):
+    def test_monday_deadline_boundaries_and_timezone(self):
         cases = (
-            ('2026-11-03T08:59:59+09:00', '2026-11-02T09:00:00+09:00'),
-            ('2026-11-03T09:00:00+09:00', '2026-11-03T09:00:00+09:00'),
-            ('2026-11-03T23:59:59+09:00', '2026-11-03T09:00:00+09:00'),
-            ('2026-11-07T13:00:00+09:00', '2026-11-07T09:00:00+09:00'),
-            ('2027-01-01T08:00:00+09:00', '2026-12-31T09:00:00+09:00'),
-            ('2026-11-02T19:00:00-05:00', '2026-11-03T09:00:00+09:00'),
+            ('2026-11-09T08:59:59+09:00', '2026-11-02T09:00:00+09:00'),
+            ('2026-11-09T09:00:00+09:00', '2026-11-09T09:00:00+09:00'),
+            ('2026-11-15T23:59:59+09:00', '2026-11-09T09:00:00+09:00'),
+            ('2026-11-12T13:00:00+09:00', '2026-11-09T09:00:00+09:00'),
+            ('2027-01-01T08:00:00+09:00', '2026-12-28T09:00:00+09:00'),
+            # Sunday evening in New York is already Monday morning in Tokyo.
+            ('2026-11-08T19:00:00-05:00', '2026-11-09T09:00:00+09:00'),
         )
         for now, expected in cases:
             with self.subTest(now=now):
                 self.assertEqual(jobs.latest_due(datetime.fromisoformat(now)).isoformat(), expected)
 
-    def test_existing_weekly_state_suppresses_today_then_allows_tomorrow(self):
+    def test_completed_daily_deadline_carries_over_until_next_monday(self):
+        # The last deadline of the daily period (Thursday 2026-11-05) satisfies that week.
         state = {'setup_started_at': '2026-10-09T14:26:04.220935+00:00',
-                 'completed_due': '2026-11-02T09:00:00+09:00'}
+                 'completed_due': '2026-11-05T09:00:00+09:00'}
         original = dict(state)
-        for now, expected in (('2026-11-02T15:00:00+09:00', False),
-                              ('2026-11-03T08:59:59+09:00', False),
-                              ('2026-11-03T09:00:00+09:00', True),
-                              ('2026-11-08T12:00:00+09:00', True)):
+        for now, expected in (('2026-11-06T09:30:00+09:00', False),
+                              ('2026-11-08T23:00:00+09:00', False),
+                              ('2026-11-09T08:59:59+09:00', False),
+                              ('2026-11-09T09:00:00+09:00', True),
+                              ('2026-11-12T12:00:00+09:00', True)):
             with self.subTest(now=now):
                 self.assertEqual(jobs.weekly_due(datetime.fromisoformat(now), state), expected)
         self.assertEqual(state, original)
-        state['setup_started_at'] = '2026-11-03T10:00:00+09:00'
-        self.assertFalse(jobs.weekly_due(datetime.fromisoformat('2026-11-03T12:00:00+09:00'), state))
+        state['completed_due'] = '2026-11-09T09:00:00+09:00'
+        self.assertFalse(jobs.weekly_due(datetime.fromisoformat('2026-11-15T12:00:00+09:00'), state))
+        state['setup_started_at'] = '2026-11-16T10:00:00+09:00'
+        self.assertFalse(jobs.weekly_due(datetime.fromisoformat('2026-11-16T12:00:00+09:00'), state))
 
 
 class JobsTests(unittest.TestCase):
@@ -73,7 +78,10 @@ root = pathlib.Path(__file__).parents[2]
 with (root / 'trace').open('a') as stream: stream.write('capture\\n')
 if (root / 'fail-capture').exists(): sys.exit(1)
 state = pathlib.Path(sys.argv[sys.argv.index('--config') + 1]).parent
-(state / 'capture-status.json').write_text(json.dumps({'finished_at': datetime.now(timezone.utc).isoformat(), 'success': True, 'counts': {'pending': 3 if (root / 'backlog').exists() else 0}}))
+status = {'finished_at': datetime.now(timezone.utc).isoformat(), 'success': True, 'counts': {'pending': 3 if (root / 'backlog').exists() else 0}}
+if (root / 'rate-limited').exists():
+    status['warning'] = 'Claude usage limit reached; 1 turns wait for its reset at 2026-11-05T04:31:00+00:00.'
+(state / 'capture-status.json').write_text(json.dumps(status))
 ''')
         (self.repo / 'scripts/evidence.py').write_text('''import json, pathlib, sys
 from datetime import datetime, timezone
@@ -185,7 +193,7 @@ elif not (root / 'missing-report').exists():
         def improve(config, state_root, **kwargs):
             self.assertEqual(self.trace.read_text().splitlines()[-1], 'deploy')
             self.assertEqual(state_root, self.state.resolve())
-            self.assertEqual(kwargs['due'], '2026-10-13T09:00:00+09:00')
+            self.assertEqual(kwargs['due'], '2026-10-12T09:00:00+09:00')
             self.assertGreater(kwargs['timeout'], 0)
             self.assertLessEqual(kwargs['timeout'], 900)
             return {'outcome': 'no_change'}
@@ -303,28 +311,29 @@ elif not (root / 'missing-report').exists():
                 patch.object(jobs, 'review_prompts', side_effect=improve):
             self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 13, 3, tzinfo=timezone.utc)), 0)
 
-    def test_daily_check_keeps_legacy_state_and_reports_next_day_without_work(self):
+    def test_check_keeps_daily_period_state_and_reports_next_monday_without_work(self):
         self.initialize()
         saved = {'setup_started_at': '2026-10-09T14:26:04.220935+00:00',
-                 'completed_due': '2026-11-02T09:00:00+09:00'}
+                 'completed_due': '2026-11-05T09:00:00+09:00'}
         path = self.state / 'weekly-state.json'
         path.write_text(json.dumps(saved))
         before = path.read_bytes()
         self.args.check = True
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            self.assertEqual(jobs.execute(self.args, datetime.fromisoformat('2026-11-02T15:00:00+09:00')), 0)
+            self.assertEqual(jobs.execute(self.args, datetime.fromisoformat('2026-11-06T15:00:00+09:00')), 0)
         result = json.loads(output.getvalue())
         self.assertFalse(result['weekly_due'])
-        self.assertEqual(result['next_due'], '2026-11-03T09:00:00+09:00')
+        self.assertEqual(result['latest_due'], '2026-11-02T09:00:00+09:00')
+        self.assertEqual(result['next_due'], '2026-11-09T09:00:00+09:00')
         self.assertEqual(path.read_bytes(), before)
         self.assertFalse(self.trace.exists())
 
-    def test_first_run_does_not_catch_up_previous_day(self):
+    def test_first_run_does_not_catch_up_previous_week(self):
         self.initialize()
         self.assertNotIn('completed_due', self.state_data())
 
-    def test_missed_days_catch_up_latest_daily_deadline_once(self):
+    def test_suspended_monday_catches_up_tuesday_once(self):
         self.initialize()
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
@@ -333,9 +342,22 @@ elif not (root / 'missing-report').exists():
         self.assertEqual(status['stages'], {name: {'success': True} for name in
                          ('capture', 'evidence', 'upload', 'collect', 'review', 'publish', 'deploy')})
         self.assertNotIn('error', status)
-        self.assertEqual(self.state_data()['completed_due'], '2026-10-13T09:00:00+09:00')
+        self.assertEqual(self.state_data()['completed_due'], '2026-10-12T09:00:00+09:00')
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
         self.assertEqual(len(self.trace.read_text().splitlines()), 7)
+
+    def test_manual_run_for_earlier_deadline_keeps_later_completion(self):
+        self.initialize()
+        path = self.state / 'weekly-state.json'
+        state = self.state_data()
+        state['completed_due'] = '2026-10-15T09:00:00+09:00'  # a daily-period completion, after Monday
+        path.write_text(json.dumps(state))
+        self.args.run_now = True
+        self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 16, 3, tzinfo=timezone.utc)), 0)
+        self.assertIn('claude', self.trace.read_text().splitlines())
+        self.assertEqual(self.state_data()['completed_due'], '2026-10-15T09:00:00+09:00')
+        self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 19, 3, tzinfo=timezone.utc)), 0)
+        self.assertEqual(self.state_data()['completed_due'], '2026-10-19T09:00:00+09:00')
 
     def test_failure_preserves_due_for_retry(self):
         self.initialize()
@@ -366,7 +388,7 @@ elif not (root / 'missing-report').exists():
         self.assertIn('--no-session-persistence', argv)
         self.assertEqual(argv[argv.index('--permission-mode') + 1], 'bypassPermissions')
         self.assertEqual(argv[argv.index('--model') + 1], 'claude-opus-5-5')
-        self.assertEqual(argv[argv.index('--effort') + 1], 'xhigh')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'high')
         self.assertEqual(argv[argv.index('--output-format') + 1], 'stream-json')
         self.assertNotIn('--setting-sources', argv)
         self.assertEqual(os.path.realpath(call['cwd']), os.path.realpath(self.repo))
@@ -498,6 +520,18 @@ elif not (root / 'missing-report').exists():
         with self.assertRaises(ValueError):
             jobs.execute(self.args)
         self.assertFalse(self.trace.exists())
+
+    def test_usage_limit_deferral_is_a_visible_warning_not_a_failed_sync(self):
+        self.args.command = 'sync'
+        (self.root / 'rate-limited').touch()
+        self.assertEqual(jobs.execute(self.args), 0)
+        status = json.loads((self.state / 'sync-status.json').read_text())
+        self.assertTrue(status['success'])
+        self.assertEqual(status['stages']['capture'], {'success': True})
+        self.assertEqual(status['warnings'], ['Claude usage limit reached; 1 turns wait for its reset at 2026-11-05T04:31:00+00:00.'])
+        (self.root / 'rate-limited').unlink()
+        self.assertEqual(jobs.execute(self.args), 0)
+        self.assertNotIn('warnings', json.loads((self.state / 'sync-status.json').read_text()))
 
     def test_sync_sequence(self):
         self.args.command = 'sync'

@@ -3,7 +3,6 @@
 Skipped unless RUN_CLAUDE_LIVE=1; with it set, a missing CLI fails instead of skipping. They use the caller's Claude Code login and make a
 few small claude-haiku-5-5 calls at low effort; never run them in credential-free CI.
 """
-import functools
 import json
 import os
 from pathlib import Path
@@ -103,8 +102,10 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertEqual(created, [], 'a Claude Code session persisted state under ' + str(projects_dir()))
 
     def cheap(self, function):
-        """The production builders bind Opus/xhigh at definition time; pin a small model instead."""
-        return patch.object(claude_cli, function.__name__, functools.partial(function, model=MODEL, effort=EFFORT))
+        """Pin a small model: production builders bind high effort, and model_response passes each role's model."""
+        def pinned(*args, **kwargs):
+            return function(*args, **{**kwargs, 'model': MODEL, 'effort': EFFORT})
+        return patch.object(claude_cli, function.__name__, pinned)
 
     def test_cli_advertises_every_required_flag(self):
         help_text = subprocess.run([self.cli, '--help'], env={**claude_cli.child_env(), 'LC_ALL': 'C'},

@@ -14,7 +14,7 @@ import capture
 import claude_cli
 import read_guidance
 
-from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, FIELDS, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
+from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, RateLimited, FIELDS, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
                      completed_turns, message_context, model_response, safe_path, timestamp, validate_notes)
 
 # Source checks need more room than extraction, which also carries duplicate-note context.
@@ -190,6 +190,11 @@ def evidence_fingerprint(turn):
 
 
 def source_input(note, turn, **extra):
+    # Notes are not privacy-checked, so the note under check, and the original a correction
+    # replaces, are redacted like the transcript they are compared with.
+    note = capture.redact(note)
+    if 'correction_of' in extra:
+        extra['correction_of'] = capture.redact(extra['correction_of'])
     follow_ups = turn.get('follow_ups', [])
     def build(compact):
         source = {**message_context(turn['messages'], compact=compact),
@@ -212,9 +217,10 @@ def source_input(note, turn, **extra):
     return data, source['truncated'] or any(item['truncated'] for item in later) or len(later) != len(follow_ups)
 
 
-def verify_note(config, state_root, note, turn, skill, correction_of=None, *, deadline=None):
+def verify_note(config, state_root, note, turn, skill, correction_of=None, *, deadline=None, wait_for_rate_limit=True):
     data, truncated = source_input(note, turn, **({'correction_of': correction_of} if correction_of is not None else {}))
-    result = model_response(config, state_root, prompt_runtime.load('verify', config), data, SCHEMA, deadline=deadline)
+    result = model_response(config, state_root, prompt_runtime.load('verify', config), data, SCHEMA, deadline=deadline,
+                            wait_for_rate_limit=wait_for_rate_limit, role='verify')
     if not isinstance(result, dict) or set(result) != {'status', 'summary'} or result['status'] not in SCHEMA['properties']['status']['enum']:
         raise ValueError('Invalid source verification result')
     capture.validate_summary(result['summary'], skill)
@@ -222,13 +228,15 @@ def verify_note(config, state_root, note, turn, skill, correction_of=None, *, de
             'inputTruncated': truncated}
 
 
-def correct_note(config, state_root, note, turn, skill, assessment, *, deadline=None):
+def correct_note(config, state_root, note, turn, skill, assessment, *, deadline=None, wait_for_rate_limit=True):
     data, truncated = source_input(note, turn, skill=skill,
                                   assessment={key: assessment[key] for key in ('status', 'summary')})
     if truncated:
         return None
     candidates = validate_notes(model_response(config, state_root, prompt_runtime.load('correct', config), data,
-                                               CORRECTION_SCHEMA, deadline=deadline), {'verified_skills': [skill]})
+                                               CORRECTION_SCHEMA, deadline=deadline, wait_for_rate_limit=wait_for_rate_limit,
+                                               role='correct'),
+                                {'verified_skills': [skill]})
     if len(candidates) > 1:
         raise ValueError('Too many correction candidates')
     if not candidates:
@@ -236,7 +244,8 @@ def correct_note(config, state_root, note, turn, skill, assessment, *, deadline=
     candidate = candidates[0]
     text = '# ' + candidate['title'] + '\n' + '\n'.join(
         '- ' + key.title() + ': ' + candidate[key] for key in FIELDS if key != 'title') + '\n'
-    checked = verify_note(config, state_root, text, turn, skill, correction_of=note, deadline=deadline)
+    checked = verify_note(config, state_root, text, turn, skill, correction_of=note, deadline=deadline,
+                          wait_for_rate_limit=wait_for_rate_limit)
     if checked['status'] != 'supported' or checked['inputTruncated']:
         return None
     return {'note': candidate, **checked, 'generationInputSha256': hashlib.sha256(data.encode()).hexdigest()}
@@ -259,6 +268,7 @@ def checker_fingerprint(config):
     digest = hashlib.sha256()
     for module, imported_hash in ((sys.modules[__name__], SOURCE_SHA256),
                                   (capture, capture.SOURCE_SHA256),
+                                  (capture.claude_api, capture.claude_api.SOURCE_SHA256),
                                   (claude_cli, claude_cli.SOURCE_SHA256),
                                   (prompt_runtime, prompt_runtime.SOURCE_SHA256),
                                   (read_guidance, read_guidance.SOURCE_SHA256),
@@ -282,7 +292,7 @@ def verify(config, state_root, note_sha=None, recheck=False):
     found = False
     counts = {'notes': 0, 'current': 0, 'checked': 0, 'pending': 0, 'unavailable': 0, 'errors': 0,
               'supported': 0, 'partial': 0, 'unsupported': 0, 'corrected': 0, 'unresolved': 0,
-              'recovered': 0, 'ambiguous': 0}
+              'recovered': 0, 'ambiguous': 0, 'rate_limited': 0, 'rate_limit': None}
     checker_sha = checker_fingerprint(config)
     for skill in SKILLS:
         for path in sorted((feedback / skill / 'notes').glob('*.md')):
@@ -321,6 +331,8 @@ def verify(config, state_root, note_sha=None, recheck=False):
         raise ValueError('Requested source note is unavailable on this host')
     if not targets:
         return counts
+    # A check requested for one note is attempted at once; scheduled checks wait for a usage limit's reset.
+    limit, wait = None, not note_sha
     sessions = Path(config.get('sessions_root', codex_home() / 'sessions'))
     archived = Path(config.get('archived_sessions_root', codex_home() / 'archived_sessions'))
     errors = []
@@ -377,7 +389,7 @@ def verify(config, state_root, note_sha=None, recheck=False):
             counts['pending'] += 1
             continue
         try:
-            result = verify_note(config, state_root, note, turn, skill, deadline=deadline)
+            result = verify_note(config, state_root, note, turn, skill, deadline=deadline, wait_for_rate_limit=wait)
             value = {'schema_version': 4, 'noteSha256': digest, 'sourceMachine': config['host_id'],
                 'skill': skill, 'thread': turn['thread'], 'turn': turn['turn'], 'sourceSha256': turn['source_sha256'],
                 'completed_at': turn['completed_at'], 'checked_at': datetime.now(timezone.utc).isoformat(),
@@ -387,7 +399,8 @@ def verify(config, state_root, note_sha=None, recheck=False):
                 'evidenceSha256': fingerprint,
                 'followUps': [turn_identity(item) for item in follow_ups], **result}
             if result['status'] != 'supported' and not result['inputTruncated']:
-                value['correction'] = correct_note(config, state_root, note, turn, skill, result, deadline=deadline)
+                value['correction'] = correct_note(config, state_root, note, turn, skill, result, deadline=deadline,
+                                                   wait_for_rate_limit=wait)
             validate_receipt(value)
             data = json.dumps(value, indent=2) + '\n'
             receipt = directory / (digest + '--' + hashlib.sha256(data.encode()).hexdigest() + '.json')
@@ -397,11 +410,21 @@ def verify(config, state_root, note_sha=None, recheck=False):
             count_assessment(counts, value)
         except CaptureBudgetExpired:
             counts['pending'] += 1
+        except RateLimited as error:
+            limit, wait = error.limit, True
+            counts['pending'] += 1
+            counts['rate_limited'] += 1
+            # A requested check that could not run is a failure of that request.
+            counts['errors'] += int(bool(note_sha))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             counts['errors'] += 1
             counts['pending'] += 1
             if isinstance(error, ExtractorFailure) and len(counts.get('extractor_diagnostics', [])) < 10:
                 counts.setdefault('extractor_diagnostics', []).append(error.diagnostics)
+    if counts['rate_limited']:
+        counts['rate_limit'] = capture.rate_limit_summary(limit, counts['rate_limited'], datetime.now(timezone.utc))
+        if counts['rate_limit']['overdue'] and not note_sha:
+            counts['errors'] += counts['rate_limited']
     return counts
 
 
@@ -426,6 +449,11 @@ def main():
         config = json.loads(args.config.read_text())
         counts = verify(config, root, args.note_sha, args.recheck)
         status = {'finished_at': datetime.now(timezone.utc).isoformat(), 'success': counts['errors'] == 0, 'counts': counts}
+        if counts['rate_limit'] and args.note_sha:
+            status['error'] = ('The Claude usage limit rejected the requested source check; retry after '
+                               + counts['rate_limit']['retry_at'] + '.')
+        else:
+            capture.report_rate_limit(status, counts['rate_limit'], 'source checks')
         atomic(root / 'evidence-status.json', json.dumps(status, indent=2) + '\n')
         print(json.dumps(status))
         return 0 if status['success'] else 1

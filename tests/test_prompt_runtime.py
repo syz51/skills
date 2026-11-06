@@ -58,7 +58,7 @@ class PromptRuntimeTests(unittest.TestCase):
                     self.assertEqual(fixed, runtime.COMMON_CONTRACT + runtime.ROLE_CONTRACTS[role] + '\n')
 
     def test_repository_note_prompts_carry_no_removed_privacy_instructions(self):
-        # Exact removed phrases only: the daily prompt review may reword these files freely.
+        # Exact removed phrases only: the weekly prompt review may reword these files freely.
         removed = ('Preserve privacy:', 'previous_capture_rejection', 'previous_privacy_rejection',
                    'Static privacy checks reject', 'never copy private excerpts', 'never quote private drafts',
                    'no private quotations', 'no private source quotations', 'static privacy check',

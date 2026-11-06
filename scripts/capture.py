@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import activation_trace
+import claude_api
 import claude_cli
 from read_guidance import SKILL_PATTERN, SKILLS, guidance_path, observed, request, shell_words
 
@@ -36,6 +37,12 @@ MAX_OUTPUT = 12000
 MAX_TURNS = 20
 MODEL_TIMEOUT = 240
 CYCLE_TIMEOUT = 900
+# A Claude usage limit defers model calls to its reset, or to the next hourly cycle when no reset is
+# reported. Work that the limit has blocked for longer than the grace period fails capture and sources.
+RATE_LIMIT_RETRY = timedelta(minutes=30)
+RATE_LIMIT_GRACE = timedelta(hours=24)
+# A rejection this soon after the recorded reset continues the same limit; a later one starts a new limit.
+RATE_LIMIT_CONTINUES = timedelta(hours=2)
 # CLI paths whose --help advertised every isolation control in this process.
 VERIFIED_CLIS = set()
 FIELDS = ('title', 'task', 'observation', 'evidence', 'cause', 'proposal')
@@ -55,6 +62,68 @@ class ExtractorFailure(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.diagnostics = diagnostics
+
+
+class RateLimited(ExtractorFailure):
+    """The account's usage limit rejected a call. The work waits for the limit's reset; it is not a failed extraction."""
+    def __init__(self, reason, diagnostics, limit):
+        super().__init__(reason, diagnostics)
+        self.limit = limit
+
+
+def rate_limit_path(state_root, api=False):
+    """The usage-limit record shared by every restricted call on one backend. The Claude API is billed apart
+    from the Claude Code subscription, so each backend keeps its own record."""
+    return Path(state_root) / ('rate-limit-api.json' if api else 'rate-limit.json')
+
+
+def read_rate_limit(state_root, api=False):
+    path = rate_limit_path(state_root, api)
+    safe_path(path)
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    try:
+        if (not isinstance(value, dict) or set(value) != {'since', 'retry_at', 'window'} or
+                not all(isinstance(value[key], str) for key in ('since', 'retry_at')) or
+                not (value['window'] is None or isinstance(value['window'], str))):
+            raise ValueError
+        timestamp(value['since'])
+        timestamp(value['retry_at'])
+    except ValueError:
+        raise ValueError('Invalid rate limit state') from None
+    return value
+
+
+def record_rate_limit(state_root, facts, now, api=False):
+    previous = read_rate_limit(state_root, api)
+    continues = previous is not None and now - timestamp(previous['retry_at']) <= RATE_LIMIT_CONTINUES
+    resets = facts.get('rate_limit_resets_at')
+    reset = datetime.fromtimestamp(resets, timezone.utc) if resets is not None else None
+    retry = max(reset, now) + timedelta(minutes=1) if reset and reset <= now + timedelta(days=8) else now + RATE_LIMIT_RETRY
+    if continues:
+        # A rejection that reports no reset never shortens a known wait.
+        retry = max(retry, timestamp(previous['retry_at']))
+    value = {'since': previous['since'] if continues else now.isoformat(), 'retry_at': retry.isoformat(),
+             'window': facts.get('rate_limit_type') or (previous['window'] if continues else None)}
+    atomic(rate_limit_path(state_root, api), json.dumps(value, indent=2) + '\n')
+    return value
+
+
+def rate_limit_summary(limit, count, now):
+    """Status fields for work a usage limit deferred; overdue once it has blocked work past the grace period."""
+    return {**limit, 'deferred': count, 'overdue': now - timestamp(limit['since']) > RATE_LIMIT_GRACE}
+
+
+def report_rate_limit(status, limit, work):
+    """A deferral within the grace period is a warning on a successful stage; past it, part of the error."""
+    if not limit:
+        return
+    if limit['overdue']:
+        status['error'] = ' '.join(filter(None, (status.get('error'),
+                                                 f"The Claude usage limit has blocked {limit['deferred']} {work} for more than 24 hours.")))
+    elif status['success']:
+        status['warning'] = f"Claude usage limit reached; {limit['deferred']} {work} wait for its reset at {limit['retry_at']}."
 
 
 def bounded_timeout(limit, deadline):
@@ -80,8 +149,42 @@ def timestamp(value):
     return result
 
 
+# One pass, so a placeholder is never matched again. At one position the first
+# alternative wins, so URLs and Git remotes are replaced before their user@host part
+# can read as an email. Lookbehinds anchor each pattern at the start of its word, and
+# no pattern backtracks more than once over a word, so the pass stays linear.
+REDACTIONS = re.compile('|'.join([
+    # A whole PEM or PGP private-key block, or everything after a header whose END is missing.
+    r'(?P<credential>-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----'
+    r'(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|[\s\S]*)'
+    # A bare, quoted, JSON-style or escaped-JSON assignment to a name containing a credential
+    # word that ends there or at a separator or capital: token=…, API_KEY='…', "api_key": "…",
+    # \"token\": \"…\", DB_PASSWORD=…, AWS_SECRET_ACCESS_KEY=… or githubTokenValue: …
+    r'|(?P<quote>\\?["\']?)(?<![\w-])'
+    r'(?=[\w-]*?(?i:api[_-]?key|token|passw(?:or)?d|secret|private[_-]?key)(?![a-z0-9]))[\w-]+(?P=quote)\s*[:=]\s*'
+    r'(?:"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|\\"(?:[^"\\\n]|\\[^"\n])*\\"|(?:\\?["\'])?[^\s"\']+)'
+    # A bearer token.
+    r'|(?<![\w-])(?i:bearer)\s+[^\s"\']+'
+    # Token formats the public-export scanner rejects.
+    r'|\b(?:github_pat_[A-Za-z0-9_]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|AKIA[A-Z0-9]{16})\b)',
+    # Any scheme://… URL, credentials included, and scp-style remotes such as git@host:owner/repo.git.
+    r'(?P<url>(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s<>"\']+|(?<![\w.+-])[\w.+-]+@[\w.-]+:(?=[\w~./-])[^\s<>"\']+)',
+    r'(?P<email>(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})',
+    # Pattern-based: a path containing a space is replaced only up to that space.
+    r'(?P<path>/(?:Users|home)/[^\s<>"\']+)',
+]))
+PLACEHOLDERS = {'credential': '[redacted credential]', 'url': '[redacted URL]', 'email': '[redacted email]', 'path': '[local path]'}
+
+
+def redact(text):
+    """Replace credentials, URLs and Git remotes, email addresses and local paths before a model sees text."""
+    return REDACTIONS.sub(lambda match: PLACEHOLDERS[next(name for name in PLACEHOLDERS if match[name] is not None)], text)
+
+
 def text_content(payload):
-    return '\n'.join(item.get('text', '') for item in payload.get('content', []) if isinstance(item, dict))
+    content = payload.get('content', [])
+    return '\n'.join(item['text'] if isinstance(item.get('text'), str) else ''
+                     for item in (content if isinstance(content, list) else []) if isinstance(item, dict))
 
 
 def read_results(value):
@@ -91,7 +194,7 @@ def read_results(value):
             value = json.loads(value)
         except ValueError:
             try:
-                value = ast.literal_eval(value)
+                value = activation_trace.quiet_parse(ast.literal_eval, value)
             except (ValueError, SyntaxError, RecursionError):
                 marker = re.search(r'Exit code: (\d+)\nOutput:\n', value)
                 return [{'exit_code': int(marker[1]), 'output': value[marker.end():]}] if marker else []
@@ -108,19 +211,12 @@ def read_results(value):
 
 def exec_arguments(raw, start=0):
     """Parse only flat literal exec options, never JavaScript expressions."""
-    token = re.compile(r'\s*("(?:[^"\\]|\\.)*"|\x27(?:[^\x27\\]|\\.)*\x27|[A-Za-z_$][\w$]*|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}:,])')
+    token = re.compile(r'\s*("(?:[^"\\]|\\[\s\S])*"|\x27(?:[^\x27\\]|\\[\s\S])*\x27|[A-Za-z_$][\w$]*|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}:,])')
     def take(position):
         match = token.match(raw, position)
         if not match:
             raise ValueError('Not a literal exec argument')
         return match[1], match.end()
-    def string(value):
-        if value.startswith('"'):
-            return json.loads(value)
-        # Unsupported JS escapes stay unknown rather than adopting Python semantics.
-        if re.search(r'\\(?![\\\x27"bfnrtv])', value):
-            raise ValueError('Unsupported string escape')
-        return ast.literal_eval(value)
     opening, position = take(start)
     if opening != '{':
         raise ValueError('Expected literal exec options')
@@ -128,7 +224,7 @@ def exec_arguments(raw, start=0):
     key, position = take(position)
     while key != '}':
         if key[:1] in ('"', "'"):
-            key = string(key)
+            key = activation_trace.js_string(key)
         elif not re.fullmatch(r'[A-Za-z_$][\w$]*', key):
             raise ValueError('Computed exec option')
         if key in values or key == '__proto__':
@@ -138,7 +234,7 @@ def exec_arguments(raw, start=0):
             raise ValueError('Expected literal exec option value')
         value, position = take(position)
         if value[:1] in ('"', "'"):
-            value = string(value)
+            value = activation_trace.js_string(value)
         elif value in ('true', 'false', 'null'):
             value = {'true': True, 'false': False, 'null': None}[value]
         elif re.fullmatch(r'-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?', value):
@@ -235,11 +331,11 @@ def literal_commands(raw):
         if isinstance(command, str):
             commands = [command]
     except (ValueError, AttributeError):
-        for match in re.finditer(r'\bcmd\s*:\s*("(?:[^"\\]|\\.)*"|\x27(?:[^\x27\\]|\\.)*\x27)', raw):
+        for match in re.finditer(r'\bcmd\s*:\s*("(?:[^"\\]|\\[\s\S])*"|\x27(?:[^\x27\\]|\\[\s\S])*\x27)', raw):
             try:
-                commands.append(ast.literal_eval(match[1]))
+                commands.append(activation_trace.js_string(match[1]))
             except (ValueError, SyntaxError):
-                return []
+                return []  # An undecodable command stays unknown, as in exec_arguments.
     return commands
 
 
@@ -469,9 +565,12 @@ def creation_matches(raw, output, notes, recorded_at, tool_name='exec_command'):
         if not isinstance(json.loads(raw), dict) or not re.search(r'(?:^|[._])exec_command$', tool_name):
             return []
     except ValueError:
-        masked = re.sub(r'"(?:[^"\\]|\\.)*"|\x27(?:[^\x27\\]|\\.)*\x27', '""', raw)
+        masked = re.sub(r'"(?:[^"\\]|\\[\s\S])*"|\x27(?:[^\x27\\]|\\[\s\S])*\x27', '""', raw)
         calls = re.findall(r'\b([\w.]+)\s*\(', masked)
         if calls.count('tools.exec_command') != 1 or any(call not in ('text', 'tools.exec_command') for call in calls):
+            return []
+        # The whole options object must be literal, so an expression such as "a" && "b" cannot borrow a command.
+        if not unchanged_reads(raw, commands):
             return []
     command = commands[0]
     match = re.fullmatch(r"([^\n;&|`$]+)<<'([A-Za-z_][A-Za-z0-9_]*)'\n([\s\S]*)\n\2\s*", command)
@@ -484,7 +583,7 @@ def creation_matches(raw, output, notes, recorded_at, tool_name='exec_command'):
     if len(words) < 2 or words[-1] != '-' or Path(words[-2]).name not in ('python', 'python3') or len(match[3]) > 262144:
         return []
     try:
-        statements = ast.parse(match[3]).body
+        statements = activation_trace.quiet_parse(ast.parse, match[3]).body
     except (ValueError, SyntaxError, RecursionError):
         return []
     paths = []
@@ -542,9 +641,10 @@ def literal_entrypoint(raw):
 
 
 def loaded_reads(raw, output, turn):
-    if not re.search(r'(?:' + SKILL_PATTERN + r')/', raw):
-        return []
     commands = literal_commands(raw)
+    # A JavaScript literal may escape slashes, as in skills\/rust\/SKILL.md, so decoded commands count too.
+    if not any(re.search(r'(?:' + SKILL_PATTERN + r')/', text) for text in (raw, *commands)):
+        return []
     if not commands:
         try:
             request(raw)
@@ -658,7 +758,9 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
                     continue
                 source_hash.update(line)
                 if kind == 'event_msg' and payload.get('type') == 'user_message':
-                    current['messages'].append({'role': 'user', 'text': payload.get('message', '')})
+                    # Messages stay raw for local filters; message_context redacts them for models.
+                    message = payload.get('message')
+                    current['messages'].append({'role': 'user', 'text': message if isinstance(message, str) else ''})
                 if kind == 'response_item':
                     item_type = payload.get('type')
                     if item_type in ('function_call', 'custom_tool_call'):
@@ -759,7 +861,8 @@ def claude_text(content):
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
-        text = '\n'.join(item.get('text', '') for item in content if isinstance(item, dict) and item.get('type') == 'text')
+        text = '\n'.join(item['text'] if isinstance(item.get('text'), str) else '' for item in content
+                         if isinstance(item, dict) and item.get('type') == 'text')
     else:
         return ''
     text = re.sub(r'<(system-reminder|task-notification)>[\s\S]*?</\1>', '', text)
@@ -891,7 +994,9 @@ def claude_record(scan, record, line, source_notes):
     elif results:
         claude_result(scan, record, results, source_notes)
     elif record.get('isMeta'):
-        text = '\n'.join(item.get('text', '') for item in content if isinstance(item, dict)) if isinstance(content, list) else str(content or '')
+        # A block without text is skipped, so it cannot shift the injected skill's header.
+        text = ('\n'.join(item['text'] for item in content if isinstance(item, dict) and isinstance(item.get('text'), str))
+                if isinstance(content, list) else str(content or ''))
         injected = re.match(r'Base directory for this skill: ([^\n]+)\n\n', text)
         source = record.get('sourceToolUseID')
         skill = Path(injected[1].strip()).name if injected else None
@@ -1025,6 +1130,7 @@ def validate_summary(summary, skill='frontend-ui'):
 
 
 def message_context(messages, compact=False):
+    """The model-facing view of turn messages: each text is redacted in full before any bound applies."""
     indexed = [(i, m) for i, m in enumerate(messages) if m['role'] in ('user', 'assistant')]
     selected = indexed
     if compact:
@@ -1034,13 +1140,16 @@ def message_context(messages, compact=False):
         selected = [(i, m) for i, m in indexed if i in keep]
     included = {i for i, _ in selected}
     omitted = [i for i, _ in indexed if i not in included]
-    result = [{'role': m['role'], 'text': m['text'][:2000] if compact else m['text'],
-               'source_index': i, 'original_chars': len(m['text'])} for i, m in selected]
+    result = []
+    for i, m in selected:
+        text = redact(m['text'])
+        result.append({'role': m['role'], 'text': text[:2000] if compact else text,
+                       'source_index': i, 'original_chars': len(text)})
     return {'messages': result, 'omitted_message_indices': omitted,
             'truncated': bool(omitted) or any(len(m['text']) < m['original_chars'] for m in result)}
 
 
-def extract(config, state_root, turn, existing, *, deadline=None):
+def extract(config, state_root, turn, existing, *, deadline=None, wait_for_rate_limit=True):
     relevant = []
     for skill in turn['verified_skills']:
         matching = sorted((note for note in existing if note['skill'] == skill), key=lambda note: note.get('order', 0))
@@ -1050,15 +1159,21 @@ def extract(config, state_root, turn, existing, *, deadline=None):
     compact.update(message_context(turn.get('messages', [])))
     compact['calls'] = turn.get('calls', [])[-60:]
     compact['truncated'] |= len(compact['calls']) != len(turn.get('calls', []))
-    data = json.dumps({'turn': compact, 'existing_notes': existing}, ensure_ascii=False)
+    # The existing notes come first: consecutive turns of the same skills share them, so the API caches them as a
+    # prefix. The text is the JSON of {'existing_notes': ..., 'turn': ...}, the order the prompt evaluations use.
+    def encode(notes):
+        head = '{"existing_notes": ' + json.dumps(notes, ensure_ascii=False) + ', '
+        return head + '"turn": ' + json.dumps(compact, ensure_ascii=False) + '}', len(head) if notes else None
+    data, prefix = encode(existing)
     if len(data) > MAX_INPUT:
         compact.update(message_context(turn.get('messages', []), compact=True))
         compact['truncated'] = True
-        smaller = [note for skill in turn['verified_skills'] for note in [n for n in existing if n['skill'] == skill][-2:]]
-        data = json.dumps({'turn': compact, 'existing_notes': smaller}, ensure_ascii=False)
+        data, prefix = encode([note for skill in turn['verified_skills'] for note in [n for n in existing if n['skill'] == skill][-2:]])
     if len(data) > MAX_INPUT:
         raise ValueError('Capture input exceeds safety bound')
-    return validate_notes(model_response(config, state_root, prompt_runtime.load('extract', config), data, SCHEMA, deadline=deadline), turn)
+    return validate_notes(model_response(config, state_root, prompt_runtime.load('extract', config), data, SCHEMA,
+                                         deadline=deadline, wait_for_rate_limit=wait_for_rate_limit, role='extract',
+                                         cache_prefix=prefix), turn)
 
 
 def run_extractor(command, *, env, input, timeout, cwd=None):
@@ -1105,43 +1220,69 @@ def usable(output):
     return isinstance(output, dict) and len(json.dumps(output, ensure_ascii=False)) <= MAX_OUTPUT
 
 
-def model_response(config, state_root, prompt, data, response_schema, *, deadline=None):
+def model_response(config, state_root, prompt, data, response_schema, *, deadline=None, wait_for_rate_limit=True,
+                   role=None, cache_prefix=None):
+    """Run one restricted call on the role's model: through the Claude API when the configuration names a key
+    file, otherwise through the Claude Code CLI. Until a recorded usage limit's reset, raise RateLimited
+    without calling, unless the caller asked for an immediate retry."""
+    model = claude_cli.ROLE_MODELS.get(role, claude_cli.RESTRICTED_MODEL)
+    api = bool(config.get('api_key_file'))
+    limit = read_rate_limit(state_root, api)
+    if wait_for_rate_limit and limit and datetime.now(timezone.utc) < timestamp(limit['retry_at']):
+        raise RateLimited('extractor rate limit failure', {'phase': 'startup', 'failure_class': 'rate limit', 'attempts': 0},
+                          limit)
     with tempfile.TemporaryDirectory(prefix='.capture-model-', dir=state_root) as folder:
         bounded_timeout(MODEL_TIMEOUT, deadline)
-        cli = str(claude_cli.cli_path(config))
-        verify_cli(cli, deadline=deadline)
-        command = claude_cli.restricted_command(cli, response_schema)
-        child_env = claude_cli.child_env()
+        if api:
+            command, child_env = claude_api.command(config), claude_api.environment(config)
+        else:
+            cli = str(claude_cli.cli_path(config))
+            verify_cli(cli, deadline=deadline)
+            command = claude_cli.restricted_command(cli, response_schema, model=model)
+            child_env = claude_cli.child_env()
         for attempt in range(1, 3):
             timeout = bounded_timeout(MODEL_TIMEOUT, deadline)
             began = time.monotonic()
+            stdin = (claude_api.request(model, claude_cli.EFFORT, prompt, data, response_schema, timeout, cache_prefix) if api
+                     else prompt + '\n' + data)
             try:
-                result = run_extractor(command, env=child_env, input=prompt + '\n' + data, timeout=timeout, cwd=folder)
+                result = run_extractor(command, env=child_env, input=stdin, timeout=timeout, cwd=folder)
+                stdout, stderr, exit_code, expired = result.stdout, result.stderr, result.returncode, False
             except subprocess.TimeoutExpired as error:
-                exit_code = getattr(error, 'returncode', None)
-                phase, output, event_errors, facts = claude_cli.structured_run(error.output, partial=True)
-                # A leftover child can hold the pipes open after the CLI answered; keep the finished answer.
-                if phase == 'completed' and usable(output):
-                    return output
-                category = claude_cli.failure_class(decoded(error.stderr) + '\n' + event_errors)
-                if category == 'CLI or output':
-                    category = 'timeout'
+                stdout, stderr, exit_code, expired = error.output, error.stderr, getattr(error, 'returncode', None), True
+            if api:
+                phase, output, category, facts, usage = claude_api.outcome(decoded(stdout))
             else:
-                exit_code = result.returncode
-                # A crashed CLI can stop mid-line; keep what it wrote so the failure stays diagnosable.
-                phase, output, event_errors, facts = claude_cli.structured_run(result.stdout, partial=result.returncode != 0)
-                if result.returncode == 0 and phase == 'completed' and usable(output):
-                    return output
-                category = claude_cli.failure_class(decoded(result.stderr) + '\n' + event_errors)
+                # A crashed or killed CLI can stop mid-line; keep what it wrote so the failure stays diagnosable.
+                phase, output, event_errors, facts = claude_cli.structured_run(stdout, partial=expired or exit_code != 0)
+                category, usage = claude_cli.failure_class(decoded(stderr) + '\n' + event_errors), None
+            # A leftover child can hold the pipes open after the call answered; keep the finished answer.
+            if phase == 'completed' and usable(output) and (expired or exit_code == 0):
+                rate_limit_path(state_root, api).unlink(missing_ok=True)
+                if usage:
+                    print(json.dumps({'event': 'model_call', 'role': role or 'review', 'model': model, 'usage': usage}),
+                          file=sys.stderr, flush=True)
+                return output
+            category = category or 'CLI or output'
+            if expired and category == 'CLI or output':
+                category = 'timeout'
             diagnostics = {'elapsed_seconds': round(time.monotonic() - began, 3), 'phase': phase,
                            'failure_class': category, 'attempts': attempt, 'exit_code': exit_code, **facts}
             # Keep recovered failures diagnosable without logging CLI or source text.
             print(json.dumps({'event': 'extractor_attempt_failed', **diagnostics}), file=sys.stderr, flush=True)
+            # Only a structured signal, never matched text alone, proves the account's usage limit. It is
+            # recorded even when the cycle's budget is gone, since it applies to every later call.
+            limited = category == 'rate limit' and (facts['api_error_status'] == 429 or facts['rate_limit_type'] is not None
+                                                    or facts['rate_limit_resets_at'] is not None)
+            if limited:
+                limit = record_rate_limit(state_root, facts, datetime.now(timezone.utc), api)
             # Deadline exhaustion is scheduling, not a failed assessment. Never settle its evidence.
             bounded_timeout(MODEL_TIMEOUT, deadline)
             if attempt == 1 and category in ('timeout', 'connection'):
                 continue
             reason = 'extractor timeout' if category == 'timeout' else 'extractor ' + category + ' failure'
+            if limited:
+                raise RateLimited(reason, diagnostics, limit)
             raise ExtractorFailure(reason, diagnostics)
 
 
@@ -1187,6 +1328,10 @@ def failure_reason(error):
         'Invalid capture note field': 'model schema rejected',
         'Invalid capture note scope': 'model scope rejected',
         'Invalid capture transaction': 'invalid capture state',
+        'Invalid rate limit state': 'invalid rate limit state',
+        'Claude API key file is unavailable': 'API key file unavailable',
+        'Claude API key file must be readable only by its owner': 'API key file permissions too open',
+        'Claude API helper requires uv': 'uv unavailable for the API helper',
         'Invalid capture host configuration': 'invalid host configuration',
         'Capture paths must not contain user symlinks': 'unsafe local path',
         'Capture input exceeds safety bound': 'input bound exceeded',
@@ -1227,7 +1372,7 @@ def capture(config, state_root, *, now=None, retry_now=False):
         for path in sorted((feedback / skill / 'notes').glob('*.md')):
             safe_path(path)
             content = path.read_text()
-            notes.append({'skill': skill, 'text': content[:1500], 'order': path.stat().st_mtime_ns, 'hash': (re.findall(r'^- Lesson hash: ([a-f0-9]{64})$', content, re.M) or [None])[0]})
+            notes.append({'skill': skill, 'text': redact(content)[:1500], 'order': path.stat().st_mtime_ns, 'hash': (re.findall(r'^- Lesson hash: ([a-f0-9]{64})$', content, re.M) or [None])[0]})
             for evidence in re.findall(r'^- Capture evidence: ([a-f0-9]{64})$', content, re.M):
                 parts = re.findall(r'^- Capture lesson: ([0-9]+)/([0-9]+)$', content, re.M)
                 if parts:
@@ -1262,19 +1407,25 @@ def capture(config, state_root, *, now=None, retry_now=False):
     processed = 0
     errors = len(scan_errors) + len(unavailable)
     attempted = 0
+    rate_limited = 0
+    limit = None
+    # --retry-now makes one call despite a recorded limit; after a new rejection the rest wait.
+    wait = not retry_now
     for turn in pending:
         if time.monotonic() >= deadline or attempted >= MAX_TURNS:
             break
         evidence = turn['evidence_id']
         deferred = state['deferred'].get(evidence, {})
         clock = now or datetime.now(timezone.utc)
-        if not retry_now and deferred.get('retry_at') and clock < timestamp(deferred['retry_at']):
+        # A rate-limited turn waits on the shared usage-limit record, not on a backoff of its own.
+        if (not retry_now and deferred.get('retry_at') and not deferred.get('rate_limited')
+                and clock < timestamp(deferred['retry_at'])):
             errors += 1
             continue
         attempted += 1
         try:
             if evidence not in state['pending']:
-                lessons = extract(config, state_root, turn, notes, deadline=deadline)
+                lessons = extract(config, state_root, turn, notes, deadline=deadline, wait_for_rate_limit=wait)
                 state['pending'][evidence] = {'lessons': lessons, 'deployed': deployed, 'machine': machine, 'recorded_at': clock.isoformat()}
                 atomic(state_path, json.dumps(state, indent=2) + '\n')
             transaction = state['pending'][evidence]
@@ -1284,6 +1435,17 @@ def capture(config, state_root, *, now=None, retry_now=False):
             lessons = validate_notes({'notes': transaction['lessons']}, turn)
         except CaptureBudgetExpired:
             break
+        except RateLimited as error:
+            limit, wait = error.limit, True
+            rate_limited += 1
+            # Retained like other deferred work, so a source that disappears meanwhile stays a visible error,
+            # but without a failure backoff: the turn is not at fault.
+            entry = {'attempts': deferred.get('attempts', 0), 'reason': failure_reason(error),
+                     'completed_at': turn['completed_at'], 'retry_at': limit['retry_at'], 'rate_limited': True}
+            if deferred != entry:
+                state['deferred'][evidence] = entry
+                atomic(state_path, json.dumps(state, indent=2) + '\n')
+            continue
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             errors += 1
             attempts = deferred.get('attempts', 0) + 1
@@ -1307,7 +1469,7 @@ def capture(config, state_root, *, now=None, retry_now=False):
                 *[f'- {key.title()}: {lesson[key]}' for key in FIELDS if key != 'title'], ''])
             filename = transaction['recorded_at'].replace(':', '').replace('+', '-') + '-' + transaction['machine'] + '-' + content_hash[:24] + '.md'
             atomic(feedback / lesson['skill'] / 'notes' / filename, content, exclusive=True)
-            notes.append({'skill': lesson['skill'], 'text': content[:1500], 'hash': content_hash, 'order': time.time_ns()})
+            notes.append({'skill': lesson['skill'], 'text': redact(content)[:1500], 'hash': content_hash, 'order': time.time_ns()})
             written += 1
         processed += 1
         state['processed'][turn['evidence_id']] = {'completed_at': turn['completed_at'], 'notes': len(lessons)}
@@ -1325,8 +1487,12 @@ def capture(config, state_root, *, now=None, retry_now=False):
             except ValueError:
                 continue
             pending_dates.append(completed)
+    rate_limit = rate_limit_summary(limit, rate_limited, now or datetime.now(timezone.utc)) if rate_limited else None
+    if rate_limit and rate_limit['overdue']:
+        errors += rate_limited
     summary = {'eligible': len(pending), 'processed': processed, 'notes': written,
                'pending': len(remaining) + len(unavailable), 'errors': errors,
+               'rate_limited': rate_limited, 'rate_limit': rate_limit,
                'oldest_pending_at': min(pending_dates, key=timestamp) if pending_dates else None,
                'unavailable_sources': len(unavailable),
                'scanner_error_count': len(scan_errors), 'scanner_diagnostics': scan_errors[:10]}
@@ -1361,6 +1527,7 @@ def main():
                 status['success'] = status['counts']['errors'] == 0
                 if not status['success']:
                     status['error'] = 'Capture has deferred evidence; source remains pending.'
+                report_rate_limit(status, status['counts']['rate_limit'], 'turns')
             except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
                 status.update(success=False, error='Capture failed: ' + failure_reason(error) + '. Source evidence remains pending.')
             finished = datetime.now(timezone.utc).isoformat()
@@ -1368,8 +1535,9 @@ def main():
             status['last_success_finished_at' if status['success'] else 'last_failure_finished_at'] = finished
             atomic(status_path, json.dumps(status, indent=2) + '\n')
             summary = {'success': status['success'], 'counts': status.get('counts', {})}
-            if status.get('error'):
-                summary['error'] = status['error']
+            for key in ('error', 'warning'):
+                if status.get(key):
+                    summary[key] = status[key]
             print(json.dumps(summary))
             return 0 if status['success'] else 1
     except BlockingIOError:

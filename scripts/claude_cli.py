@@ -8,7 +8,12 @@ from pathlib import Path
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 RESTRICTED_MODEL = 'claude-opus-5-5'
 REVIEW_MODEL = 'claude-opus-5-5'
-EFFORT = 'xhigh'
+EFFORT = 'high'
+# Each production role's model, the cheapest that matched Opus on the frozen prompt evaluations (cases and
+# holdouts, graded by Opus): extraction 28/28 on Sonnet as on Opus, source checks 30/36 on Haiku as on Opus,
+# and corrections only on Opus (20/20). Prompt review's proposals, grading and approvals, and the maintainer
+# review, stay on the Opus models above.
+ROLE_MODELS = {'extract': 'claude-sonnet-5-5', 'verify': 'claude-haiku-5-5', 'correct': RESTRICTED_MODEL}
 # --json-schema answers through this synthetic tool; a restricted session may expose nothing else.
 STRUCTURED_TOOL = 'StructuredOutput'
 DEFAULT_CLI = Path.home() / '.local/bin/claude'
@@ -26,7 +31,7 @@ REVIEW_FLAGS = ('--print', '--no-session-persistence', '--model', '--effort', '-
 FAILURE_PATTERNS = (
     ('authentication', r'\b401\b|\b403\b|unauthori[sz]ed|not logged in|/login\b|invalid api key|'
                        r'authentication[ _](?:failed|required|error)|oauth token'),
-    ('rate limit', r'\b429\b|rate.?limit|usage limit|limit reached|quota exceeded|too many requests'),
+    ('rate limit', r'\b429\b|rate.?limit|usage limit|limit reached|hit your (?:[\w-]+ )*limit|quota exceeded|too many requests'),
     ('connection', r'connection (?:reset|refused|closed|error)|stream disconnected|network (?:unreachable|error)|'
                    r'timed out|unexpected eof|econnreset|etimedout|fetch failed|overloaded|\b50[0234]\b|\b529\b'))
 
@@ -99,12 +104,12 @@ def structured_run(stdout, *, partial=False):
     """Return (phase, structured output or None, error text, result facts) for a restricted run.
 
     The phase is 'startup' before the session starts, 'inference' after it starts and 'completed' once it
-    reports a result. The result facts are the last result event's static subtype and API status for failure
-    diagnostics, both None without a result event. Raises RuntimeError when the session exposed or used any
-    tool besides StructuredOutput.
+    reports a result. The result facts are the last result event's static subtype and API status, and a
+    rejecting usage limit's window type and reset time, for failure diagnostics; each is None when absent.
+    Raises RuntimeError when the session exposed or used any tool besides StructuredOutput.
     """
     phase, output, errors = 'startup', None, []
-    facts = {'result_subtype': None, 'api_error_status': None}
+    facts = {'result_subtype': None, 'api_error_status': None, 'rate_limit_type': None, 'rate_limit_resets_at': None}
     for event in events(stdout, partial=partial):
         kind = event.get('type')
         if kind == 'system' and event.get('subtype') == 'init':
@@ -119,11 +124,13 @@ def structured_run(stdout, *, partial=False):
             if any(isinstance(block, dict) and block.get('type') in ('tool_use', 'server_tool_use')
                    and block.get('name') != STRUCTURED_TOOL for block in content):
                 raise RuntimeError('Capture model attempted tool execution')
-        elif kind == 'rate_limit_event' and (event.get('rate_limit_info') or {}).get('status') == 'rejected':
+        elif kind == 'rate_limit_event' and isinstance(event.get('rate_limit_info'), dict) \
+                and event['rate_limit_info'].get('status') == 'rejected':
             errors.append('rate limit rejected')
+            facts.update(rate_limit_facts(event['rate_limit_info']))
         elif kind == 'result':
             phase = 'completed'
-            facts = result_facts(event)
+            facts.update(result_facts(event))
             if event.get('is_error') or event.get('subtype') != 'success':
                 status = event.get('api_error_status')
                 errors.append(' '.join(str(part) for part in (status, event.get('subtype'), event.get('result'))
@@ -168,6 +175,15 @@ def result_facts(result):
         label = 'other'
     return {'result_subtype': label,
             'api_error_status': status if isinstance(status, int) and not isinstance(status, bool) else None}
+
+
+def rate_limit_facts(info):
+    """The window type and reset time (Unix seconds) of a rejecting usage limit; never CLI text."""
+    kind, resets = info.get('rateLimitType'), info.get('resetsAt')
+    return {'rate_limit_type': kind if isinstance(kind, str) and re.fullmatch(r'[a-z0-9_]{1,40}', kind) else
+            None if kind is None else 'other',
+            'rate_limit_resets_at': resets if isinstance(resets, int) and not isinstance(resets, bool)
+            and 0 < resets < 10 ** 10 else None}
 
 
 def failure_class(text):

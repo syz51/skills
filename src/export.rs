@@ -22,6 +22,10 @@ use std::{
 };
 
 pub const MANIFEST: &str = ".public-export.json";
+/// Message generations allowed when the publication scanner rejects the generated text.
+pub const MESSAGE_ATTEMPTS: usize = 3;
+/// Added to the generation prompt after the publication scanner rejects a message.
+pub const SCAN_RETRY: &str = "The previous message for this diff was rejected because it contained a private identifier or credential. Do not include local paths, host names, private repository names or credentials.";
 pub type Files = BTreeMap<String, Vec<u8>>;
 /// Expected contention with another publication or maintenance transaction.
 #[derive(Debug)]
@@ -224,6 +228,34 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 fn text(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(git(repo, args)?)?.trim_end().to_owned())
 }
+pub fn scan(path: &str, data: &[u8]) -> Result<()> {
+    let s = std::str::from_utf8(data).map_err(|_| format!("Non-text publication file: {path}"))?;
+    // Markers match in any case, but replacements do not, so an unreplaced case variant is
+    // rejected. A lowercase users segment is also a common web route, so its case variants
+    // count only where a home path would start: not after a path segment, and followed by a
+    // name rather than a route parameter.
+    let hosts = [
+        ["roy", "-mac"].concat(),
+        ["sunmacbook", "-air"].concat(),
+        ["syz51/", "codex-skills"].concat(),
+    ]
+    .map(|marker| regex::escape(&marker))
+    .join("|");
+    let private = regex::Regex::new(&format!(
+        "{}|(?i:{hosts}|(?:^|[^\\w.-])/us{}[a-z_])",
+        ["/Us", "ers/"].concat(),
+        "ers/"
+    ))?;
+    let secret = regex::Regex::new(
+        r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|sk-(?:proj-)?[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16})\b",
+    )?;
+    if private.is_match(s) || secret.is_match(s) {
+        return Err(
+            format!("Publication rejected: {path} (private identifier or credential)").into(),
+        );
+    }
+    Ok(())
+}
 fn clean(repo: &Path) -> Result<String> {
     if text(repo, &["branch", "--show-current"])? != "main"
         || !git(repo, &["status", "--porcelain"])?.is_empty()
@@ -273,6 +305,7 @@ pub fn snapshot(c: &Config, rev: &str) -> Result<Files> {
         for (old, new) in &c.replacements {
             s = s.replace(old, new.as_str().ok_or("Invalid replacement")?);
         }
+        scan(&e.target, s.as_bytes())?;
         files.insert(e.target.clone(), s.into_bytes());
     }
     Ok(files)
@@ -556,14 +589,14 @@ fn rust_checks(validation: &Path, state: &Path, cargo: &Path) -> Result<()> {
 pub fn execute(
     c: &Config,
     publish: bool,
-    generate: &dyn Fn(&str) -> Result<CommitMessage>,
+    generate: &dyn Fn(&str, Option<&str>) -> Result<CommitMessage>,
 ) -> Result<ExportResult> {
     execute_with_destination(c, publish, generate, &c.target_url)
 }
 fn execute_with_destination(
     c: &Config,
     publish: bool,
-    generate: &dyn Fn(&str) -> Result<CommitMessage>,
+    generate: &dyn Fn(&str, Option<&str>) -> Result<CommitMessage>,
     destination: &str,
 ) -> Result<ExportResult> {
     execute_with_checks(c, publish, generate, destination, Path::new("cargo"))
@@ -571,7 +604,7 @@ fn execute_with_destination(
 fn execute_with_checks(
     c: &Config,
     publish: bool,
-    generate: &dyn Fn(&str) -> Result<CommitMessage>,
+    generate: &dyn Fn(&str, Option<&str>) -> Result<CommitMessage>,
     destination: &str,
     cargo: &Path,
 ) -> Result<ExportResult> {
@@ -715,23 +748,41 @@ fn execute_with_checks(
             &repo,
             &["for-each-ref", "--format=%(refname) %(objectname)"],
         )?;
-        let message = generate(std::str::from_utf8(&diff)?)?;
-        if git(&repo, &["write-tree"])? != staged
-            || git(
-                &repo,
-                &["for-each-ref", "--format=%(refname) %(objectname)"],
-            )? != refs
-            || !git(
-                &repo,
-                &["diff", "--no-ext-diff", "--no-textconv", "--name-only"],
-            )?
-            .is_empty()
-            || !git(&repo, &["ls-files", "--others", "--exclude-standard"])?.is_empty()
-            || text(&repo, &["remote", "get-url", "origin"])? != destination
-        {
-            return Err("Public candidate changed during message generation".into());
-        }
-        validate_message(&message)?;
+        let diff = std::str::from_utf8(&diff)?;
+        let mut instruction = None;
+        let mut attempt = 1;
+        // A scanner rejection regenerates with an instruction; other invalid messages stop.
+        let message = loop {
+            let message = generate(diff, instruction)?;
+            if git(&repo, &["write-tree"])? != staged
+                || git(
+                    &repo,
+                    &["for-each-ref", "--format=%(refname) %(objectname)"],
+                )? != refs
+                || !git(
+                    &repo,
+                    &["diff", "--no-ext-diff", "--no-textconv", "--name-only"],
+                )?
+                .is_empty()
+                || !git(&repo, &["ls-files", "--others", "--exclude-standard"])?.is_empty()
+                || text(&repo, &["remote", "get-url", "origin"])? != destination
+            {
+                return Err("Public candidate changed during message generation".into());
+            }
+            message_quality(&message)?;
+            match scan_message(&message) {
+                Ok(()) => break message,
+                Err(_) if attempt < MESSAGE_ATTEMPTS => {
+                    attempt += 1;
+                    instruction = Some(SCAN_RETRY);
+                }
+                Err(error) => {
+                    return Err(
+                        format!("{error}; all {MESSAGE_ATTEMPTS} generation attempts").into(),
+                    );
+                }
+            }
+        };
         if clean(&c.source_repo)? != local
             || (c.fetch_source
                 && text(&c.source_repo, &["rev-parse", "refs/remotes/origin/main"])? != revision)
@@ -769,7 +820,12 @@ fn execute_with_checks(
     result.public_commit = Some(commit);
     Ok(result)
 }
+/// Quality, attribution and publication-scanner checks for a generated commit message.
 pub fn validate_message(m: &CommitMessage) -> Result<()> {
+    message_quality(m)?;
+    scan_message(m)
+}
+fn message_quality(m: &CommitMessage) -> Result<()> {
     let s = m.subject.trim();
     let lower = s.to_lowercase();
     if s.len() < 12
@@ -798,11 +854,20 @@ pub fn validate_message(m: &CommitMessage) -> Result<()> {
     }
     Ok(())
 }
+fn scan_message(m: &CommitMessage) -> Result<()> {
+    scan(
+        "commit message",
+        format!("{}\n{}", m.subject, m.body).as_bytes(),
+    )
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     #[test]
     fn sha256_preserves_lowercase_zero_padded_hex() {
         assert_eq!(
@@ -849,44 +914,117 @@ mod tests {
         let c=Config::from_value(json!({"schema_version":1,"source_repo":source,"state_dir":t.path().join("state"),"author_name":"Test","author_email":"test@example.invalid","target_url":"https://github.com/example/skills.git","files":[{"source":"skills/guide.md","target":"skills/guide.md"},{"source":"tests/test_fixture.py","target":"tests/test_fixture.py"}]})).unwrap();
         (t, c, remote)
     }
+    /// Private identifiers and credentials the scanner rejects, built so this file passes it.
+    /// Case variants are included: replacements match exactly, so these stay unreplaced.
+    fn private_samples() -> [String; 12] {
+        [
+            ["-----BEGIN ENCRYPTED ", "PRIVATE KEY-----"].concat(),
+            ["-----BEGIN PGP ", "PRIVATE KEY BLOCK-----"].concat(),
+            ["/Us", "ers/alice/x"].concat(),
+            ["roy", "-mac"].concat(),
+            ["syz51/", "codex-skills"].concat(),
+            format!("ghp_{}", "a".repeat(36)),
+            ["-----BEGIN ", "PRIVATE KEY-----"].concat(),
+            ["Roy", "-Mac"].concat(),
+            ["SunMacBook", "-Air"].concat(),
+            ["SYZ51/", "Codex-Skills"].concat(),
+            ["/us", "ers/alice"].concat(),
+            ["(/US", "ERS/alice/x)"].concat(),
+        ]
+    }
     #[test]
-    fn snapshot_publishes_identifiers_verbatim_after_replacements_and_drops() {
+    fn scanner_markers_ignore_case_but_web_routes_pass() {
+        for sample in private_samples() {
+            assert!(scan("guide.md", sample.as_bytes()).is_err(), "{sample}");
+        }
+        for route in [
+            "path: '/users/:id'",
+            "`/users/${id}` and `/users/1`",
+            "server/api/users/[id].put.ts - PUT /api/users/:id",
+            "https://api.github.com/users/octocat",
+            "pages/users/profile.vue",
+        ] {
+            assert!(scan("guide.md", route.as_bytes()).is_ok(), "{route}");
+        }
+    }
+    #[test]
+    fn snapshot_scans_files_after_replacements_and_drops() {
         let (_t, mut c, _remote) = fixture();
-        let token = format!("ghp_{}", "a".repeat(36));
-        let guide = format!(
-            "Paths /Users/alice/x on client-host and maintainer-host, repo example-owner/private-repo, {token}\n"
-        );
-        fs::write(c.source_repo.join("skills/guide.md"), &guide).unwrap();
-        fs::write(
-            c.source_repo.join("skills/sources.json"),
-            r#"{"backupPath":"/Users/alice/backup","items":[{"backupPath":"x","license":"MIT"}]}"#,
-        )
-        .unwrap();
-        git(&c.source_repo, &["add", "."]).unwrap();
-        git(&c.source_repo, &["commit", "-m", "Add identifiers"]).unwrap();
-        c.replacements
-            .insert("maintainer-host".into(), json!("client-host"));
+        let host = ["sunmacbook", "-air"].concat();
+        c.replacements.insert(host.clone(), json!("client-host"));
         c.json_drop_keys = vec!["backupPath".into()];
         c.files.push(crate::config::Entry {
             source: "skills/sources.json".into(),
             target: "skills/sources.json".into(),
         });
+        // Replacements and json_drop_keys run before the scan, so these publish.
+        let guide = format!("Checked on {host} with FAKE_TOKEN.\n");
+        fs::write(c.source_repo.join("skills/guide.md"), &guide).unwrap();
+        let backup = ["/Us", "ers/alice/backup"].concat();
+        fs::write(
+            c.source_repo.join("skills/sources.json"),
+            json!({"backupPath": backup, "items": [{"backupPath": "x", "license": "MIT"}]})
+                .to_string(),
+        )
+        .unwrap();
+        git(&c.source_repo, &["add", "."]).unwrap();
+        git(
+            &c.source_repo,
+            &["commit", "-m", "Add replaced identifiers"],
+        )
+        .unwrap();
         let files = snapshot(&c, "HEAD").unwrap();
         assert_eq!(
             String::from_utf8(files["skills/guide.md"].clone()).unwrap(),
-            guide.replace("maintainer-host", "client-host")
+            guide.replace(&host, "client-host")
         );
         let metadata: Value = serde_json::from_slice(&files["skills/sources.json"]).unwrap();
         assert_eq!(metadata, json!({"items": [{"license": "MIT"}]}));
+        // A local path, a hostname no replacement covers, the private repository slug,
+        // a token or a private key fails the snapshot.
+        for sample in private_samples() {
+            fs::write(
+                c.source_repo.join("skills/guide.md"),
+                format!("See {sample}\n"),
+            )
+            .unwrap();
+            git(
+                &c.source_repo,
+                &["commit", "-am", "Add a private identifier"],
+            )
+            .unwrap();
+            let error = snapshot(&c, "HEAD").unwrap_err().to_string();
+            assert!(
+                error.contains("Publication rejected: skills/guide.md"),
+                "{error}"
+            );
+        }
     }
     #[test]
-    fn commit_messages_keep_identifiers_but_reject_attribution_and_low_quality() {
-        let token = format!("ghp_{}", "a".repeat(36));
+    fn commit_messages_reject_identifiers_credentials_attribution_and_low_quality() {
         let kept = CommitMessage {
-            subject: "Document the client-host maintainer role".into(),
-            body: format!("Mention /Users/alice/x, example-owner/private-repo and {token}."),
+            subject: "Document the maintainer host role".into(),
+            body: "Mention the client-host reference and FAKE_TOKEN.".into(),
         };
         assert!(validate_message(&kept).is_ok());
+        for sample in private_samples() {
+            for m in [
+                CommitMessage {
+                    subject: format!("Document {sample}"),
+                    body: kept.body.clone(),
+                },
+                CommitMessage {
+                    subject: kept.subject.clone(),
+                    body: format!("Mention {sample}."),
+                },
+            ] {
+                let error = validate_message(&m).unwrap_err().to_string();
+                assert!(
+                    error.contains("Publication rejected: commit message"),
+                    "{error}"
+                );
+            }
+        }
         for body in [
             "Co-authored-by: Someone <a@example.invalid>",
             "Generated-by: tool",
@@ -936,7 +1074,7 @@ mod tests {
     #[test]
     fn rust_candidate_checks_run_before_push_and_noop_skips_them() {
         let (temp, config, remote, cargo) = rust_fixture("none");
-        let generate = |_: &str| Ok(message());
+        let generate = |_: &str, _: Option<&str>| Ok(message());
         execute_with_checks(&config, true, &generate, remote.to_str().unwrap(), &cargo).unwrap();
         let calls = fs::read_to_string(temp.path().join("calls")).unwrap();
         assert_eq!(
@@ -964,7 +1102,7 @@ mod tests {
             let result = execute_with_checks(
                 &config,
                 true,
-                &|_| panic!("Rust failure must precede generation"),
+                &|_, _| panic!("Rust failure must precede generation"),
                 remote.to_str().unwrap(),
                 &cargo,
             );
@@ -1013,7 +1151,7 @@ mod tests {
         execute_with_checks(
             &config,
             true,
-            &|_| Ok(message()),
+            &|_, _| Ok(message()),
             remote.to_str().unwrap(),
             &cargo,
         )
@@ -1034,7 +1172,7 @@ mod tests {
         execute_with_checks(
             &config,
             true,
-            &|_| Ok(message()),
+            &|_, _| Ok(message()),
             remote.to_str().unwrap(),
             Path::new("/missing-cargo"),
         )
@@ -1121,7 +1259,7 @@ mod tests {
     fn real_transaction_keeps_history_private_and_noop_skips_generation() {
         let (_t, c, remote) = fixture();
         let calls = AtomicUsize::new(0);
-        let generate = |diff: &str| {
+        let generate = |diff: &str, _: Option<&str>| {
             calls.fetch_add(1, Ordering::SeqCst);
             assert!(!diff.contains("Private source context"));
             assert!(!diff.contains(MANIFEST));
@@ -1161,7 +1299,7 @@ mod tests {
             execute_with_destination(
                 &config,
                 true,
-                &|_| {
+                &|_, _| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(message())
                 },
@@ -1191,7 +1329,7 @@ mod tests {
             execute_with_destination(
                 &config,
                 true,
-                &|_| panic!("Must not generate after subprocess failure"),
+                &|_, _| panic!("Must not generate after subprocess failure"),
                 remote.to_str().unwrap()
             )
             .is_err()
@@ -1209,7 +1347,7 @@ mod tests {
             execute_with_destination(
                 &c,
                 true,
-                &|_| Err("Generation unavailable".into()),
+                &|_, _| Err("Generation unavailable".into()),
                 remote.to_str().unwrap()
             )
             .is_err()
@@ -1226,11 +1364,75 @@ mod tests {
             execute_with_destination(
                 &c,
                 true,
-                &|_| panic!("Must not generate after failed check"),
+                &|_, _| panic!("Must not generate after failed check"),
                 remote.to_str().unwrap()
             )
             .is_err()
         );
+        assert!(git(&remote, &["for-each-ref"]).unwrap().is_empty());
+    }
+    #[test]
+    fn scanner_rejection_regenerates_the_message_with_an_instruction() {
+        let (_t, c, remote) = fixture();
+        let host = ["Roy", "-Mac"].concat();
+        let instructions = Mutex::new(Vec::new());
+        let generate = |_: &str, instruction: Option<&str>| {
+            let mut seen = instructions.lock().unwrap();
+            seen.push(instruction.map(str::to_owned));
+            Ok(if seen.len() < MESSAGE_ATTEMPTS {
+                CommitMessage {
+                    subject: format!("Document the {host} client setup"),
+                    body: String::new(),
+                }
+            } else {
+                message()
+            })
+        };
+        assert!(
+            execute_with_destination(&c, true, &generate, remote.to_str().unwrap())
+                .unwrap()
+                .changed
+        );
+        let retry = Some(SCAN_RETRY.to_owned());
+        assert_eq!(*instructions.lock().unwrap(), [None, retry.clone(), retry]);
+        assert_eq!(
+            text(&remote, &["log", "--format=%s", "main"]).unwrap(),
+            message().subject
+        );
+    }
+    #[test]
+    fn message_generation_stops_after_bounded_scanner_rejections() {
+        let (_t, c, remote) = fixture();
+        let calls = AtomicUsize::new(0);
+        let private = |_: &str, _: Option<&str>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CommitMessage {
+                subject: format!("Document {}", ["/Us", "ers/alice/x"].concat()),
+                body: String::new(),
+            })
+        };
+        let Err(error) = execute_with_destination(&c, true, &private, remote.to_str().unwrap())
+        else {
+            panic!("A private message must not publish");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("Publication rejected: commit message"),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), MESSAGE_ATTEMPTS);
+        assert!(git(&remote, &["for-each-ref"]).unwrap().is_empty());
+        // Only scanner rejections regenerate; an uninformative message stops at once.
+        calls.store(0, Ordering::SeqCst);
+        let generic = |_: &str, _: Option<&str>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CommitMessage {
+                subject: "changes".into(),
+                body: String::new(),
+            })
+        };
+        assert!(execute_with_destination(&c, true, &generic, remote.to_str().unwrap()).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(git(&remote, &["for-each-ref"]).unwrap().is_empty());
     }
     #[test]
@@ -1240,7 +1442,7 @@ mod tests {
             execute_with_destination(
                 &c,
                 true,
-                &|_| {
+                &|_, _| {
                     fs::write(c.source_repo.join("skills/guide.md"), "Concurrent edit\n")?;
                     Ok(message())
                 },
@@ -1255,7 +1457,7 @@ mod tests {
     fn imported_edit_deletion_and_enrollment_generate_public_bookkeeping_diff() {
         for case in ["edit", "delete", "enroll"] {
             let (t, mut c, remote) = fixture();
-            execute_with_destination(&c, true, &|_| Ok(message()), remote.to_str().unwrap())
+            execute_with_destination(&c, true, &|_, _| Ok(message()), remote.to_str().unwrap())
                 .unwrap();
             let community = t.path().join("community");
             git(
@@ -1301,7 +1503,7 @@ mod tests {
                 git(root, &["commit", "-m", "Import community guidance"]).unwrap();
             }
             git(&community, &["push", "origin", "main"]).unwrap();
-            let generate = |diff: &str| {
+            let generate = |diff: &str, _: Option<&str>| {
                 assert!(!diff.is_empty());
                 assert!(diff.contains(MANIFEST));
                 assert!(!diff.contains("Private source context"));
@@ -1319,7 +1521,7 @@ mod tests {
                 !execute_with_destination(
                     &c,
                     true,
-                    &|_| panic!("no-op must not generate"),
+                    &|_, _| panic!("no-op must not generate"),
                     remote.to_str().unwrap()
                 )
                 .unwrap()

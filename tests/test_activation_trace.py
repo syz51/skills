@@ -8,8 +8,10 @@ import subprocess
 import tempfile
 import sys
 import unittest
+import warnings
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
+import activation_trace
 from activation_trace import SOURCE_SHA256, node_read_observations, score_claude_trace, score_trace
 from read_guidance import PROTOCOL
 
@@ -51,6 +53,14 @@ class ActivationTraceTests(unittest.TestCase):
 
     def score(self, value, required=('typescript',), forbidden=(), before=()):
         return score_trace(value, self.targets, required, forbidden, before)
+
+    def test_python_literal_results_with_invalid_escapes_parse_without_warnings(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            results = activation_trace._results("{'exit_code': 0, 'output': 'a\\|b'}")
+            self.assertEqual(activation_trace._results("'a\\|b'"), [])
+        self.assertEqual(results, [{'exit_code': 0, 'output': 'a\\|b', 'source_index': None}])
+        self.assertEqual([str(item.message) for item in caught], [])
 
     def test_literal_cat_and_shell_wrapper_observe_exact_full_bytes(self):
         for cmd in ('cat ' + TS, '/bin/zsh -lc ' + shlex.quote('cat ' + TS)):

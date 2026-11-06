@@ -9,6 +9,7 @@ import tempfile
 import sys
 import time
 import unittest
+import warnings
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
@@ -483,6 +484,139 @@ class CaptureTests(unittest.TestCase):
             capture.capture(self.config, self.state)
             model.assert_not_called()
 
+    def test_python_literal_tool_values_with_invalid_escapes_parse_without_warnings(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            results = capture.read_results("{'exit_code': 0, 'output': 'a\\|b'}")
+        self.assertEqual(results, [{'exit_code': 0, 'output': 'a\\|b'}])
+        self.assertEqual([str(item.message) for item in caught], [])
+
+    def test_javascript_command_literals_decode_with_javascript_semantics(self):
+        call = 'text(await tools.exec_command({cmd:%s}));'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            for literal, expected in [('"cat skills\\/rust\\/SKILL.md"', ['cat skills/rust/SKILL.md']),
+                                      ('"printf \\"a\\tb\\""', ['printf "a\tb"']), ("'it\\'s'", ["it's"]),
+                                      # Escapes pair from the left: an escaped backslash, then a literal bar.
+                                      ("'grep a\\\\|b x'", ['grep a\\|b x']),
+                                      # An escape with no meaning of its own is that character, as in JavaScript.
+                                      ("'grep a\\|b x'", ['grep a|b x']), ('"grep a\\|b x"', ['grep a|b x']),
+                                      ('"it\\\'s \\x41\\u{42}\\v"', ["it's AB\v"]), ("'a\\\nb'", ['ab']),
+                                      # Literals invalid in strict-mode JavaScript leave the command unknown.
+                                      ("'\\1'", []), ("'\\x4'", []), ("'\\ud83d'", []), ("'a\nb'", [])]:
+                with self.subTest(literal=literal):
+                    self.assertEqual(capture.literal_commands(call % literal), expected)
+        self.assertEqual([str(item.message) for item in caught], [])
+
+    def test_escaped_slash_skill_read_is_recognized_and_capture_emits_no_warnings(self):
+        skill = '---\nname: rust\n---\n# Rust\nObserved guidance.\n'
+        read = 'text(await tools.exec_command({cmd:"cat skills\\/rust\\/SKILL.md"}));'
+        envelope = str([{'type': 'input_text', 'text': json.dumps({'exit_code': 0, 'output': skill})}])
+        # A command that is no skill read and a Python-literal envelope with an escape Python warns about.
+        unknown = "text(await tools.exec_command({cmd:'cat skills/rust/references/a\\|b.md'}));"
+        text = self.record('event_msg', {'type': 'task_started', 'turn_id': 'escaped'})
+        text += self.record('event_msg', {'type': 'user_message', 'message': 'Fix the borrow error'})
+        for call, raw, output in (('read', read, envelope), ('unknown', unknown, "{'exit_code': 0, 'output': 'a\\|b'}")):
+            text += self.record('response_item', {'type': 'custom_tool_call', 'call_id': call, 'name': 'exec', 'input': raw})
+            text += self.record('response_item', {'type': 'custom_tool_call_output', 'call_id': call, 'output': output})
+        text += self.record('response_item', {'type': 'message', 'role': 'assistant', 'content': [{'text': 'Fixed it.'}]})
+        text += self.record('event_msg', {'type': 'task_complete', 'turn_id': 'escaped'})
+        self.rollout(text)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            [turn] = self.scan()
+            with patch.object(capture, 'run_extractor', return_value=completed({'notes': []})):
+                self.assertEqual(capture.capture(self.config, self.state)['processed'], 1)
+        self.assertEqual(turn['verified_skills'], ['rust'])
+        self.assertEqual(turn['loaded_reads'], [{'path': 'rust/SKILL.md', 'sha256': hashlib.sha256(skill.encode()).hexdigest(),
+                                                'coverage': 'complete', 'read_turn': 'escaped'}])
+        self.assertEqual([str(item.message) for item in caught], [])
+
+    def test_maintenance_turn_with_an_absolute_pipeline_path_is_excluded(self):
+        # Turn messages stay raw for local filters; redacted, this path would be a placeholder.
+        path = '/Us' + 'ers/alice/.local/share/codex-skills/repository/scripts/capture.py'
+        self.rollout(self.transcript(user='Fix ' + path + ' retries'))
+        self.assertEqual(self.scan(), [])
+        self.assertEqual(len(capture.completed_turns(self.sessions.glob('*.jsonl'), capture.timestamp(capture.SINCE),
+                                                     eligible_only=False)), 1)
+
+    def test_null_codex_message_text_does_not_abort_capture(self):
+        text = self.transcript().replace('"message": "Build a small page"', '"message": null', 1)
+        text = text.replace('"content": [{"text": "Built page and checked layout."}]', '"content": [{"text": null}]', 1)
+        text = text.replace(self.record('event_msg', {'type': 'task_complete', 'turn_id': 'turn1'}),
+                            self.record('response_item', {'type': 'message', 'role': 'assistant', 'content': None})
+                            + self.record('event_msg', {'type': 'task_complete', 'turn_id': 'turn1'}), 1)
+        self.rollout(text + self.transcript('turn2'))
+        first, second = self.scan()
+        self.assertEqual([m['text'] for m in first['messages'] if m['role'] != 'tool'], ['', '', ''])
+        self.assertEqual(second['turn'], 'turn2')
+        with patch.object(capture, 'run_extractor', return_value=completed({'notes': []})):
+            self.assertEqual(capture.capture(self.config, self.state)['processed'], 2)
+
+    def test_compact_bound_applies_to_redacted_text_so_no_secret_fragment_leaks(self):
+        # Truncating first would leave a fragment the patterns no longer recognize.
+        for private, fragment in (('ghp_' + 'Q' * 30, 'Q'), ('alice@example.com', 'alice')):
+            with self.subTest(fragment=fragment):
+                text = 'x' * 1990 + ' ' + private
+                self.assertIn(fragment, text[:2000])
+                context = capture.message_context([{'role': 'user', 'text': text}], compact=True)
+                [message] = context['messages']
+                self.assertNotIn(fragment, message['text'])
+                self.assertEqual(len(message['text']), 2000)
+                self.assertEqual(message['original_chars'], len(capture.redact(text)))
+                self.assertTrue(context['truncated'])
+        [message] = capture.message_context([{'role': 'user', 'text': 'Use token=abc123'}], compact=True)['messages']
+        self.assertEqual((message['text'], message['original_chars']), ('Use [redacted credential]', 25))
+
+    def test_redaction_covers_credential_forms(self):
+        key = '-----BEGIN ' + 'OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----'
+        for text, expected in [
+                ('password="hunter2"', '[redacted credential]'),
+                ("API_KEY='abc123'", '[redacted credential]'),
+                ('{"api_key": "abc123", "token": "xyz"}', '{[redacted credential], [redacted credential]}'),
+                ('AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', '[redacted credential]'),
+                ('GITHUB_TOKEN=abc DB_PASSWORD=x client_secret: y OPENAI_API_KEY=z',
+                 '[redacted credential] [redacted credential] [redacted credential] [redacted credential]'),
+                ('token=abc123 and Bearer abc.def and password: hunter2', '[redacted credential] and [redacted credential] and [redacted credential]'),
+                ('github_pat_11ABCDEFG0_abcdefghijklmnop', '[redacted credential]'),
+                ('AKIA' + 'IOSFODNN7EXAMPLE', '[redacted credential]'),
+                ('sk-proj-abcdefgh12345678 sk-abcdefgh12345', '[redacted credential] [redacted credential]'),
+                ('ghp_abcdefgh12345 gho_abcdefgh123 ghu_abcdefgh123 ghs_abcdefgh123 ghr_abcdefgh123',
+                 ' '.join(['[redacted credential]'] * 5)),
+                ('curl -d "{\\"api_key\\": \\"abc123\\", \\"token\\": \\"x y\\"}" now',
+                 'curl -d "{[redacted credential], [redacted credential]}" now'),
+                ('githubTokenValue: abc123 apiKeyId=x private_key: k passwd=p',
+                 '[redacted credential] [redacted credential] [redacted credential] [redacted credential]'),
+                ('key:\n' + key + '\ndone', 'key:\n[redacted credential]\ndone'),
+                ('cut ' + key[:40], 'cut [redacted credential]'),
+                ('-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----\nafter',
+                 '[redacted credential]\nafter'),
+                # Ordinary words that contain or resemble credential names are kept.
+                ('max_tokens: 100, tokenizer: bpe, secretary: Ann, FAKE_TOKEN placeholder, passwords: 3, the cupbearer of wine',
+                 'max_tokens: 100, tokenizer: bpe, secretary: Ann, FAKE_TOKEN placeholder, passwords: 3, the cupbearer of wine')]:
+            with self.subTest(text=text[:30]):
+                self.assertEqual(capture.redact(text), expected)
+
+    def test_redaction_stays_linear_on_long_words_and_repeated_credential_names(self):
+        # Each case took tens of seconds with a backtracking name pattern.
+        for text in ('token_' * 20000, '-'.join(['api-key'] * 20000), 'a' * 120000, 'a-' * 60000, '"token' * 20000):
+            with self.subTest(text=text[:12]):
+                started = time.monotonic()
+                capture.redact(text)
+                self.assertLess(time.monotonic() - started, 2)
+
+    def test_redaction_replaces_urls_and_git_remotes_before_emails(self):
+        for text, expected in [
+                ('https://alice:pw@github.com/acme/secret-repo', '[redacted URL]'),
+                ('git@github.com:acme/secret-repo.git', '[redacted URL]'),
+                ('ssh://git@github.com/acme/secret-repo.git and file:///tmp/x', '[redacted URL] and [redacted URL]'),
+                ('https://example.com/?token=abc&x=1 next', '[redacted URL] next'),
+                ('mail a@example.com: thanks', 'mail [redacted email]: thanks'),
+                # Pattern-based limit: a local path is replaced only up to its first space.
+                ('open /Us' + 'ers/alice/My Project/app.tsx', 'open [local path] Project/app.tsx')]:
+            with self.subTest(text=text[:30]):
+                self.assertEqual(capture.redact(text), expected)
+
     def test_schema(self):
         turn = {'verified_skills': ['frontend-ui']}
         self.assertEqual(capture.validate_notes({'notes': [self.lesson]}, turn), [self.lesson])
@@ -499,7 +633,7 @@ class CaptureTests(unittest.TestCase):
         turn = {'verified_skills': ['frontend-ui'], 'messages': [{'role': 'assistant', 'text': source}]}
         for field, text in [('task', 'Claude Code built the Aster Labs page'), ('evidence', 'Checked on 2026-11-04'),
                             ('evidence', 'Read https://example.com/docs'), ('evidence', 'Mailed a@example.com'),
-                            ('task', 'Edited /Users/alice/project/app.tsx'), ('proposal', 'Call +1 (555) 010-0199 at 12 Main Street'),
+                            ('task', 'Edited /Us' + 'ers/alice/project/app.tsx'), ('proposal', 'Call +1 (555) 010-0199 at 12 Main Street'),
                             ('observation', '"The private draft must stay unpublished until launch."'),
                             ('cause', '未公開研究資料には秘密顧客情報が含まれています'), ('observation', 'Saw that ' + run)]:
             note = {**self.lesson, field: text}
@@ -664,7 +798,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_failure_does_not_starve_later_turn(self):
         self.rollout(self.transcript() + self.transcript('turn2', load=False))
-        def model(config, root, turn, existing, *, deadline=None):
+        def model(config, root, turn, existing, *, deadline=None, wait_for_rate_limit=True):
             if turn['turn'] == 'turn1':
                 raise RuntimeError('unavailable')
             return []
@@ -673,6 +807,23 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(summary['processed'], 1)
         self.assertEqual(summary['pending'], 1)
         self.assertEqual(summary['errors'], 1)
+
+    def test_extraction_puts_shared_notes_first_and_marks_them_as_the_cache_prefix(self):
+        self.state.mkdir()
+        existing = [{'skill': 'frontend-ui', 'text': 'Shared lesson', 'order': 1}]
+        turn = {'verified_skills': ['frontend-ui'], 'messages': [], 'calls': []}
+        seen = []
+        with patch.object(capture, 'model_response', side_effect=lambda *args, **kwargs: (seen.append((args, kwargs)), {'notes': []})[1]):
+            self.assertEqual(capture.extract(self.config, self.state, turn, existing), [])
+            self.assertEqual(capture.extract(self.config, self.state, turn, []), [])
+        (args, kwargs), (empty_args, empty_kwargs) = seen
+        data, prefix = args[3], kwargs['cache_prefix']
+        self.assertEqual(list(json.loads(data)), ['existing_notes', 'turn'])
+        self.assertEqual(json.loads(data[:prefix].rstrip(', ') + '}'), {'existing_notes': existing})
+        self.assertTrue(data[prefix:].startswith('"turn": '))
+        # Without existing notes there is no shared prefix to cache.
+        self.assertIsNone(empty_kwargs['cache_prefix'])
+        self.assertEqual(json.loads(empty_args[3])['existing_notes'], [])
 
     def test_dedupe_context_uses_recent_notes_for_relevant_skill(self):
         self.state.mkdir()
@@ -816,10 +967,19 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn('private invalid payload', json.dumps(summary))
         self.assertNotIn(str(self.sessions), json.dumps(summary))
 
-    def test_extractor_receives_unredacted_transcript_text(self):
-        user = ('Build a small page; mail a@example.com, open https://example.com/x, read /Users/alice/notes.md, '
+    def test_extractor_receives_redacted_transcript_text(self):
+        user = ('Build a small page; mail a@example.com, open https://example.com/x, read /Us' + 'ers/alice/notes.md, '
                 'use token=abc123 and Bearer abc.def and sk-abcdefgh12345')
-        self.rollout(self.transcript(user=user))
+        context = 'Also check /home/alice/app with ghp_abcdefgh12345 and password: hunter2'
+        reply = 'Built page at https://example.com/x and mailed a@example.com.'
+        text = self.record('event_msg', {'type': 'task_started', 'turn_id': 'turn1'})
+        text += self.record('event_msg', {'type': 'user_message', 'message': user})
+        text += self.record('response_item', {'type': 'message', 'role': 'user', 'content': [{'text': context}]})
+        text += self.record('response_item', {'type': 'function_call', 'call_id': 'read', 'name': 'exec_command', 'arguments': 'cat /skills/frontend-ui/SKILL.md'})
+        text += self.record('response_item', {'type': 'function_call_output', 'call_id': 'read', 'output': 'Exit code: 0\n# Frontend UI\n' + 'skill policy content ' * 20})
+        text += self.record('response_item', {'type': 'message', 'role': 'assistant', 'content': [{'text': reply}]})
+        text += self.record('event_msg', {'type': 'task_complete', 'turn_id': 'turn1'})
+        self.rollout(text)
         inputs = []
         def run(command, **kwargs):
             inputs.append(json.loads(kwargs['input'][len(capture.PROMPT) + 1:]))
@@ -827,8 +987,29 @@ class CaptureTests(unittest.TestCase):
         with patch.object(capture, 'run_extractor', side_effect=run):
             self.assertEqual(capture.capture(self.config, self.state)['processed'], 1)
         [data] = inputs
-        self.assertEqual([m['text'] for m in data['turn']['messages']], [user, 'Built page and checked layout.'])
-        self.assertNotIn('redacted', json.dumps(data))
+        self.assertEqual([m['text'] for m in data['turn']['messages']], [
+            'Build a small page; mail [redacted email], open [redacted URL] read [local path] '
+            'use [redacted credential] and [redacted credential] and [redacted credential]',
+            'Also check [local path] with [redacted credential] and [redacted credential]',
+            'Built page at [redacted URL] and mailed [redacted email].'])
+        for private in ('a@example.com', 'example.com/x', 'alice', 'abc123', 'abc.def', 'abcdefgh12345', 'hunter2'):
+            self.assertNotIn(private, json.dumps(data))
+
+    def test_extractor_receives_redacted_existing_note_context(self):
+        self.rollout()
+        notes = self.feedback / 'frontend-ui/notes'
+        notes.mkdir(parents=True)
+        (notes / 'existing.md').write_text('# Earlier lesson\n- Evidence: Read /Us' + 'ers/alice/app.tsx via '
+                                           'https://example.com/x for a@example.com with token=abc123\n')
+        inputs = []
+        def run(command, **kwargs):
+            inputs.append(json.loads(kwargs['input'][len(capture.PROMPT) + 1:]))
+            return completed({'notes': []})
+        with patch.object(capture, 'run_extractor', side_effect=run):
+            self.assertEqual(capture.capture(self.config, self.state)['processed'], 1)
+        [data] = inputs
+        self.assertEqual([note['text'] for note in data['existing_notes']], [
+            '# Earlier lesson\n- Evidence: Read [local path] via [redacted URL] for [redacted email] with [redacted credential]\n'])
 
     def test_retry_after_rejection_carries_no_rejection_hint(self):
         self.rollout()
@@ -1002,7 +1183,7 @@ class CaptureTests(unittest.TestCase):
         def run(command, **kwargs):
             calls.append(command)
             self.assertEqual(command[command.index('--model') + 1], capture.claude_cli.RESTRICTED_MODEL)
-            self.assertEqual(command[command.index('--effort') + 1], 'xhigh')
+            self.assertEqual(command[command.index('--effort') + 1], 'high')
             self.assertLessEqual(kwargs['timeout'], 240)
             if len(calls) == 1:
                 raise capture.subprocess.TimeoutExpired('private command', 240,
@@ -1042,12 +1223,159 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), '')
         metadata = json.loads(stderr.getvalue())
         self.assertEqual(set(metadata), {'event', 'elapsed_seconds', 'phase', 'failure_class', 'attempts',
-                                         'exit_code', 'result_subtype', 'api_error_status'})
+                                         'exit_code', 'result_subtype', 'api_error_status', 'rate_limit_type',
+                                         'rate_limit_resets_at'})
         self.assertEqual((metadata['exit_code'], metadata['result_subtype'], metadata['api_error_status']), (None, None, None))
         self.assertEqual((metadata['event'], metadata['failure_class'], metadata['phase'], metadata['attempts']),
                          ('extractor_attempt_failed', 'timeout', 'inference', 1))
         self.assertNotIn('private', stderr.getvalue())
         self.assertNotIn('secret', stderr.getvalue())
+
+    def rejected(self, resets=None):
+        """A run the account's usage limit rejected, optionally reporting the window's reset time."""
+        events = [INIT]
+        if resets is not None:
+            events.append({'type': 'rate_limit_event', 'rate_limit_info': {'status': 'rejected', 'rateLimitType': 'five_hour',
+                                                                           'resetsAt': resets}})
+        events.append({'type': 'result', 'subtype': 'success', 'is_error': True, 'api_error_status': 429,
+                       'result': "You've hit your 5-hour limit"})
+        return capture.subprocess.CompletedProcess([], 1, stream(*events), '')
+
+    def test_usage_limit_defers_model_calls_to_its_reset_without_failing_capture(self):
+        self.rollout(self.transcript() + self.transcript('turn2'))
+        reset = int(time.time()) + 7200
+        with patch.object(capture, 'run_extractor', return_value=self.rejected(reset)) as run, \
+                patch.object(capture.sys, 'stderr', io.StringIO()):
+            first = capture.capture(self.config, self.state)
+            second = capture.capture(self.config, self.state)
+        # One rejected call; the second turn and the next cycle wait for the reset instead of calling again.
+        self.assertEqual(run.call_count, 1)
+        for summary in (first, second):
+            self.assertEqual((summary['processed'], summary['pending'], summary['errors'], summary['rate_limited']),
+                             (0, 2, 0, 2))
+        limit = json.loads((self.state / 'rate-limit.json').read_text())
+        self.assertEqual(limit['window'], 'five_hour')
+        self.assertEqual(capture.timestamp(limit['retry_at']),
+                         datetime.fromtimestamp(reset, timezone.utc) + timedelta(minutes=1))
+        self.assertEqual(first['rate_limit'], {**limit, 'deferred': 2, 'overdue': False})
+        # Both turns are retained as deferred work, with no failure backoff of their own.
+        deferred = json.loads((self.state / 'capture-state.json').read_text())['deferred']
+        self.assertEqual(sorted(entry['reason'] for entry in deferred.values()), ['extractor rate limit failure'] * 2)
+        self.assertEqual({(entry['attempts'], entry['retry_at'], entry['rate_limited']) for entry in deferred.values()},
+                         {(0, limit['retry_at'], True)})
+        # Once the reset has passed, the calls resume and a success clears the record.
+        (self.state / 'rate-limit.json').write_text(json.dumps({**limit, 'retry_at': datetime.now(timezone.utc).isoformat()}))
+        with patch.object(capture, 'run_extractor', return_value=completed({'notes': []})) as run:
+            third = capture.capture(self.config, self.state)
+        self.assertEqual((run.call_count, third['processed'], third['pending'], third['errors'], third['rate_limited']),
+                         (2, 2, 0, 0, 0))
+        self.assertIsNone(third['rate_limit'])
+        self.assertFalse((self.state / 'rate-limit.json').exists())
+        self.assertEqual(json.loads((self.state / 'capture-state.json').read_text())['deferred'], {})
+
+    def test_usage_limit_lets_saved_transactions_finish_and_retry_now_makes_one_call(self):
+        self.rollout(self.transcript() + self.transcript('turn2'))
+        with patch.object(capture, 'run_extractor', return_value=self.rejected(int(time.time()) + 7200)), \
+                patch.object(capture.sys, 'stderr', io.StringIO()):
+            capture.capture(self.config, self.state)
+        # A transaction extracted before the limit needs no model call and still completes.
+        state = json.loads((self.state / 'capture-state.json').read_text())
+        [first, second] = sorted(state['deferred'])
+        state['pending'][first] = {'lessons': [self.lesson], 'deployed': 'unavailable', 'machine': 'host',
+                                   'recorded_at': datetime.now(timezone.utc).isoformat()}
+        (self.state / 'capture-state.json').write_text(json.dumps(state))
+        with patch.object(capture, 'run_extractor') as run:
+            summary = capture.capture(self.config, self.state)
+        run.assert_not_called()
+        self.assertEqual((summary['processed'], summary['notes'], summary['rate_limited'], summary['errors']), (1, 1, 1, 0))
+        # --retry-now makes the call despite the record; a success clears it.
+        with patch.object(capture, 'run_extractor', return_value=completed({'notes': []})) as run:
+            summary = capture.capture(self.config, self.state, retry_now=True)
+        self.assertEqual((run.call_count, summary['processed'], summary['rate_limited']), (1, 1, 0))
+        self.assertFalse((self.state / 'rate-limit.json').exists())
+
+    def test_rate_limit_text_without_a_structured_signal_is_an_ordinary_failure(self):
+        self.rollout()
+        # A stack trace line number or a module name can match the text classifier; it must not defer silently.
+        crash = capture.subprocess.CompletedProcess([], 1, stream(INIT), 'TypeError at cli.js:429:12')
+        with patch.object(capture, 'run_extractor', return_value=crash), patch.object(capture.sys, 'stderr', io.StringIO()):
+            summary = capture.capture(self.config, self.state)
+        self.assertEqual((summary['errors'], summary['rate_limited']), (1, 0))
+        self.assertFalse((self.state / 'rate-limit.json').exists())
+        [entry] = json.loads((self.state / 'capture-state.json').read_text())['deferred'].values()
+        self.assertEqual((entry['reason'], entry['attempts'], 'rate_limited' in entry), ('extractor rate limit failure', 1, False))
+
+    def test_a_rejection_after_the_cycle_deadline_is_still_recorded(self):
+        self.state.mkdir()
+        clock = [0.0]
+        def rejected(*args, **kwargs):
+            clock[0] = 10 ** 6
+            return self.rejected(int(time.time()) + 7200)
+        with patch.object(capture.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(capture, 'run_extractor', side_effect=rejected), patch.object(capture.sys, 'stderr', io.StringIO()):
+            with self.assertRaises(capture.CaptureBudgetExpired):
+                capture.model_response(self.config, self.state, 'prompt', '{}', capture.SCHEMA, deadline=1000)
+        self.assertEqual(capture.read_rate_limit(self.state)['window'], 'five_hour')
+
+    def test_usage_limit_status_warns_then_fails_once_the_limit_outlasts_the_grace_period(self):
+        self.rollout()
+        before = datetime.now(timezone.utc)
+        config = self.state / 'config.json'
+        self.state.mkdir()
+        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'claude_path': sys.executable}))
+        def main():
+            with patch.object(sys, 'argv', ['capture.py', '--config', str(config)]), \
+                    patch.object(capture, 'cli_version', return_value='unknown'), patch('builtins.print'), \
+                    patch.object(capture.sys, 'stderr', io.StringIO()):
+                return capture.main(), json.loads((self.state / 'capture-status.json').read_text())
+        # Without a reported reset, the next hourly cycle retries.
+        with patch.object(capture, 'run_extractor', return_value=self.rejected()):
+            code, status = main()
+        limit = json.loads((self.state / 'rate-limit.json').read_text())
+        self.assertIsNone(limit['window'])
+        self.assertLessEqual(before + capture.RATE_LIMIT_RETRY, capture.timestamp(limit['retry_at']))
+        self.assertLessEqual(capture.timestamp(limit['retry_at']), datetime.now(timezone.utc) + capture.RATE_LIMIT_RETRY)
+        self.assertEqual((code, status['success'], status['counts']['errors']), (0, True, 0))
+        self.assertEqual(status['warning'], 'Claude usage limit reached; 1 turns wait for its reset at ' + limit['retry_at'] + '.')
+        self.assertNotIn('error', status)
+        # A limit that has blocked work for more than a day fails capture, so it is never silent.
+        (self.state / 'rate-limit.json').write_text(json.dumps({**limit, 'since': (before - timedelta(hours=25)).isoformat()}))
+        with patch.object(capture, 'run_extractor') as run:
+            code, status = main()
+        run.assert_not_called()
+        self.assertEqual((code, status['success'], status['counts']['errors'], status['counts']['rate_limited']), (1, False, 1, 1))
+        self.assertTrue(status['counts']['rate_limit']['overdue'])
+        self.assertEqual(status['error'], 'Capture has deferred evidence; source remains pending. '
+                                          'The Claude usage limit has blocked 1 turns for more than 24 hours.')
+        self.assertNotIn('warning', status)
+
+    def test_a_rejection_soon_after_the_expected_reset_continues_the_same_limit(self):
+        self.state.mkdir()
+        now = datetime.now(timezone.utc)
+        reset = now + timedelta(hours=3)
+        first = capture.record_rate_limit(self.state, {'rate_limit_resets_at': int(reset.timestamp()),
+                                                       'rate_limit_type': 'five_hour'}, now)
+        self.assertEqual((first['since'], first['window']), (now.isoformat(), 'five_hour'))
+        # A rejection reporting no reset never shortens a known wait, and keeps the window it continues.
+        later = capture.record_rate_limit(self.state, {'rate_limit_resets_at': None}, now + timedelta(hours=1))
+        self.assertEqual(later, first)
+        after = capture.record_rate_limit(self.state, {'rate_limit_resets_at': None}, now + timedelta(hours=4))
+        self.assertEqual((after['since'], after['retry_at']),
+                         (now.isoformat(), (now + timedelta(hours=4) + capture.RATE_LIMIT_RETRY).isoformat()))
+        # A rejection hours after the recorded reset is a new limit with its own grace period.
+        fresh = capture.record_rate_limit(self.state, {'rate_limit_resets_at': None}, now + timedelta(hours=20))
+        self.assertEqual((fresh['since'], fresh['window']), ((now + timedelta(hours=20)).isoformat(), None))
+        # A reset outside the plausible range falls back to the next cycle.
+        far = capture.record_rate_limit(self.state, {'rate_limit_resets_at': int((now + timedelta(days=30)).timestamp()),
+                                                     'rate_limit_type': 'seven_day'}, now + timedelta(days=5))
+        self.assertEqual((capture.timestamp(far['retry_at']), far['window']),
+                         (now + timedelta(days=5) + capture.RATE_LIMIT_RETRY, 'seven_day'))
+        for invalid in ('{"since": "x"}', json.dumps({'since': 1, 'retry_at': now.isoformat(), 'window': None}),
+                        json.dumps({'since': 'soon', 'retry_at': now.isoformat(), 'window': None})):
+            (self.state / 'rate-limit.json').write_text(invalid)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, 'Invalid rate limit state'):
+                capture.read_rate_limit(self.state)
+        self.assertEqual(capture.failure_reason(ValueError('Invalid rate limit state')), 'invalid rate limit state')
 
     def test_transient_cli_failure_retries_but_authentication_and_limits_do_not(self):
         self.state.mkdir()

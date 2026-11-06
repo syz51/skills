@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded prompt regression review. Maintenance evaluations are decision proxies, not runtime proof."""
 import argparse
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -10,10 +10,10 @@ import re
 import subprocess
 import tempfile
 import time
-from zoneinfo import ZoneInfo
 
 import capture
 import claude_cli
+import jobs
 import prompt_runtime
 import read_guidance
 
@@ -77,34 +77,27 @@ def digest(value):
 
 
 def due_key(value=None):
+    """The date of the weekly deadline (jobs.latest_due) that `value` falls under; a bare date counts from 09:00."""
     if value is None:
-        local = datetime.now(ZoneInfo('Asia/Tokyo'))
+        moment = datetime.now(timezone.utc)
     elif isinstance(value, datetime):
         if value.tzinfo is None:
             raise ValueError('Due requires timezone')
-        local = value.astimezone(ZoneInfo('Asia/Tokyo'))
+        moment = value
     else:
         raw = str(value)
-        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
-            local = date.fromisoformat(raw)
-        else:
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
             return due_key(datetime.fromisoformat(raw.replace('Z', '+00:00')))
-    if isinstance(local, datetime):
-        deadline = local.replace(hour=9, minute=0, second=0, microsecond=0)
-        if local < deadline:
-            local -= timedelta(days=1)
-    return local.strftime('%Y-%m-%d')
+        day = date.fromisoformat(raw)
+        moment = datetime(day.year, day.month, day.day, 9, tzinfo=jobs.TOKYO)
+    return jobs.latest_due(moment).date().isoformat()
 
 
 def target_role(due):
     day = date.fromisoformat(due)
-    # Keep historical weekly targets and the migration day's target intact.
-    # Subsequent daily reviews rotate one role per day, within the same budget.
-    transition = date(2026, 11, 2)
-    if day < transition:
-        index = (day - date(2026, 1, 5)).days // 7
-    else:
-        index = (transition - date(2026, 1, 5)).days // 7 + (day - transition).days
+    # One role per Monday. Daily reviews from 2026-11-02 to 2026-11-05 advanced the rotation three
+    # roles beyond the weekly count, so from 2026-11-09 it resumes after the last role they reviewed.
+    index = (day - date(2026, 1, 5)).days // 7 + (3 if day >= date(2026, 11, 9) else 0)
     return ROLES[index % len(ROLES)]
 
 
@@ -213,19 +206,24 @@ def metrics(state_root):
     return result
 
 
-def model(config, state, prompt, data, schema, deadline):
+def model(config, state, prompt, data, schema, deadline, role=None):
+    """One evaluation call. `role` runs a production role on its own model; proposals, grades and approvals stay on MODEL."""
     capture.bounded_timeout(900, deadline)
     # Keep actual decisions for diagnosis; pass/fail summaries cannot explain
     # whether generation, validation or grading caused an unsuccessful check.
     directory = safe_directory(Path(state), 'prompt-evaluation-calls')
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     request = {'recorded_at': datetime.now(timezone.utc).isoformat(), 'evaluator_hash': SOURCE_SHA256,
-               'runtime_hash': prompt_runtime.SOURCE_SHA256, 'model': MODEL,
+               'runtime_hash': prompt_runtime.SOURCE_SHA256, 'model': claude_cli.ROLE_MODELS.get(role, MODEL),
+               # The backend changes the framing: the API sends only this prompt, the CLI adds its own system prompt.
+               'backend': 'api' if config.get('api_key_file') else 'cli',
                'prompt': prompt, 'data': data, 'schema': schema}
     identity = digest(request)
     capture.atomic(directory / (identity + '.request.json'), encoded(request).decode(), exclusive=True)
     try:
-        value = capture.model_response(config, state, prompt, encoded(data).decode(), schema, deadline=deadline)
+        # Each case runs twice with identical input, so the whole input is cached for the repeat.
+        text = encoded(data).decode()
+        value = capture.model_response(config, state, prompt, text, schema, deadline=deadline, role=role, cache_prefix=len(text))
     except Exception as error:
         capture.atomic(directory / (identity + '.failure.json'),
                        encoded({'request': identity, 'failure_class': type(error).__name__}).decode(), exclusive=True)
@@ -288,12 +286,15 @@ def task_input(case):
         return {**source, 'simulation_contract': 'Decision simulation only: return no_change, defer, or change; never execute tools. This is not runtime proof.'}
     messages = capture.message_context(source.get('messages', []))
     if role == 'extract':
+        # Production redacts the existing-note context and the note under check as well.
+        existing = [{**item, 'text': capture.redact(item['text'])} if isinstance(item, dict) and isinstance(item.get('text'), str)
+                    else capture.redact(item) if isinstance(item, str) else item for item in source.get('existing_notes', [])]
         return {'turn': {'verified_skills': case_turn(source, role)['verified_skills'], **messages, 'calls': []},
-                'existing_notes': source.get('existing_notes', [])}
+                'existing_notes': existing}
     note = source['note']
     if isinstance(note, dict):
         note = '# ' + note['title'] + '\n' + '\n'.join('- ' + key.title() + ': ' + note[key] for key in capture.FIELDS if key != 'title')
-    data = {'note': note, 'original_turn': {**messages,
+    data = {'note': capture.redact(note), 'original_turn': {**messages,
             'scope': 'Original user/assistant messages only; tool contents and runtime outcomes absent.'}}
     if source.get('follow_ups'):
         data['follow_ups'] = source['follow_ups']
@@ -317,7 +318,8 @@ def evaluate(config, state, root, role, text, cases, deadline):
         key = digest(case)
         result[key] = []
         for repeat in range(2):
-            output = validate_output(case, model(config, state, prompt_runtime.render(role, text, root), data, schema, deadline))
+            output = validate_output(case, model(config, state, prompt_runtime.render(role, text, root), data, schema, deadline,
+                                                 role=role))
             result[key].append(output_passes(case, output))
             if role != 'maintain':
                 item_id = digest({'case': key, 'output': output, 'repeat': repeat})
@@ -372,6 +374,7 @@ class SourceChanged(RuntimeError):
 def assert_sources_current():
     for module_path, imported_hash in ((Path(__file__), SOURCE_SHA256),
                                         (Path(capture.__file__), capture.SOURCE_SHA256),
+                                        (Path(capture.claude_api.__file__), capture.claude_api.SOURCE_SHA256),
                                         (Path(claude_cli.__file__), claude_cli.SOURCE_SHA256),
                                         (Path(read_guidance.__file__), read_guidance.SOURCE_SHA256),
                                         (Path(capture.activation_trace.__file__), capture.activation_trace.SOURCE_SHA256),
@@ -789,12 +792,17 @@ def run(config, state_root, *, timeout=900, due=None):
             assert_sources_current()
             base = git(root, 'rev-parse', 'HEAD')
             record = published_record(root, due, role)
-            if record or prior.get('completed_due') == due:
+            # A due key at or before the last completed one (such as a manual run in the week after
+            # the daily period) has been reviewed already.
+            completed = str(prior.get('completed_due') or '')
+            if record or completed >= due:
                 result = {'outcome': 'already_reviewed', 'commit': base if record else None, 'target': role, 'due': due}
             else:
                 result = review(config, state, root, base, role, due, deadline)
             assert_sources_current()
-            save(state_path, {'completed_due': due, 'result': result})
+            # Never move the completion marker back to an earlier due key.
+            if completed < due:
+                save(state_path, {'completed_due': due, 'result': result})
             save(status_path, {'success': True, **result})
             return result
     except Exception as error:

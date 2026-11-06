@@ -119,16 +119,42 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(export.ExportError):
             export.execute(config)
 
-    def test_snapshot_publishes_text_verbatim_and_rejects_non_text(self):
-        # No content scanner: committed text is published as is, after configured replacements.
-        text = ('See /Users/alice/file on client-host and maintainer-host in example-owner/private-repo with ghp_' + 'a' * 36
-                + ' and -----BEGIN PRIVATE KEY-----\n')
-        (self.source / 'skills/guide.md').write_text(text)
+    def test_private_scanner(self):
+        for text in ('/Us' + 'ers/alice/file', 'roy' + '-mac', 'sunmacbook' + '-air', 'ghp_' + 'a' * 36, '-----BEGIN ' + 'PRIVATE KEY-----',
+                     # Markers match in any case; replacements do not, so these stay unreplaced.
+                     '-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----', '-----BEGIN ENCRYPTED ' + 'PRIVATE KEY-----', '-----BEGIN DSA ' + 'PRIVATE KEY-----', 'Roy' + '-Mac', 'SunMacBook' + '-Air', 'SYZ51/' + 'Codex-Skills', '/us' + 'ers/alice', '(/US' + 'ERS/alice/x)'):
+            with self.subTest(text_length=len(text)), self.assertRaises(export.ExportError):
+                export.scan('test.md', text.encode())
+        export.scan('test.md', b'Use FAKE_TOKEN in examples.')
+        # A lowercase users route is not a home path.
+        for route in ("path: '/users/:id'", '`/users/${id}` and `/users/1`', 'server/api/users/[id].put.ts - PUT /api/users/:id',
+                      'https://api.github.com/users/octocat', 'pages/users/profile.vue'):
+            with self.subTest(route=route):
+                export.scan('test.md', route.encode())
+
+    def test_snapshot_scans_after_replacements_and_drops_and_rejects_non_text(self):
+        host = 'sunmacbook' + '-air'
+        folder = self.source / 'skills/example'
+        folder.mkdir()
+        (folder / 'sources.json').write_text(json.dumps({'backupPath': '/Us' + 'ers/alice/backup', 'items': [{'license': 'MIT'}]}))
+        (self.source / 'skills/guide.md').write_text('Checked on ' + host + ' with FAKE_TOKEN.\n')
+        self.commit()
+        config = dict(self.config, replacements={host: 'client-host'}, json_drop_keys=['backupPath'],
+                      files=[*self.config['files'], {'source': 'skills/example/sources.json', 'target': 'sources.json'}])
+        # Replacements and json_drop_keys run before the scan, so these publish.
+        files = export.snapshot(config, export.clean_source(self.source))
+        self.assertEqual(files['skills/guide.md'], b'Checked on client-host with FAKE_TOKEN.\n')
+        self.assertEqual(json.loads(files['sources.json']), {'items': [{'license': 'MIT'}]})
+        # A local path, a hostname no replacement covers, the private repository slug,
+        # a token or a private key fails the snapshot.
+        for private in ('/Us' + 'ers/alice/file', 'roy' + '-mac', 'syz51/' + 'codex-skills', 'ghp_' + 'a' * 36,
+                        '-----BEGIN ' + 'PRIVATE KEY-----'):
+            (self.source / 'skills/guide.md').write_text('See ' + private + '\n')
+            self.commit()
+            with self.subTest(text_length=len(private)), self.assertRaisesRegex(export.ExportError, 'Publication rejected: skills/guide.md'):
+                export.snapshot(config, export.clean_source(self.source))
         (self.source / 'skills/image.bin').write_bytes(b'\xff\xfe')
         self.commit()
-        config = dict(self.config, replacements={'maintainer-host': 'client-host'})
-        files = export.snapshot(config, export.clean_source(self.source))
-        self.assertEqual(files['skills/guide.md'], text.replace('maintainer-host', 'client-host').encode())
         config = dict(self.config, files=[{'source': 'skills/image.bin', 'target': 'skills/image.bin'}])
         with self.assertRaisesRegex(export.ExportError, 'Non-text publication file'):
             export.snapshot(config, export.clean_source(self.source))

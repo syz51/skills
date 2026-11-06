@@ -158,7 +158,7 @@ class MonitorTests(unittest.TestCase):
         self.remote['weekly_state']['setup_started_at'] = NOW.isoformat()
         self.assertNotIn('maintainer-host:weekly:overdue', monitor.health(self.remote, NOW))
 
-    def test_daily_review_overdue_and_recovery_on_tuesday_and_weekend(self):
+    def test_monday_review_overdue_and_recovery_later_in_the_week(self):
         for day in (13, 17):
             now = datetime(2026, 10, day, 4, tzinfo=timezone.utc)
             remote = snapshot('maintainer-host')
@@ -166,14 +166,33 @@ class MonitorTests(unittest.TestCase):
                 remote[name]['finished_at'] = now.isoformat()
             remote['captured_at'] = now.isoformat()
             key = 'maintainer-host:weekly:overdue'
+            # Monday's review is done, so the rest of the week raises nothing.
+            self.assertNotIn(key, monitor.health(remote, now))
+            remote['weekly_state']['completed_due'] = '2026-10-05T09:00:00+09:00'
             problems = monitor.health(remote, now)
             self.assertIn(key, problems)
-            self.assertIn('Daily skill review', problems[key])
+            self.assertIn('Monday skill review', problems[key])
             # Starting or finishing a run is insufficient; the latest due marker must advance.
             self.assertFalse(monitor.recovered(key, remote, now, (now - timedelta(hours=1)).isoformat()))
             remote['weekly_state']['completed_due'] = monitor.latest_due(now).isoformat()
             self.assertNotIn(key, monitor.health(remote, now))
             self.assertTrue(monitor.recovered(key, remote, now, (now - timedelta(hours=1)).isoformat()))
+
+    def test_daily_period_completion_carries_over_until_next_monday(self):
+        remote = snapshot('maintainer-host')
+        remote['weekly_state']['completed_due'] = '2026-11-05T09:00:00+09:00'
+        key = 'maintainer-host:weekly:overdue'
+        for now in (datetime(2026, 11, 6, 4, tzinfo=timezone.utc), datetime(2026, 11, 9, 2, 59, tzinfo=timezone.utc)):
+            with self.subTest(now=now):
+                for name in ('sync', 'weekly'):
+                    remote[name]['finished_at'] = now.isoformat()
+                remote['captured_at'] = now.isoformat()
+                self.assertNotIn(key, monitor.health(remote, now))
+        now = datetime(2026, 11, 9, 3, 1, tzinfo=timezone.utc)  # Monday 12:01 Tokyo
+        for name in ('sync', 'weekly'):
+            remote[name]['finished_at'] = now.isoformat()
+        remote['captured_at'] = now.isoformat()
+        self.assertIn(key, monitor.health(remote, now))
 
     def test_transient_disconnect_and_sustained_outage(self):
         state = monitor.evaluate(self.local, None, self.previous, NOW)

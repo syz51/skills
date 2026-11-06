@@ -33,7 +33,8 @@ fn execute(command: Command) -> Result<serde_json::Value> {
         Command::Plan(options) | Command::Publish(options) | Command::Daily(options) => options,
     };
     let config = Config::load(&options.config)?;
-    let generate = |diff: &str| message::generate(&config, diff);
+    let generate =
+        |diff: &str, instruction: Option<&str>| message::generate(&config, diff, instruction);
     match command {
         Command::Plan(_) => Ok(serde_json::to_value(export::execute(
             &config, false, &generate,
