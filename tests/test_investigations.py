@@ -250,6 +250,24 @@ class InvestigationTests(unittest.TestCase):
         log=self.state/'investigations/logs'/result['run_sha256']/'stdout'
         self.assertLessEqual(log.stat().st_size,1000000)
 
+    def test_exited_unreaped_group_is_complete_and_a_stuck_one_is_not(self):
+        cycle=self.cycle();case=self.fixture('print("done")')
+        real=os.killpg;seen={'refused':False,'polled':False}
+        def unreaped(pid,sig):
+            # Darwin's answer while the finished leader is still unreaped: refused until the runner polls again.
+            if not seen['polled']:
+                seen['refused']=True;raise PermissionError(1,'Operation not permitted')
+            return real(pid,sig)
+        def poll(process,original=subprocess.Popen.poll):
+            seen['polled']=seen['polled'] or seen['refused'];return original(process)
+        with patch.object(inv.os,'killpg',side_effect=unreaped),patch.object(subprocess.Popen,'poll',poll):
+            result=inv.run(self.config,self.state,cycle,case,'baseline')
+        self.assertTrue(seen['polled'])
+        self.assertFalse(result['process_group_incomplete']);self.assertTrue(result['passed'])
+        with patch.object(inv.os,'killpg',side_effect=PermissionError(1,'Operation not permitted')),patch.object(inv.time,'sleep'):
+            result=inv.run(self.config,self.state,cycle,case,'candidate')
+        self.assertTrue(result['process_group_incomplete']);self.assertFalse(result['passed'])
+
     @unittest.skipUnless(hasattr(os,'fork'),'POSIX process-group test')
     def test_successful_leader_cannot_leave_descendants_running(self):
         cycle = self.cycle(); case = self.fixture('import os,time\npid=os.fork()\nif pid==0: time.sleep(20)\nelse: print(pid,flush=True)')

@@ -52,11 +52,12 @@ fn unchanged_success_skips_repeats_and_next_day_runs() {
 }
 
 #[test]
-fn failed_publication_is_retryable_and_diagnostics_stay_static() {
+fn failed_publication_is_retryable_and_reports_its_cause_outside_the_status() {
     let root = TempDir::new().unwrap();
     let config = config(&root);
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
-    assert!(daily::run_with(&config, now, || Err("private diagnostic".into())).is_err());
+    let error = daily::run_with(&config, now, || Err("private diagnostic".into())).unwrap_err();
+    assert_eq!(error.to_string(), "private diagnostic");
     assert!(!root.path().join("daily-state.json").exists());
     let status = fs::read_to_string(root.path().join("daily-status.json")).unwrap();
     assert!(!status.contains("private diagnostic"));

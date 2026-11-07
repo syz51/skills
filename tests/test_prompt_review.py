@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -51,7 +52,8 @@ class PromptReviewTests(unittest.TestCase):
         self.approval = True
         self.proposal_change = {}
 
-    def responder(self, config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None):
+    def responder(self, config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend):
+        self.assertEqual(backend, 'cli')
         self.assertGreater(deadline, time.monotonic())
         self.calls.append((prompt, json.loads(data), deadline))
         value = json.loads(data)
@@ -247,6 +249,35 @@ class PromptReviewTests(unittest.TestCase):
                          time.monotonic()+30)
         backends = sorted(json.loads(path.read_text())['backend'] for path in directory.glob('*.request.json'))
         self.assertEqual(backends, ['api', 'cli', 'cli'])
+
+    def test_a_review_keeps_one_backend(self):
+        key = self.root / 'key'
+        key.write_text('sk-ant-secret\n')
+        config = {**self.config, 'api_key_file': str(key)}
+        directory = self.state/'prompt-evaluation-calls'
+        def backends():
+            return sorted(json.loads(path.read_text())['backend'] for path in directory.glob('*.request.json'))
+        with patch.object(review.capture, 'model_response', return_value={'notes': []}) as response:
+            review.model(config, self.state, 'Synthetic check', {}, review.capture.SCHEMA, time.monotonic()+30)
+            self.assertEqual(response.call_args.kwargs['backend'], 'api')
+            # A fallback in effect starts calls on the subscription.
+            record = review.capture.record_api_fallback(config, self.state, 'billing', datetime.now(timezone.utc))
+            review.model(config, self.state, 'Synthetic check 2', {}, review.capture.SCHEMA, time.monotonic()+30)
+            self.assertEqual(response.call_args.kwargs['backend'], 'cli')
+            # A review pinned to the API keeps asking for it, so the real call fails rather than move.
+            review.model({**config, 'review_backend': 'api'}, self.state, 'Synthetic check 3', {}, review.capture.SCHEMA,
+                         time.monotonic()+30)
+            self.assertEqual(response.call_args.kwargs['backend'], 'api')
+        self.assertEqual(backends(), ['api', 'api', 'cli'])
+        self.assertEqual(review.fallback_status(config, self.state), {'api_fallback': record})
+        self.assertEqual(review.fallback_status(self.config, self.state), {})
+        seen = []
+        def evaluate(config, *args):
+            seen.append(config['review_backend'])
+            raise RuntimeError('stop after the baseline')
+        with patch.object(review, 'evaluate', side_effect=evaluate), self.assertRaises(RuntimeError):
+            review.review(config, self.state, self.repo, self.base, 'extract', 'due', time.monotonic()+30)
+        self.assertEqual(seen, ['cli'])
 
     def test_model_failure_preserves_request_without_exception_secrets(self):
         with patch.object(review.capture, 'model_response', side_effect=RuntimeError('private credentials in diagnostic')):
@@ -678,20 +709,20 @@ class PromptReviewTests(unittest.TestCase):
 
     def test_semantically_unrelated_valid_notes_and_bad_grade_ids_fail_closed(self):
         original = self.responder
-        def semantic(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None):
+        def semantic(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
             value = json.loads(data)
             if schema is review.GRADE_SCHEMA:
                 return {'grades': [{'item_id': item['item_id'], 'passed': False} for item in value['items']]}
-            return original(config, state, prompt, data, schema, deadline=deadline, role=role)
+            return original(config, state, prompt, data, schema, deadline=deadline, role=role, backend=backend)
         with patch.object(review.capture, 'model_response', side_effect=semantic):
             result = review.run(self.config, self.state, due=self.due)
         self.assertEqual(result['outcome'], 'no_change')
         self.assertTrue(all(not any(v) for v in result['candidate'].values()))
         (self.state / 'prompt-review-state.json').unlink()
-        def wrong_ids(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None):
+        def wrong_ids(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
             if schema is review.GRADE_SCHEMA:
                 return {'grades': [{'item_id': 'wrong', 'passed': True} for _ in json.loads(data)['items']]}
-            return original(config, state, prompt, data, schema, deadline=deadline, role=role)
+            return original(config, state, prompt, data, schema, deadline=deadline, role=role, backend=backend)
         with patch.object(review.capture, 'model_response', side_effect=wrong_ids):
             with self.assertRaises(RuntimeError):
                 review.run(self.config, self.state, due=self.due)

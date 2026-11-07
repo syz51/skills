@@ -496,12 +496,22 @@ def run(config, state_root, cycle_path, case_path, variant, issue_id=None):
                         finally:
                             # A successful leader is insufficient when its workers
                             # remain alive. Always clean the entire owned group.
-                            try:
-                                os.killpg(process.pid, 0)
-                                incomplete = process.poll() is not None
-                                os.killpg(process.pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
+                            for _ in range(200):
+                                try:
+                                    os.killpg(process.pid, 0)
+                                    incomplete = process.poll() is not None
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    break
+                                except PermissionError:
+                                    # Darwin refuses to signal a group whose members have all exited
+                                    # unreaped, such as a leader that just finished: reap it, look again.
+                                    process.poll()
+                                    time.sleep(.01)
+                                else:
+                                    break
+                            else:
+                                incomplete = True
                             process.wait()
         oversized = stdout.stat().st_size > 1_000_000 or stderr.stat().st_size > 1_000_000
         source_unchanged = True

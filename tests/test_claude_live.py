@@ -1,7 +1,8 @@
 """Opt-in checks of the Claude Code flow against the real CLI.
 
 Skipped unless RUN_CLAUDE_LIVE=1; with it set, a missing CLI fails instead of skipping. They use the caller's Claude Code login and make a
-few small claude-haiku-5-5 calls at low effort; never run them in credential-free CI.
+few small claude-haiku-5-5 calls at low effort, plus two extraction calls on the extract role's model and effort;
+never run them in credential-free CI.
 """
 import json
 import os
@@ -144,6 +145,30 @@ class ClaudeLiveTests(unittest.TestCase):
         self.assertEqual(output['answer'], 4)
         self.assertEqual([path.name for path in state.iterdir()], [])
 
+    def test_extractor_separates_rejected_defaults_from_single_design_feedback(self):
+        """Runs the extract role on its production model and effort: the boundary is a model judgment."""
+        state = self.root / 'state'
+        state.mkdir()
+        config = {'claude_path': self.cli, 'install_root': str(self.root / 'install'),
+                  'repo_path': str(Path(__file__).resolve().parents[1])}
+        def turn(*messages):
+            return {'verified_skills': ['frontend-ui'], 'calls': [],
+                    'messages': [{'role': role, 'text': text} for role, text in messages]}
+        rejected = capture.extract(config, state, turn(
+            ('user', 'Build the landing page for my bookshop app in landing.html.'),
+            ('assistant', 'Built landing.html: a hero with a headline and frosted translucent glassmorphism cards for the three features.'),
+            ('user', 'Stop defaulting to glassmorphism, those frosted translucent panels. I do not want them in any '
+                     'interface you build for me unless I ask for them. Here, use plain bordered cards instead.'),
+            ('assistant', 'Replaced the frosted panels in landing.html with plain bordered cards and checked the page at wide and narrow widths.')), [])
+        patterns = [capture.rejected_default(note['title']) for note in rejected]
+        self.assertTrue(any(p and re.search(r'glass|frost|translucent', p, re.I) for p in patterns), rejected)
+        single = capture.extract(config, state, turn(
+            ('user', 'Build the pricing page in pricing.html with three plans.'),
+            ('assistant', 'Built pricing.html with three plan cards, each with two badges and a feature list.'),
+            ('user', 'On this pricing page the cards feel too busy. Drop the second badge on each card and tighten the spacing here.'),
+            ('assistant', 'Removed the second badge from each plan card in pricing.html and reduced the card padding; checked the page at wide and narrow widths.')), [])
+        self.assertEqual([note['title'] for note in single if capture.rejected_default(note['title']) is not None], [], single)
+
     def test_review_writes_the_final_reply_and_logs_events(self):
         repo = self.root / 'repo'
         repo.mkdir()
@@ -155,7 +180,7 @@ class ClaudeLiveTests(unittest.TestCase):
         state.mkdir()
         prompt = 'Do not use any tools. Reply with exactly the text REVIEW-OK and nothing else.'
         with tempfile.TemporaryFile('w+', dir=self.root) as log, self.cheap(claude_cli.review_command):
-            jobs.review(self.cli, repo, state, prompt, log, dict(os.environ), TIMEOUT)
+            jobs.review(self.cli, repo, state, prompt, log, dict(os.environ), TIMEOUT, jobs.review_settings({}))
             log.seek(0)
             logged = log.read()
 

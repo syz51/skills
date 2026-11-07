@@ -13,6 +13,25 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[1] / 'scripts'))
 import evidence
 
+START = datetime(2026, 11, 6, 12, tzinfo=timezone.utc)
+
+
+def codex(kind, payload):
+    return json.dumps({'type': kind, 'payload': payload, 'timestamp': '2026-10-10T01:00:00Z'}) + '\n'
+
+
+def codex_turn(turn):
+    """One completed Codex turn, as a rollout records it."""
+    return (codex('event_msg', {'type': 'task_started', 'turn_id': turn})
+            + codex('event_msg', {'type': 'user_message', 'message': 'Build a small page'})
+            + codex('response_item', {'type': 'message', 'role': 'assistant', 'content': [{'text': 'Built ' + turn + '.'}]})
+            + codex('event_msg', {'type': 'task_complete', 'turn_id': turn}))
+
+
+def hours(value):
+    """The hourly sync cycle `value` hours after START."""
+    return START + timedelta(hours=value)
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -444,14 +463,17 @@ class EvidenceTests(unittest.TestCase):
     def test_new_same_chat_confirmation_rechecks_unresolved_note_once(self):
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=[
                 {'status': 'partial', 'summary': 'The outcome is not established.'}, {'notes': []}]):
-            evidence.verify(self.config, self.root)
+            evidence.verify(self.config, self.root, now=hours(0))
         old = {p: p.read_bytes() for p in self.feedback.rglob('*.json')}
         follow = {**self.turn, 'turn': 'confirmation', 'completed_at': '2026-10-14T02:00:00Z',
                   'source_sha256': 'c' * 64, 'messages': [{'role': 'user', 'text': 'I checked the final version and the behavior matches.'}]}
         with patch.object(evidence, 'completed_turns', return_value=[self.turn, follow]), patch.object(evidence, 'model_response',
                 return_value={'status': 'supported', 'summary': 'The later confirmation supplies the previously missing report.'}) as model:
-            first = evidence.verify(self.config, self.root)
-            second = evidence.verify(self.config, self.root)
+            # The unresolved note waits for its retry, then picks up the confirmation once.
+            waiting = evidence.verify(self.config, self.root, now=hours(0.4))
+            first = evidence.verify(self.config, self.root, now=hours(1))
+            second = evidence.verify(self.config, self.root, now=hours(2))
+        self.assertEqual((waiting['checked'], waiting['unresolved']), (0, 1))
         self.assertEqual((first['checked'], first['unresolved'], second['checked']), (1, 0, 0))
         model.assert_called_once()
         request = json.loads(model.call_args.args[3])
@@ -472,24 +494,25 @@ class EvidenceTests(unittest.TestCase):
     def test_changed_original_evidence_rechecks_and_unchanged_evidence_does_not(self):
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=[
                 {'status': 'partial', 'summary': 'The result is not established.'}, {'notes': []}]):
-            evidence.verify(self.config, self.root)
+            evidence.verify(self.config, self.root, now=hours(0))
         restored = {**self.turn, 'source_sha256': 'd' * 64, 'messages': [*self.turn['messages'],
                     {'role': 'assistant', 'text': 'Additional saved context qualifies the earlier report.'}]}
         with patch.object(evidence, 'completed_turns', return_value=[restored]), patch.object(evidence, 'model_response', side_effect=[
                 {'status': 'partial', 'summary': 'The added context is still insufficient.'}, {'notes': []}]) as model:
-            first = evidence.verify(self.config, self.root)
-            second = evidence.verify(self.config, self.root)
+            first = evidence.verify(self.config, self.root, now=hours(1))
+            second = evidence.verify(self.config, self.root, now=hours(24))
         self.assertEqual((first['checked'], second['checked']), (1, 0))
         self.assertEqual(model.call_count, 2)
 
     def test_restored_source_is_checked_after_being_unavailable(self):
         with patch.object(evidence, 'completed_turns', return_value=[]), patch.object(evidence, 'model_response') as model:
-            missing = evidence.verify(self.config, self.root)
+            missing = evidence.verify(self.config, self.root, now=hours(0))
         model.assert_not_called()
         self.assertEqual(missing['unavailable'], 1)
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',
                 return_value={'status': 'supported', 'summary': 'The restored messages support attribution.'}):
-            self.assertEqual(evidence.verify(self.config, self.root)['checked'], 1)
+            self.assertEqual(evidence.verify(self.config, self.root, now=hours(0.4))['unavailable'], 1)
+            self.assertEqual(evidence.verify(self.config, self.root, now=hours(1))['checked'], 1)
 
     def test_long_followups_stay_bounded_and_unresolved(self):
         later = [{**self.turn, 'turn': f'later{i}', 'completed_at': f'2026-10-15T{i:02d}:00:00Z',
@@ -542,6 +565,8 @@ class EvidenceTests(unittest.TestCase):
         data = (json.dumps(old) + '\n').encode()
         previous = previous.with_name(old['noteSha256'] + '--' + hashlib.sha256(data).hexdigest() + '.json')
         previous.write_bytes(data)
+        # A receipt from an earlier checker, which voided every retry schedule.
+        (self.root / evidence.BACKOFF).unlink()
         responses = [{'status': 'partial', 'summary': 'The result remains overstated.'}, {'notes': [self.correction]},
                      {'status': 'supported', 'summary': 'The correction preserves the reported limit.'}]
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=responses):
@@ -554,10 +579,10 @@ class EvidenceTests(unittest.TestCase):
     def test_correction_failures_preserve_history_and_fail_the_job(self):
         unsafe = {'notes': [{**self.correction, 'evidence': 'two\nlines'}]}
         # A rejected correction is not retried; the job fails without a receipt.
-        for failures in ([RuntimeError('Service unavailable')], [unsafe]):
+        for cycle, failures in enumerate(([RuntimeError('Service unavailable')], [unsafe])):
             with self.subTest(failures=failures), patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(
                     evidence, 'model_response', side_effect=[{'status': 'partial', 'summary': 'The result is overstated.'}, *failures]) as model:
-                result = evidence.verify(self.config, self.root)
+                result = evidence.verify(self.config, self.root, now=hours(cycle))
             self.assertEqual(result['errors'], 1)
             self.assertEqual(model.call_count, 1 + len(failures))
             self.assertEqual(list(self.feedback.rglob('*.json')), [])
@@ -679,6 +704,21 @@ class EvidenceTests(unittest.TestCase):
                                  + limit['retry_at'] + '.')
         self.assertEqual(list(self.feedback.rglob('*.json')), [])
 
+    def test_status_names_a_standing_subscription_fallback(self):
+        key = self.root / 'key'
+        key.write_text('sk-ant-secret\n')
+        key.chmod(0o600)
+        config = self.root / 'config.json'
+        config.write_text(json.dumps({**self.config, 'api_key_file': str(key)}))
+        record = evidence.capture.record_api_fallback({'api_key_file': str(key)}, self.root, 'billing', datetime.now(timezone.utc))
+        counts = {'errors': 0, 'rate_limit': None}
+        with patch.object(evidence, 'verify', return_value=counts), \
+                patch.object(sys, 'argv', ['evidence.py', '--config', str(config)]), patch('builtins.print'):
+            self.assertEqual(evidence.main(), 0)
+        status = json.loads((self.root / 'evidence-status.json').read_text())
+        self.assertEqual(status['api_fallback'], record)
+        self.assertTrue(status['warning'].startswith('Running on subscription fallback'))
+
     def test_a_requested_check_runs_despite_a_recorded_limit_and_fails_when_rejected(self):
         now = datetime.now(timezone.utc)
         (self.root / 'rate-limit.json').write_text(json.dumps(
@@ -724,6 +764,8 @@ class EvidenceTests(unittest.TestCase):
         data = (json.dumps(old) + '\n').encode()
         previous = previous.with_name(old['noteSha256'] + '--' + hashlib.sha256(data).hexdigest() + '.json')
         previous.write_bytes(data)
+        # A receipt from an earlier checker, which voided every retry schedule.
+        (self.root / evidence.BACKOFF).unlink()
         responses = [{'status': 'partial', 'summary': 'The result remains overstated.'}, {'notes': [self.correction]},
                      {'status': 'supported', 'summary': 'The correction preserves uncertainty.'}]
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=responses):
@@ -753,6 +795,190 @@ class EvidenceTests(unittest.TestCase):
                         dict(value, loadedReads=[{'path': '../private', 'sha256': 'a' * 64, 'coverage': 'complete', 'read_turn': 'turn1'}])]:
             with self.assertRaises(ValueError):
                 evidence.validate_receipt(changed)
+
+
+
+class BackoffTests(unittest.TestCase):
+    setUp = EvidenceTests.setUp
+
+    def schedule(self):
+        return json.loads((self.root / evidence.BACKOFF).read_text())['notes']
+
+    def digest(self):
+        return hashlib.sha256(self.path.read_bytes()).hexdigest()
+
+    def test_missing_source_is_retried_after_doubling_waits_up_to_a_day(self):
+        scans = []
+        with patch.object(evidence, 'completed_turns', side_effect=lambda *a, **k: scans.append(1) or []), \
+                patch.object(evidence, 'model_response') as model:
+            waits, at = [], 0.0
+            for _ in range(8):
+                self.assertEqual(evidence.verify(self.config, self.root, now=hours(at))['unavailable'], 1)
+                [entry] = self.schedule().values()
+                due = evidence.timestamp(entry['retry_at'])
+                waits.append((due - hours(at) + evidence.BACKOFF_SLACK) / timedelta(hours=1))
+                # Every hourly run before the retry counts the note as still unavailable without reading a transcript.
+                before = len(scans)
+                self.assertEqual(evidence.verify(self.config, self.root, now=due - timedelta(minutes=1))['unavailable'], 1)
+                self.assertEqual(len(scans), before)
+                at = (due - START) / timedelta(hours=1)
+        self.assertEqual(waits, [1, 2, 4, 8, 16, 24, 24, 24])
+        self.assertEqual(len(scans), 8)
+        self.assertEqual(entry['reason'], 'unavailable')
+        model.assert_not_called()
+
+    def test_changed_note_or_checker_is_due_at_once(self):
+        with patch.object(evidence, 'completed_turns', return_value=[]) as scanner:
+            evidence.verify(self.config, self.root, now=hours(0))
+            self.assertEqual(set(self.schedule()), {'frontend-ui/' + self.digest()})
+            with patch.object(evidence, 'checker_fingerprint', return_value='f' * 64):
+                evidence.verify(self.config, self.root, now=hours(0.1))
+            self.assertEqual(scanner.call_count, 2)
+            self.assertEqual(next(iter(self.schedule().values()))['checker'], 'f' * 64)
+            evidence.verify(self.config, self.root, now=hours(0.2))
+            self.assertEqual(scanner.call_count, 3)
+            self.path.write_text(self.path.read_text() + '- Task: An edited lesson.\n')
+            evidence.verify(self.config, self.root, now=hours(0.3))
+            self.assertEqual(scanner.call_count, 4)
+        # The old note's entry goes with it.
+        self.assertEqual(set(self.schedule()), {'frontend-ui/' + self.digest()})
+
+    def test_requested_check_runs_at_once_and_updates_only_its_own_schedule(self):
+        other = self.path.with_name('other.md')
+        other.write_text(self.path.read_text() + '- Task: Another lesson.\n')
+        other_key = 'frontend-ui/' + hashlib.sha256(other.read_bytes()).hexdigest()
+        with patch.object(evidence, 'completed_turns', return_value=[]) as scanner:
+            evidence.verify(self.config, self.root, now=hours(0))
+            before = self.schedule()[other_key]
+            self.assertEqual(evidence.verify(self.config, self.root, self.digest(), now=hours(0.1))['unavailable'], 1)
+            self.assertEqual(scanner.call_count, 2)
+        schedule = self.schedule()
+        self.assertEqual(schedule[other_key], before)
+        self.assertEqual(schedule['frontend-ui/' + self.digest()]['attempts'], 2)
+
+    def test_requested_recheck_that_settles_a_failed_note_clears_its_wait(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]):
+            with patch.object(evidence, 'model_response', side_effect=RuntimeError('Service unavailable')):
+                self.assertEqual(evidence.verify(self.config, self.root, now=hours(0))['errors'], 1)
+            with patch.object(evidence, 'model_response',
+                              return_value={'status': 'supported', 'summary': 'Reported attribution is supported.'}):
+                self.assertEqual(evidence.verify(self.config, self.root, self.digest(), now=hours(0.2))['checked'], 1)
+            self.assertEqual(self.schedule(), {})
+            with patch.object(evidence, 'model_response') as model:
+                later = evidence.verify(self.config, self.root, now=hours(0.5))
+        model.assert_not_called()
+        self.assertEqual((later['errors'], later['pending'], later['supported']), (0, 0, 1))
+
+    def test_a_waiting_failed_check_still_fails_the_job_while_other_notes_are_checked(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=RuntimeError('Service unavailable')):
+            evidence.verify(self.config, self.root, now=hours(0))
+        self.path.with_name('later.md').write_text(self.path.read_text() + '- Task: A later lesson.\n')
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',
+                return_value={'status': 'supported', 'summary': 'Reported attribution is supported.'}):
+            counts = evidence.verify(self.config, self.root, now=hours(0.4))
+        self.assertEqual((counts['checked'], counts['errors'], counts['pending']), (1, 1, 1))
+
+    def test_no_saved_wait_outlasts_the_cap(self):
+        key = 'frontend-ui/' + self.digest()
+        checker = evidence.checker_fingerprint(self.config)
+        (self.root / evidence.BACKOFF).write_text(json.dumps({'version': 1, 'notes': {key: {
+            'checker': checker, 'reason': 'unavailable', 'attempts': 6, 'retry_at': '2036-01-01T00:00:00+00:00'}}}))
+        [entry] = evidence.load_backoff(self.root / evidence.BACKOFF, checker, hours(0)).values()
+        self.assertEqual(entry['retry_at'], hours(0) + evidence.MAX_BACKOFF)
+        with patch.object(evidence, 'completed_turns', return_value=[]) as scanner:
+            # The first run saves the capped wait, so the note is due a day later.
+            evidence.verify(self.config, self.root, now=hours(0))
+            self.assertEqual(scanner.call_count, 0)
+            evidence.verify(self.config, self.root, now=hours(24))
+        self.assertEqual(scanner.call_count, 1)
+
+    def test_failed_check_waits_and_still_fails_the_job(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=RuntimeError('Service unavailable')) as model:
+            first = evidence.verify(self.config, self.root, now=hours(0))
+            waiting = evidence.verify(self.config, self.root, now=hours(0.4))
+            self.assertEqual(model.call_count, 1)
+            evidence.verify(self.config, self.root, now=hours(1))
+            self.assertEqual(model.call_count, 2)
+        for counts in (first, waiting):
+            self.assertEqual((counts['errors'], counts['pending'], counts['checked']), (1, 1, 0))
+        [entry] = self.schedule().values()
+        self.assertEqual((entry['reason'], entry['attempts']), ('error', 2))
+
+    def test_a_new_outcome_starts_the_waits_over_and_a_settled_note_leaves_the_schedule(self):
+        with patch.object(evidence, 'completed_turns', return_value=[]):
+            for at in (0, 1, 3):
+                evidence.verify(self.config, self.root, now=hours(at))
+        self.assertEqual(next(iter(self.schedule().values()))['attempts'], 3)
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response', side_effect=[
+                {'status': 'partial', 'summary': 'The result is not established.'}, {'notes': []}]):
+            evidence.verify(self.config, self.root, now=hours(7))
+        [entry] = self.schedule().values()
+        self.assertEqual((entry['reason'], entry['attempts']), ('unresolved', 1))
+        followed = {**self.turn, 'turn': 'later', 'completed_at': '2026-10-14T03:00:00Z', 'source_sha256': 'c' * 64,
+                    'messages': [{'role': 'user', 'text': 'The final version works as reported.'}]}
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn, followed]), patch.object(
+                evidence, 'model_response', return_value={'status': 'supported', 'summary': 'The later report confirms it.'}):
+            self.assertEqual(evidence.verify(self.config, self.root, now=hours(8))['checked'], 1)
+        self.assertEqual(self.schedule(), {})
+
+    def test_bounded_backlog_and_unreadable_schedule_do_not_delay_checks(self):
+        for index in range(11):
+            self.path.with_name('note' + str(index) + '.md').write_text(self.path.read_text() + '- Task: lesson ' + str(index) + '\n')
+        self.path.unlink()
+        (self.root / evidence.BACKOFF).write_text('{not json')
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',
+                return_value={'status': 'supported', 'summary': 'Reported attribution is supported.'}):
+            first = evidence.verify(self.config, self.root, now=hours(0))
+            self.assertEqual(self.schedule(), {})
+            second = evidence.verify(self.config, self.root, now=hours(0.1))
+        self.assertEqual((first['checked'], first['pending'], second['checked']), (10, 1, 1))
+
+    def test_nothing_due_reads_no_transcript(self):
+        with patch.object(evidence, 'completed_turns', return_value=[]) as codex_scan, \
+                patch.object(evidence, 'claude_turns', return_value=[]) as claude_scan:
+            evidence.verify(self.config, self.root, now=hours(0))
+            evidence.verify(self.config, self.root, now=hours(0.4))
+        self.assertEqual((codex_scan.call_count, claude_scan.call_count), (1, 1))
+
+
+class IncrementalSourceScanTests(unittest.TestCase):
+    setUp = EvidenceTests.setUp
+
+    def test_unchanged_transcripts_are_not_read_again(self):
+        sessions = self.root / 'sessions'
+        sessions.mkdir()
+        rollout = sessions / 'rollout.jsonl'
+        rollout.write_text(codex('session_meta', {'id': 'session1', 'source': 'desktop'}) + codex_turn('turn1'))
+        partial = [{'status': 'partial', 'summary': 'The result is not established.'}, {'notes': []}]
+        parsed = []
+        real = evidence.capture.codex_file
+        def counted(path, *args, **kwargs):
+            parsed.append(kwargs.get('resume') or (args[2] if len(args) > 2 else None))
+            return real(path, *args, **kwargs)
+        with patch.object(evidence.capture, 'codex_file', side_effect=counted), \
+                patch.object(evidence, 'model_response', side_effect=partial) as model:
+            first = evidence.verify(self.config, self.root, now=hours(0))
+            self.assertEqual((first['checked'], first['unresolved']), (1, 1))
+            self.assertTrue((self.root / 'evidence-scan.json').is_file())
+            second = evidence.verify(self.config, self.root, now=hours(1))
+            self.assertEqual((second['checked'], second['unavailable'], second['unresolved']), (0, 0, 1))
+            self.assertEqual(model.call_count, 2)
+        # The second scan resumed the unchanged file at its end instead of reading it again.
+        self.assertEqual(len(parsed), 2)
+        self.assertIsNone(parsed[0])
+        self.assertEqual(parsed[1]['offset'], rollout.stat().st_size)
+        cached = json.loads((self.root / 'evidence-scan.json').read_text())
+        self.assertEqual([turn['turn'] for turn in cached['files'][str(rollout)]['turns']], ['turn1'])
+
+    def test_a_note_without_its_turn_reads_every_transcript_in_full(self):
+        self.path.write_text('# Historical review\n- Observation: Observed: a report was made.\n')
+        with patch.object(evidence, 'completed_turns', return_value=[]) as scanner, \
+                patch.object(evidence, 'claude_turns', return_value=[]):
+            evidence.verify(self.config, self.root, now=hours(0))
+        self.assertIsNone(scanner.call_args.kwargs['cache'])
+        self.assertTrue(scanner.call_args.kwargs['source_notes'])
 
 
 if __name__ == '__main__':

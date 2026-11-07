@@ -9,7 +9,7 @@ Read this skill's references with the Read tool, one complete file per call. For
 
 Use this skill for language, type-system, and type-checking decisions. For frontend work, read `frontend-ui` first and retain its UI and framework policy; apply this skill alongside it.
 
-Use Effect by default for new TypeScript application logic and effectful workflows. In existing projects, follow established Effect conventions or adopt it incrementally at clear boundaries, preserving project constraints. Pure utilities, configuration, and type-only changes do not require adding Effect.
+Follow Effect where the project already uses it, keeping its established conventions. Elsewhere, Effect is not the default: adopt it only where its typed errors, services, resource safety, or structured concurrency clearly pay for the added dependency and abstraction, and then incrementally at clear boundaries, preserving project constraints. Pure utilities, configuration, and type-only changes do not require adding Effect.
 
 Load supporting guidance only when the task needs it:
 

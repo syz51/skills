@@ -17,6 +17,9 @@ ROLE_MODELS = {'extract': 'claude-sonnet-5-5', 'verify': 'claude-haiku-5-5', 'co
 # --json-schema answers through this synthetic tool; a restricted session may expose nothing else.
 STRUCTURED_TOOL = 'StructuredOutput'
 DEFAULT_CLI = Path.home() / '.local/bin/claude'
+# The maintainer review's sandbox profile: Bash runs in the OS sandbox with an allowlisted network, writes confined to
+# the review checkout and the paths the profile lists, and credential files unreadable. Overridden by `review_settings`.
+REVIEW_SETTINGS = Path.home() / '.claude/factory/audit/maintainer-sandbox.json'
 MAX_STREAM = 1000000
 # Set by a running Claude Code session for its own process tree. CLAUDE_CODE_EFFORT_LEVEL would
 # override the effort each command pins.
@@ -26,7 +29,7 @@ SESSION_PREFIXES = ('CLAUDE_CODE_SESSION_', 'CLAUDE_CODE_MESSAGING_', 'CLAUDE_AG
 # Without any of these flags a call would lose isolation or change its output format, so callers fail closed.
 RESTRICTED_FLAGS = ('--print', '--setting-sources', '--tools', '--strict-mcp-config', '--disable-slash-commands',
                     '--no-session-persistence', '--model', '--effort', '--output-format', '--verbose', '--json-schema')
-REVIEW_FLAGS = ('--print', '--no-session-persistence', '--model', '--effort', '--permission-mode',
+REVIEW_FLAGS = ('--print', '--no-session-persistence', '--model', '--effort', '--permission-mode', '--settings',
                 '--output-format', '--verbose')
 FAILURE_PATTERNS = (
     ('authentication', r'\b401\b|\b403\b|unauthori[sz]ed|not logged in|/login\b|invalid api key|'
@@ -53,6 +56,10 @@ def child_env(base=None):
     env['CLAUDE_CODE_DISABLE_AUTO_MEMORY'] = '1'
     # No auto-update, telemetry or error reporting mid-run; scheduled jobs must behave the same every hour.
     env['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'] = '1'
+    # A subscription defaults to the 1-hour cache TTL, whose writes cost twice the input price; one-shot runs make
+    # their requests back to back, so the 5-minute TTL (1.25x writes) serves them for less. The weekly review,
+    # which is not one-shot, removes it.
+    env['CLAUDE_CODE_PROMPT_CACHE_TTL'] = '5m'
     return env
 
 
@@ -70,10 +77,12 @@ def restricted_command(cli, schema, *, model=RESTRICTED_MODEL, effort=EFFORT):
             '--output-format', 'stream-json', '--verbose', '--json-schema', json.dumps(schema, separators=(',', ':'))]
 
 
-def review_command(cli, *, model=REVIEW_MODEL, effort=EFFORT):
-    """The maintainer review keeps the user's Claude Code configuration, with full tool access and no prompts."""
+def review_command(cli, settings, *, model=REVIEW_MODEL, effort=EFFORT):
+    """The maintainer review keeps the user's Claude Code configuration and runs without prompts, inside the
+    sandbox that the `settings` profile enforces on top of it."""
     return [str(cli), '--print', '--no-session-persistence', '--model', model, '--effort', effort,
-            '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
+            '--permission-mode', 'bypassPermissions', '--settings', str(settings),
+            '--output-format', 'stream-json', '--verbose']
 
 
 def events(stdout, *, partial=False):

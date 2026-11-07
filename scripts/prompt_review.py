@@ -209,6 +209,7 @@ def metrics(state_root):
 def model(config, state, prompt, data, schema, deadline, role=None):
     """One evaluation call. `role` runs a production role on its own model; proposals, grades and approvals stay on MODEL."""
     capture.bounded_timeout(900, deadline)
+    backend = config.get('review_backend') or capture.model_backend(config, state)
     # Keep actual decisions for diagnosis; pass/fail summaries cannot explain
     # whether generation, validation or grading caused an unsuccessful check.
     directory = safe_directory(Path(state), 'prompt-evaluation-calls')
@@ -216,14 +217,16 @@ def model(config, state, prompt, data, schema, deadline, role=None):
     request = {'recorded_at': datetime.now(timezone.utc).isoformat(), 'evaluator_hash': SOURCE_SHA256,
                'runtime_hash': prompt_runtime.SOURCE_SHA256, 'model': claude_cli.ROLE_MODELS.get(role, MODEL),
                # The backend changes the framing: the API sends only this prompt, the CLI adds its own system prompt.
-               'backend': 'api' if config.get('api_key_file') else 'cli',
+               # A review keeps one backend; a call that cannot run there fails the review.
+               'backend': backend,
                'prompt': prompt, 'data': data, 'schema': schema}
     identity = digest(request)
     capture.atomic(directory / (identity + '.request.json'), encoded(request).decode(), exclusive=True)
     try:
         # Each case runs twice with identical input, so the whole input is cached for the repeat.
         text = encoded(data).decode()
-        value = capture.model_response(config, state, prompt, text, schema, deadline=deadline, role=role, cache_prefix=len(text))
+        value = capture.model_response(config, state, prompt, text, schema, deadline=deadline, role=role, cache_prefix=len(text),
+                                       backend=backend)
     except Exception as error:
         capture.atomic(directory / (identity + '.failure.json'),
                        encoded({'request': identity, 'failure_class': type(error).__name__}).decode(), exclusive=True)
@@ -757,6 +760,12 @@ def publish(root, base, role, text, new_case, audit, deadline):
             git(root, 'worktree', 'remove', '--force', str(work))
 
 
+def fallback_status(config, state):
+    """A subscription fallback in effect, named in the status like capture's and source checks'."""
+    record = capture.active_api_fallback(config, state)
+    return {'api_fallback': record} if record else {}
+
+
 def run(config, state_root, *, timeout=900, due=None):
     state = Path(state_root)
     state.mkdir(parents=True, exist_ok=True)
@@ -803,11 +812,11 @@ def run(config, state_root, *, timeout=900, due=None):
             # Never move the completion marker back to an earlier due key.
             if completed < due:
                 save(state_path, {'completed_due': due, 'result': result})
-            save(status_path, {'success': True, **result})
+            save(status_path, {'success': True, **result, **fallback_status(config, state)})
             return result
     except Exception as error:
         save(status_path, {'success': False, 'due': due, 'target': role, 'failure_class': 'review_failed',
-                           'previous_success': prior.get('result')})
+                           'previous_success': prior.get('result'), **fallback_status(config, state)})
         if isinstance(error, SourceChanged):
             raise SourceChanged('Prompt review source changed; a fresh process is required; due remains pending') from None
         raise RuntimeError('Prompt review failed; due remains pending') from None
@@ -815,6 +824,8 @@ def run(config, state_root, *, timeout=900, due=None):
 
 def review(config, state, root, base, role, due, deadline):
     assert_sources_current()
+    # Baseline and candidate are compared only when every call ran on the same backend, which frames prompts its own way.
+    config = {**config, 'review_backend': capture.model_backend(config, state)}
     prompt_runtime.bundle_hash(root, allow_legacy=False)
     cases = load_cases(root)
     holdouts = load_cases(root, holdouts=True)

@@ -17,7 +17,9 @@ IDENTIFIER = re.compile(r'[\w.-]+')
 # Upstream repositories are untrusted: ignore inherited Git settings and user or system configuration, never prompt,
 # and allow only HTTPS.
 GIT_ENV = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'}
-PROTOCOLS = ('-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always')
+# A proxy that takes credentials in its URL, such as the weekly review sandbox's, aborts the unauthenticated
+# CONNECT that Git's default `anyauth` sends first; the sandbox's own Git setting for this is dropped above.
+PROTOCOLS = ('-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', '-c', 'http.proxyAuthMethod=basic')
 REGULAR = ('100644', '000000')  # Plain files and deletions; anything else is reported as special.
 TIMEOUT = 300
 MAX_COMMITS = 30

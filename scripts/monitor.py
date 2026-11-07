@@ -124,6 +124,10 @@ def health(snapshot, now, grace=False):
             oldest = counts.get('oldest_pending_at')
             if counts.get('pending', 0) and oldest and now - stamp(oldest) > timedelta(hours=24):
                 problems[key + ':backlog'] = host + ': completed skill work has waited over 24 hours for feedback capture'
+            fallback = status.get('api_fallback')
+            if isinstance(fallback, dict):
+                problems[key + ':fallback'] = (host + ': running on subscription fallback; the Claude API is unavailable ('
+                                               + str(fallback.get('reason')) + ')')
     if 'weekly' in snapshot['jobs'] and not grace and not active_weekly:
         state = snapshot.get('weekly_state')
         if state:
@@ -172,6 +176,8 @@ def recovered(key, snapshot, now, observed):
         return bool(status.get('success') is True and isinstance(counts, dict)
                     and (counts.get('pending') == 0 or (counts.get('oldest_pending_at')
                          and now - stamp(counts['oldest_pending_at']) <= timedelta(hours=24))))
+    if kind == 'fallback':
+        return status.get('phase') == 'finished' and not status.get('api_fallback')
     if kind == 'overdue':
         completed = (snapshot.get('weekly_state') or {}).get('completed_due')
         return bool(completed and stamp(completed) >= latest_due(now))

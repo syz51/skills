@@ -21,7 +21,7 @@ Publication waits up to five minutes for the shared maintenance lock, checking c
 
 Configure the Claude Code executable, model, effort and optional timeout explicitly in the private generation configuration. Also configure `python_path` for the existing candidate-validation suite. The publisher runs the Claude Code CLI directly; generation receives the staged public diff, excluding generated manifest noise. Private commit messages and private repository history are never used as message context.
 
-Generation runs in a fresh empty directory with a minimal environment, no tools, MCP servers, slash commands, user settings or instructions, and no saved session. It uses the signed-in Claude subscription and its usage limits. Returned subject/body text must pass quality, attribution and private-identifier/credential checks. When the scanner rejects a message, generation runs again with an instruction to leave out local paths, host names and credentials, up to three attempts in all. Empty, generic or otherwise invalid messages, and a message rejected on every attempt, stop publication and leave the deadline pending; there is no generic fallback. The exporter retains ownership of all Git operations. Plan and unchanged runs do not generate messages.
+Generation runs in a fresh empty directory with a minimal environment, no tools, MCP servers, slash commands, user settings or instructions, and no saved session. With `api_key_file` set it passes that key to the CLI as `ANTHROPIC_API_KEY`, so the call is billed to the key; otherwise it uses the signed-in Claude subscription and its usage limits. When the API reports an exhausted credit balance or rejects the key, generation continues on the signed-in subscription and records the fallback in `api_fallback_file` when one is set. That record is shared with the Python pipeline; while it stands, later calls go straight to the subscription, until a day has passed or the key file changes. Returned subject/body text must pass quality, attribution and private-identifier/credential checks. When the scanner rejects a message, generation runs again with an instruction to leave out local paths, host names and credentials, up to three attempts in all. Empty, generic or otherwise invalid messages, and a message rejected on every attempt, stop publication and leave the deadline pending; there is no generic fallback. The exporter retains ownership of all Git operations. Plan and unchanged runs do not generate messages.
 
 Ordinary generation excludes the generated manifest. When an imported public contribution requires only refreshed manifest fingerprints, generation receives that public bookkeeping diff so the reconciliation commit can explain the actual remaining change.
 
@@ -33,7 +33,7 @@ Changed snapshots containing `Cargo.toml` also run formatting, strict Clippy and
 
 These checks reduce exposure risk but do not prove that arbitrary content is safe. New sources and license changes need human review. The three retained UnoCSS snapshots are explicitly enrolled after their original hashes and bundled MIT license were matched to a pinned upstream revision recorded in source metadata.
 
-The exporter manages only its selected paths and its manifest. Other public-owned files are preserved. There are no force pushes. If a managed public file changes independently, publication stops so the change can be imported and reconciled in the private source. Changes to private review records alone do not require a public commit.
+The exporter manages only its selected paths and its manifest. Other public-owned files are preserved. There are no force pushes. If a managed public file changes independently, publication stops so the change can be imported and reconciled in the private source. It resumes once the private source contains the change, as a three-way merge against the last published version shows, or records the imported public commits. Changes to private review records alone do not require a public commit.
 
 ## Branch protection and public CI
 
@@ -58,12 +58,14 @@ The Rust configuration retains the existing schema-1 inventory and state paths. 
     "claude_path": "/absolute/path/to/claude",
     "model": "claude-haiku-5-5",
     "effort": "high",
-    "timeout_seconds": 240
+    "timeout_seconds": 240,
+    "api_key_file": "/absolute/path/to/claude-api-key",
+    "api_fallback_file": "/absolute/path/to/api-fallback.json"
   }
 }
 ```
 
-Merge those fields into your reviewed configuration; this fragment is not a complete inventory. `claude_path` must be an absolute path to an existing file, and the Claude Code CLI must already be signed in for the publishing user. `effort` is one of `low`, `medium`, `high`, `xhigh` or `max`; `timeout_seconds` (1 to 900, default 120) bounds the whole call. Unknown fields are rejected. Missing or expired authentication stops publication; sign in with the normal Claude Code CLI and retry. No generic message is substituted. `plan`, unchanged publication, and a satisfied daily deadline do not call the model.
+Merge those fields into your reviewed configuration; this fragment is not a complete inventory. `claude_path` must be an absolute path to an existing file, and the Claude Code CLI must already be signed in for the publishing user. `effort` is one of `low`, `medium`, `high`, `xhigh` or `max`; `timeout_seconds` (1 to 900, default 120) bounds the whole call, a subscription fallback included. `api_key_file` and `api_fallback_file` are optional absolute paths; the key file must be a regular file readable only by its owner, and `api_fallback_file` requires `api_key_file`. Point `api_fallback_file` at the pipeline's `api-fallback.json` beside its `config.json` to share one fallback record. Unknown fields are rejected. Missing or expired authentication stops publication; sign in with the normal Claude Code CLI and retry. No generic message is substituted. `plan`, unchanged publication, and a satisfied daily deadline do not call the model.
 
 ## Weekly investigation boundary
 

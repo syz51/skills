@@ -1,7 +1,7 @@
 use codex_skills::{
     CommitMessage,
     config::{Config, relative},
-    export::{Files, git, manifest, prepare, scan, snapshot, validate_message},
+    export::{Files, Imported, git, imported, manifest, prepare, scan, snapshot, validate_message},
 };
 use std::{fs, path::Path};
 fn g(p: &Path, args: &[&str]) -> String {
@@ -30,12 +30,12 @@ fn remote_ref(p: &Path) {
 fn independent_root_and_manifest_recovery() {
     let t = tempfile::tempdir().unwrap();
     init(t.path());
-    assert!(prepare(t.path(), &files(), None).unwrap());
+    assert!(prepare(t.path(), &files(), None, &Imported::new()).unwrap());
     commit(t.path());
     let previous = g(t.path(), &["rev-parse", "HEAD"]);
     remote_ref(t.path());
-    assert!(!prepare(t.path(), &files(), Some(&previous)).unwrap());
-    assert!(!prepare(t.path(), &files(), None).unwrap());
+    assert!(!prepare(t.path(), &files(), Some(&previous), &Imported::new()).unwrap());
+    assert!(!prepare(t.path(), &files(), None, &Imported::new()).unwrap());
     assert_eq!(g(t.path(), &["rev-list", "--count", "HEAD"]), "1");
 }
 
@@ -44,12 +44,12 @@ fn managed_directory_can_be_replaced_by_a_file() {
     let t = tempfile::tempdir().unwrap();
     let p = t.path();
     init(p);
-    prepare(p, &files(), None).unwrap();
+    prepare(p, &files(), None, &Imported::new()).unwrap();
     commit(p);
     let previous = g(p, &["rev-parse", "HEAD"]);
     remote_ref(p);
     let desired = [("skills".into(), b"Replacement file\n".to_vec())].into();
-    assert!(prepare(p, &desired, Some(&previous)).unwrap());
+    assert!(prepare(p, &desired, Some(&previous), &Imported::new()).unwrap());
     assert_eq!(fs::read(p.join("skills")).unwrap(), b"Replacement file\n");
 }
 
@@ -58,7 +58,7 @@ fn imported_deletion_does_not_follow_unowned_parent_symlink() {
     let t = tempfile::tempdir().unwrap();
     let p = t.path().join("repository");
     init(&p);
-    prepare(&p, &files(), None).unwrap();
+    prepare(&p, &files(), None, &Imported::new()).unwrap();
     commit(&p);
     let previous = g(&p, &["rev-parse", "HEAD"]);
     let victim = t.path().join("victim");
@@ -69,7 +69,7 @@ fn imported_deletion_does_not_follow_unowned_parent_symlink() {
     std::os::unix::fs::symlink(&victim, p.join("skills")).unwrap();
     commit(&p);
     remote_ref(&p);
-    assert!(prepare(&p, &Files::new(), Some(&previous)).unwrap());
+    assert!(prepare(&p, &Files::new(), Some(&previous), &Imported::new()).unwrap());
     assert_eq!(
         fs::read_to_string(victim.join("guide.md")).unwrap(),
         "Preserve external material\n"
@@ -83,7 +83,7 @@ fn git_ignore_and_encoding_cannot_change_the_validated_index() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path();
         init(p);
-        prepare(p, &files(), None).unwrap();
+        prepare(p, &files(), None, &Imported::new()).unwrap();
         commit(p);
         let previous = g(p, &["rev-parse", "HEAD"]);
         let mut desired = files();
@@ -104,7 +104,7 @@ fn git_ignore_and_encoding_cannot_change_the_validated_index() {
         commit(p);
         let before = g(p, &["rev-parse", "HEAD"]);
         remote_ref(p);
-        assert!(prepare(p, &desired, Some(&previous)).is_err());
+        assert!(prepare(p, &desired, Some(&previous), &Imported::new()).is_err());
         assert_eq!(g(p, &["rev-parse", "HEAD"]), before);
     }
 }
@@ -113,20 +113,143 @@ fn divergence_requires_import_and_preserves_public_owned_files() {
     let t = tempfile::tempdir().unwrap();
     let p = t.path();
     init(p);
-    prepare(p, &files(), None).unwrap();
+    prepare(p, &files(), None, &Imported::new()).unwrap();
     commit(p);
     let old = g(p, &["rev-parse", "HEAD"]);
     fs::write(p.join("skills/guide.md"), "Community fix\n").unwrap();
     fs::write(p.join("README.md"), "Community docs\n").unwrap();
     commit(p);
     remote_ref(p);
-    assert!(prepare(p, &files(), Some(&old)).is_err());
+    assert!(prepare(p, &files(), Some(&old), &Imported::new()).is_err());
     let mut desired = files();
     desired.insert("skills/guide.md".into(), b"Community fix\n".to_vec());
-    assert!(prepare(p, &desired, Some(&old)).unwrap());
+    assert!(prepare(p, &desired, Some(&old), &Imported::new()).unwrap());
     assert_eq!(
         fs::read_to_string(p.join("README.md")).unwrap(),
         "Community docs\n"
+    );
+}
+fn guide(text: &str) -> Files {
+    [("skills/guide.md".into(), text.as_bytes().to_vec())].into()
+}
+/// Publishes `base`, then commits `public` as a public edit. Returns the trusted export and
+/// the public commit.
+fn public_edit(p: &Path, base: &str, public: &str) -> (String, String) {
+    init(p);
+    prepare(p, &guide(base), None, &Imported::new()).unwrap();
+    commit(p);
+    let old = g(p, &["rev-parse", "HEAD"]);
+    fs::write(p.join("skills/guide.md"), public).unwrap();
+    commit(p);
+    remote_ref(p);
+    (old, g(p, &["rev-parse", "HEAD"]))
+}
+fn import_error(public: &str) -> String {
+    format!(
+        "Public managed file changed; import it, then record its public commits in \
+         public/imported-commits: skills/guide.md ({})",
+        &public[..12]
+    )
+}
+#[test]
+fn contained_public_edit_needs_no_record() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    let lines = |first: &str, last: &str| format!("{first}\nk1\nk2\nk3\nk4\nk5\n{last}\n");
+    let (old, public) = public_edit(p, &lines("intro", "outro"), &lines("intro", "public fix"));
+    // The private source took the public fix on top of its own newer change.
+    let both = guide(&lines("private intro", "public fix"));
+    assert!(prepare(p, &both, Some(&old), &Imported::new()).unwrap());
+    assert_eq!(g(p, &["rev-parse", "HEAD"]), public);
+    assert_eq!(
+        fs::read(p.join("skills/guide.md")).unwrap(),
+        both["skills/guide.md"]
+    );
+    // Without the public fix, or with a conflicting edit of its lines, the export would lose
+    // it, so it has to be imported and recorded.
+    for desired in [
+        lines("private intro", "outro"),
+        lines("intro", "private outro"),
+    ] {
+        g(p, &["reset", "--hard", "HEAD"]);
+        let error = prepare(p, &guide(&desired), Some(&old), &Imported::new()).unwrap_err();
+        assert_eq!(error.to_string(), import_error(&public));
+    }
+}
+#[test]
+fn recorded_import_covers_edits_a_merge_cannot_prove() {
+    // A private addition next to the imported public one conflicts, as does an imported edit
+    // the private source revised.
+    for (base, public, export) in [("x\n", "x\ny\n", "x\ny\nz\n"), ("a\n", "b\n", "c\n")] {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path();
+        let (old, commit) = public_edit(p, base, public);
+        let error = prepare(p, &guide(export), Some(&old), &Imported::new()).unwrap_err();
+        assert_eq!(error.to_string(), import_error(&commit));
+        g(p, &["reset", "--hard", "HEAD"]);
+        // Recording an unrelated commit is not enough.
+        let other: Imported = ["0".repeat(40)].into();
+        assert!(prepare(p, &guide(export), Some(&old), &other).is_err());
+        g(p, &["reset", "--hard", "HEAD"]);
+        assert!(prepare(p, &guide(export), Some(&old), &[commit].into()).unwrap());
+        assert_eq!(
+            fs::read_to_string(p.join("skills/guide.md")).unwrap(),
+            export
+        );
+    }
+}
+#[test]
+fn recorded_import_covers_a_public_mode_change() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    init(p);
+    prepare(p, &guide("same\n"), None, &Imported::new()).unwrap();
+    commit(p);
+    let old = g(p, &["rev-parse", "HEAD"]);
+    g(p, &["update-index", "--chmod=+x", "skills/guide.md"]);
+    g(p, &["commit", "-m", "Make the guide executable"]);
+    remote_ref(p);
+    let public = g(p, &["rev-parse", "HEAD"]);
+    let error = prepare(p, &guide("same\n"), Some(&old), &Imported::new()).unwrap_err();
+    assert_eq!(error.to_string(), import_error(&public));
+    g(p, &["reset", "--hard", "HEAD"]);
+    assert!(prepare(p, &guide("same\n"), Some(&old), &[public].into()).unwrap());
+}
+#[test]
+fn recorded_import_covers_a_public_edit_git_cannot_merge() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    let (old, public) = public_edit(p, "text\n", "binary\0\n");
+    let error = prepare(p, &guide("text v2\n"), Some(&old), &Imported::new()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Could not compare the public edit of skills/guide.md: Git operation failed: merge-file"
+    );
+    g(p, &["reset", "--hard", "HEAD"]);
+    assert!(prepare(p, &guide("text v2\n"), Some(&old), &[public].into()).unwrap());
+}
+#[test]
+fn imported_commits_are_read_from_the_source_revision() {
+    let t = tempfile::tempdir().unwrap();
+    let p = t.path();
+    init(p);
+    fs::write(p.join("README.md"), "Source\n").unwrap();
+    commit(p);
+    assert!(imported(p, "HEAD").unwrap().is_empty());
+    let id = "a".repeat(40);
+    fs::create_dir(p.join("public")).unwrap();
+    fs::write(
+        p.join("public/imported-commits"),
+        format!("# Imported public fixes\n{id}  # CI fix\n\n"),
+    )
+    .unwrap();
+    commit(p);
+    assert_eq!(imported(p, "HEAD").unwrap(), [id].into());
+    fs::write(p.join("public/imported-commits"), "abc123\n").unwrap();
+    commit(p);
+    assert_eq!(
+        imported(p, "HEAD").unwrap_err().to_string(),
+        "Invalid public/imported-commits entry: abc123"
     );
 }
 #[test]
@@ -134,20 +257,20 @@ fn deletion_is_restricted_and_tampering_rejected() {
     let t = tempfile::tempdir().unwrap();
     let p = t.path();
     init(p);
-    prepare(p, &files(), None).unwrap();
+    prepare(p, &files(), None, &Imported::new()).unwrap();
     commit(p);
     let old = g(p, &["rev-parse", "HEAD"]);
     fs::write(p.join("unmanaged.txt"), "Keep\n").unwrap();
     commit(p);
     remote_ref(p);
-    prepare(p, &Files::new(), Some(&old)).unwrap();
+    prepare(p, &Files::new(), Some(&old), &Imported::new()).unwrap();
     assert!(!p.join("skills/guide.md").exists());
     assert!(p.join("unmanaged.txt").exists());
     g(p, &["reset", "--hard", "HEAD"]);
     fs::write(p.join(".public-export.json"), "{}\n").unwrap();
     commit(p);
     remote_ref(p);
-    assert!(prepare(p, &files(), Some(&old)).is_err());
+    assert!(prepare(p, &files(), Some(&old), &Imported::new()).is_err());
 }
 #[test]
 fn input_and_message_boundaries() {
@@ -235,7 +358,7 @@ fn public_aliases_are_rejected_without_overwrite() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path();
         init(p);
-        prepare(p, &files(), None).unwrap();
+        prepare(p, &files(), None, &Imported::new()).unwrap();
         commit(p);
         let old = g(p, &["rev-parse", "HEAD"]);
         let public = p.join(existing);
@@ -246,12 +369,12 @@ fn public_aliases_are_rejected_without_overwrite() {
         remote_ref(p);
         let mut desired = files();
         desired.insert(target.into(), b"Candidate material\n".to_vec());
-        assert!(prepare(p, &desired, Some(&old)).is_err());
+        assert!(prepare(p, &desired, Some(&old), &Imported::new()).is_err());
         assert_eq!(
             fs::read_to_string(&public).unwrap(),
             "Public-owned material\n"
         );
         assert_eq!(g(p, &["rev-parse", "HEAD"]), before);
-        assert!(!prepare(p, &files(), Some(&old)).unwrap());
+        assert!(!prepare(p, &files(), Some(&old), &Imported::new()).unwrap());
     }
 }

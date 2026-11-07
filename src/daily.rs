@@ -77,12 +77,14 @@ pub fn run_with(
             export::save(&status_path, &status)?;
             return Ok(json!({"outcome": "deferred", "reason": "publication_lock_held"}));
         }
-        Err(_) => {
+        // The status file stays static; the cause goes to the caller, which logs it locally
+        // and still masks JSON errors.
+        Err(error) => {
             status["success"] = json!(false);
             status["error"] = json!(FAILURE);
             status["finished_at"] = json!(Utc::now().to_rfc3339());
             export::save(&status_path, &status)?;
-            return Err(FAILURE.into());
+            return Err(error);
         }
     };
     status["success"] = json!(true);

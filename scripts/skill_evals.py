@@ -154,7 +154,7 @@ def run_process(command, timeout, *, input=None, cwd=None, env=None):
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(process.pid, sig)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
                 if sig == signal.SIGTERM:
                     try:

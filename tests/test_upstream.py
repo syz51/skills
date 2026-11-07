@@ -279,5 +279,14 @@ class RecordValidation(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())['sources'][0]['status'], 'error')
 
 
+
+class TransportSettingsTests(unittest.TestCase):
+    def test_proxy_credentials_are_sent_up_front(self):
+        # A sandbox proxy that takes credentials in its URL aborts the unauthenticated CONNECT that `anyauth` tries first.
+        settings = dict(zip(upstream.PROTOCOLS[::2], upstream.PROTOCOLS[1::2]))
+        self.assertEqual(set(settings), {'-c'})
+        self.assertIn('http.proxyAuthMethod=basic', upstream.PROTOCOLS[1::2])
+        self.assertIn('protocol.allow=never', upstream.PROTOCOLS[1::2])
+
 if __name__ == '__main__':
     unittest.main()

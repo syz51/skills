@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -160,12 +161,13 @@ class RecoveryTests(unittest.TestCase):
     def test_hourly_recovery_restored_older_source_and_unchanged_repeat(self):
         original = self.path.read_bytes()
         with patch.object(evidence, 'model_response', return_value=self.result) as model:
-            missing = evidence.verify(self.config, self.root)
+            start = datetime(2026, 11, 6, 12, tzinfo=timezone.utc)
+            missing = evidence.verify(self.config, self.root, now=start)
             self.assertEqual((missing['unavailable'], missing['recovered']), (1, 0))
             model.assert_not_called()
             self.rollout()
-            first = evidence.verify(self.config, self.root)
-            second = evidence.verify(self.config, self.root)
+            first = evidence.verify(self.config, self.root, now=start + timedelta(hours=1))
+            second = evidence.verify(self.config, self.root, now=start + timedelta(hours=2))
             self.assertEqual((first['checked'], first['recovered'], first['unavailable']), (1, 1, 0))
             self.assertEqual((second['checked'], second['recovered']), (0, 0))
             model.assert_called_once()

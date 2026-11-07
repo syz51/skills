@@ -63,7 +63,7 @@ def run(command, log, env, stdin=None, timeout=5400, cwd=None, stdout=None):
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             try:
                 process.wait(timeout=5)
@@ -71,9 +71,10 @@ def run(command, log, env, stdin=None, timeout=5400, cwd=None, stdout=None):
                 pass
             # The leader can exit on SIGTERM while a descendant ignores it.
             # Finish the group cleanup even when waiting for the leader succeeded.
+            # Darwin answers EPERM for a group whose members have all exited unreaped: nothing is left to signal.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             process.wait()
             raise RuntimeError('Command timed out: ' + Path(command[0]).name)
@@ -81,7 +82,39 @@ def run(command, log, env, stdin=None, timeout=5400, cwd=None, stdout=None):
             raise RuntimeError('Command failed: ' + Path(command[0]).name)
 
 
-def review_command(cli, env, timeout):
+def sandbox_section(path, required):
+    try:
+        sandbox = json.loads(path.read_text()).get('sandbox', {})
+    except FileNotFoundError:
+        if required:
+            raise
+        return {}
+    if not isinstance(sandbox, dict):
+        raise ValueError('sandbox is not an object')
+    return sandbox
+
+
+def review_settings(config):
+    """The review's sandbox profile, refused unless it turns the sandbox on and fails closed without it.
+
+    The profile is resolved here, because the review runs in another directory. Claude Code merges the user's
+    settings under it, and either scope can exempt commands or platforms from the sandbox, so both are refused
+    when they do."""
+    path = Path(config.get('review_settings') or claude_cli.REVIEW_SETTINGS).expanduser().resolve()
+    user = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').expanduser() / 'settings.json'
+    try:
+        sandbox, inherited = sandbox_section(path, True), sandbox_section(user, False)
+    except (OSError, ValueError, AttributeError):
+        sandbox = inherited = None
+    if (not isinstance(sandbox, dict) or sandbox.get('enabled') is not True or sandbox.get('failIfUnavailable') is not True
+            or sandbox.get('allowUnsandboxedCommands') is not False
+            or any(scope.get('excludedCommands') not in (None, []) or 'enabledPlatforms' in scope
+                   for scope in (sandbox, inherited))):
+        raise RuntimeError('Weekly review sandbox settings are missing or do not enforce the sandbox')
+    return path
+
+
+def review_command(cli, env, timeout, settings):
     """Refuse to review unless the CLI still advertises every flag the review's privileges depend on."""
     try:
         help_text = subprocess.run([str(cli), '--help'], stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -90,13 +123,15 @@ def review_command(cli, env, timeout):
         help_text = ''
     if claude_cli.missing_flags(help_text, claude_cli.REVIEW_FLAGS):
         raise RuntimeError('Weekly review CLI adaptation failed; required command or controls are unavailable')
-    return claude_cli.review_command(cli)
+    return claude_cli.review_command(cli, settings)
 
 
-def review(cli, repo, state_root, prompt, log, env, timeout):
+def review(cli, repo, state_root, prompt, log, env, timeout, settings):
     began = time.monotonic()
     env = claude_cli.child_env(env)
-    command = review_command(cli, env, timeout)
+    # The review pauses for builds and tests longer than five minutes; it keeps the 1-hour cache.
+    env.pop('CLAUDE_CODE_PROMPT_CACHE_TTL')
+    command = review_command(cli, env, timeout, settings)
     with tempfile.TemporaryDirectory(prefix='.weekly-review-', dir=state_root) as folder:
         report = Path(folder) / 'report.md'
         events = Path(folder) / 'events.jsonl'
@@ -148,6 +183,8 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
     import sync
 
     began = time.monotonic()
+    # Checked before any attempt is prepared, so a missing profile changes no investigation state.
+    settings = review_settings(config)
     repo = Path(config['repo_path']).resolve()
     state_root = Path(state_root).resolve()
     attempts = state_root / 'investigations/attempts'
@@ -165,13 +202,17 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
     base = git(repo, 'rev-parse', 'HEAD')
     attempt = json.loads(active.read_text()) if active.exists() else None
     recovery = None
-    if attempt is not None:
-        saved_work = Path(attempt['work'])
+    def checkout_of(saved_work):
+        saved_work = Path(saved_work)
         work = saved_work.resolve()
-        folder = work.parent
-        if (not folder.is_relative_to(attempts) or work.name != 'work' or saved_work.is_symlink()
-                or not (work / '.git').is_file()):
+        if (not work.parent.is_relative_to(attempts) or work.name != 'work' or saved_work.is_symlink()
+                or saved_work.parent.is_symlink() or not (work / '.git').is_file()):
             raise ValueError('Unsafe saved investigation attempt')
+        return work
+
+    if attempt is not None:
+        work = checkout_of(attempt['work'])
+        folder = work.parent
         stale_cycle = False
         if attempt.get('cycle') is not None:
             cycle_path = Path(attempt['cycle'])
@@ -242,7 +283,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
                    + '. Reassess its evidence; do not blindly cherry-pick or reset from it.\n')
     try:
         review(claude_cli.cli_path(config), work, folder, prompt, log, execution_env,
-               timeout=max(1, timeout - (time.monotonic() - began)))
+               timeout=max(1, timeout - (time.monotonic() - began)), settings=settings)
         summary = investigations.validate_cycle(scoped, state_root, cycle)
         _, heads = investigations.inventory(work)
         outstanding = sorted((v for v in heads.values() if v['state'] != 'resolved'),
@@ -290,7 +331,62 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         attempt['cleanup_pending'] = str(exc)
         save(folder / 'attempt.json', attempt)
         summary = dict(summary, cleanup_pending=str(folder))
+    if not active.exists():
+        summary = dict(summary, **retire_attempts(repo, state_root, attempts, folder, candidate,
+                                                  git, checkout_of, began + timeout))
     return summary
+
+
+def retire_attempts(repo, state_root, attempts, current, main, git, checkout_of, deadline):
+    """Remove the checkouts of earlier attempts that hold no evidence.
+
+    Runs once an attempt is validated and no attempt is active, so every other attempt is
+    finished: superseded, or validated with its own cleanup left pending. A checkout is
+    evidence while it has uncommitted or untracked files, or any commit, including one
+    reachable only from its HEAD reflog, that `main` does not contain; such a checkout is
+    kept. Ignored files are not evidence: the repository ignores only caches and build
+    output, and investigation runs keep their logs and artifacts in the private state.
+    """
+    kept, failed = [], []
+    for record in sorted(attempts.glob('*/attempt.json')):
+        name = record.parent.name
+        if name == current.name:
+            continue
+        if time.monotonic() >= deadline:
+            failed.append(name + ': deferred by the job deadline')
+            break
+        try:
+            if record.parent.is_symlink():
+                raise ValueError('Unsafe saved investigation attempt')
+            data = json.loads(record.read_text())
+            if not isinstance(data, dict):
+                raise ValueError('Invalid saved investigation attempt')
+            if (record.parent / 'work').exists():
+                work = checkout_of(record.parent / 'work')
+                history = [git(work, 'rev-parse', 'HEAD'),
+                           *git(work, 'log', '--walk-reflogs', '--format=%H', 'HEAD').split()]
+                if (git(work, 'status', '--porcelain', '--untracked-files=all')
+                        or git(work, 'rev-list', '-n', '1', *history, '--not', main)):
+                    kept.append(name)
+                    continue
+                git(repo, 'worktree', 'remove', str(work))
+            config = Path(data.get('config') or '')
+            if (config.name == 'investigation-' + name + '-config.json' and config.parent.resolve() == state_root
+                    and not config.is_symlink()):
+                config.unlink(missing_ok=True)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            failed.append(name + ': ' + type(exc).__name__)
+    try:
+        # Drop registrations of attempt checkouts that were deleted by hand.
+        git(repo, 'worktree', 'prune')
+    except (OSError, subprocess.SubprocessError) as exc:
+        failed.append('worktree prune: ' + type(exc).__name__)
+    result = {}
+    if kept:
+        result['attempts_kept'] = kept
+    if failed:
+        result['attempts_cleanup_failed'] = failed
+    return result
 
 
 def review_prompts(config, state_root, *, timeout, due):
@@ -360,17 +456,19 @@ def execute(args, now=None):
             warnings = []
 
             def stage(name, action, message, backlog_message=None, defer=False):
+                started = time.monotonic()
                 try:
                     if action() is False:
                         message = backlog_message
                         raise RuntimeError(message)
                 except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
-                    status['stages'][name] = {'success': False, 'error': message}
+                    status['stages'][name] = {'success': False, 'error': message,
+                                              'seconds': round(time.monotonic() - started, 1)}
                     errors.append(message)
                     if not defer:
                         raise RuntimeError(message) from None
                 else:
-                    status['stages'][name] = {'success': True}
+                    status['stages'][name] = {'success': True, 'seconds': round(time.monotonic() - started, 1)}
 
             def source_stage(name):
                 began_at = datetime.now(timezone.utc)
@@ -411,17 +509,27 @@ def execute(args, now=None):
                             status['investigations'] = {'complete': False}
                             try:
                                 status['investigations'] = review_learning_cycle(config, state_root, due, log, env, remaining)
+                                if (status['investigations'].get('cleanup_pending')
+                                        or status['investigations'].get('attempts_cleanup_failed')):
+                                    warnings.append('Investigation checkouts were not all removed; see investigations in weekly status')
                             finally:
                                 active = state_root / 'investigations/active-attempt.json'
                                 if not status['investigations'].get('complete') and active.exists():
                                     status['investigations']['recovery'] = json.loads(active.read_text())
                         else:
                             prompt = maintenance_prompt(repo, config)
-                            review(claude_cli.cli_path(config), repo, state_root, prompt, log, env, timeout=remaining)
+                            review(claude_cli.cli_path(config), repo, state_root, prompt, log, env, timeout=remaining,
+                                   settings=review_settings(config))
                     stage('review', run_review,
                           'Maintenance review failed; CLI adaptation failed, execution failed, or a valid fresh report was unavailable')
                     stage('publish', lambda: step('publish'), 'Feedback publication failed')
                 stage('deploy', lambda: step('deploy'), 'Release deployment failed')
+                # Proposes source-checked rejected frontend defaults from the reviewed feedback in this checkout,
+                # which weekly collection refreshes; hourly runs retry a failure and make no model calls.
+                if args.command == 'sync' and config['role'] == 'maintainer' and config.get('frontend_avoid'):
+                    stage('frontend_avoid', lambda: run([config['python_path'], str(repo / 'scripts/frontend_avoid.py'),
+                                                         '--config', str(config_path)], log, env, timeout=300),
+                          'Rejected-default proposal failed', defer=True)
                 if args.command == 'weekly' and not errors and prompt_workflow(repo):
                     result = {}
                     def improve_prompts():

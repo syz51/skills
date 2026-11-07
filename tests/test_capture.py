@@ -1119,6 +1119,37 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(status['cli_version'], version)
             self.assertEqual(status['counts']['processed'], 1)
 
+    def test_status_names_a_standing_subscription_fallback(self):
+        self.state.mkdir()
+        key = self.state / 'key'
+        key.write_text('sk-ant-secret\n')
+        key.chmod(0o600)
+        config = self.state / 'config.json'
+        config.write_text(json.dumps({**self.config, 'host_id': 'client-host', 'claude_path': sys.executable,
+                                      'api_key_file': str(key)}))
+        counts = {'errors': 0, 'rate_limit': None}
+        for outcome, code in ((counts, 0), (RuntimeError('Capture model attempted tool execution'), 1)):
+            record = capture.record_api_fallback({'api_key_file': str(key)}, self.state, 'authentication',
+                                                 datetime.now(timezone.utc))
+            with self.subTest(code=code), patch.object(sys, 'argv', ['capture.py', '--config', str(config)]), \
+                    patch.object(capture, 'cli_version', return_value='unknown'), \
+                    patch.object(capture, 'capture', side_effect=[outcome]), patch('builtins.print') as log:
+                self.assertEqual(capture.main(), code)
+            status = json.loads((self.state / 'capture-status.json').read_text())
+            self.assertEqual(status['api_fallback'], record)
+            self.assertTrue(status['warning'].startswith(
+                'Running on subscription fallback: the Claude API is unavailable (authentication)'))
+            if not code:
+                self.assertEqual(json.loads(log.call_args.args[0])['warning'], status['warning'])
+        capture.api_fallback_path(self.state).unlink()
+        with patch.object(sys, 'argv', ['capture.py', '--config', str(config)]), \
+                patch.object(capture, 'cli_version', return_value='unknown'), \
+                patch.object(capture, 'capture', return_value=counts), patch('builtins.print'):
+            self.assertEqual(capture.main(), 0)
+        status = json.loads((self.state / 'capture-status.json').read_text())
+        self.assertNotIn('api_fallback', status)
+        self.assertNotIn('warning', status)
+
     def test_host_gate_requires_the_claude_executable(self):
         self.state.mkdir()
         config = self.state / 'config.json'

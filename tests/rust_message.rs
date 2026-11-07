@@ -53,6 +53,8 @@ fn options(path: PathBuf, timeout: Duration) -> Options {
         effort: Effort::Low,
         timeout,
         cancellation: None,
+        api_key_file: None,
+        api_fallback_file: None,
     }
 }
 fn init(tools: Value, mcp_servers: Value) -> String {
@@ -463,6 +465,314 @@ fn live_generator_returns_a_validated_message() {
     codex_skills::message::validate(&message).unwrap();
 
     // The generator runs in a fresh directory under the temporary root; no session there may persist.
+    let temp = std::env::temp_dir();
+    let roots = [sanitized(&temp), sanitized(&temp.canonicalize().unwrap())];
+    let created: Vec<String> = claude_projects()
+        .difference(&before)
+        .filter(|name| roots.iter().any(|root| name.starts_with(root.as_str())))
+        .cloned()
+        .collect();
+    assert!(created.is_empty(), "{created:?}");
+}
+
+/// A fake `claude` that answers by credential: with `ANTHROPIC_API_KEY` set it prints the file
+/// `api` (a billing error unless a test rewrites it), otherwise a valid message. Each call appends
+/// the key it saw, or `login`, to `calls`.
+fn keyed(root: &TempDir) -> PathBuf {
+    let r = root.path().display();
+    fs::write(root.path().join("api"), billing_error()).unwrap();
+    fs::write(root.path().join("login"), result(subject())).unwrap();
+    fake(
+        root,
+        &format!(
+            "cat > /dev/null\nif [ -n \"$ANTHROPIC_API_KEY\" ]; then echo \"$ANTHROPIC_API_KEY\" >> '{r}/calls'; cat '{r}/api'; exit 1; fi\necho login >> '{r}/calls'; cat '{r}/login'"
+        ),
+    )
+}
+fn billing_error() -> String {
+    json!({"type": "result", "subtype": "success", "is_error": true,
+           "result": "Credit balance is too low", "api_error_status": 400})
+    .to_string()
+}
+fn keyed_options(root: &TempDir) -> Options {
+    let key = root.path().join("key");
+    fs::write(&key, "sk-test-one\n").unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    Options {
+        api_key_file: Some(key),
+        api_fallback_file: Some(root.path().join("api-fallback.json")),
+        ..options(keyed(root), Duration::from_secs(20))
+    }
+}
+fn calls(root: &TempDir) -> Vec<String> {
+    fs::read_to_string(root.path().join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+fn fallback(root: &TempDir) -> Option<Value> {
+    let text = fs::read_to_string(root.path().join("api-fallback.json")).ok()?;
+    Some(serde_json::from_str(&text).unwrap())
+}
+
+#[test]
+fn api_key_bills_the_key_and_success_clears_the_fallback() {
+    let root = TempDir::new().unwrap();
+    let options = keyed_options(&root);
+    fs::write(root.path().join("api"), result(subject())).unwrap();
+    // The fake exits 1 for keyed calls; give the keyed path a success exit.
+    let r = root.path().display();
+    fs::write(
+        &options.claude_path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' '{HELP}'; exit 0; fi\ncat > /dev/null\necho \"${{ANTHROPIC_API_KEY:-login}}\" >> '{r}/calls'; cat '{r}/api'\n"
+        ),
+    )
+    .unwrap();
+    fs::write(root.path().join("api-fallback.json"), "not json").unwrap();
+    let message = generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(message.subject, "Reject oversized public diffs early");
+    assert_eq!(calls(&root), ["sk-test-one"]);
+    assert!(fallback(&root).is_none(), "success clears the record");
+}
+
+#[test]
+fn billing_falls_back_to_the_login_and_sticks_until_the_key_changes() {
+    let root = TempDir::new().unwrap();
+    let options = keyed_options(&root);
+    let started = chrono::Utc::now();
+    let message = generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(message.subject, "Reject oversized public diffs early");
+    assert_eq!(calls(&root), ["sk-test-one", "login"]);
+
+    let record = fallback(&root).unwrap();
+    assert_eq!(record["reason"], "billing");
+    let meta = fs::metadata(options.api_key_file.as_ref().unwrap()).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    let mtime_ns = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    assert_eq!(
+        record["key"],
+        format!("{}-{}-{}", meta.ino(), meta.size(), mtime_ns)
+    );
+    let parse = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(record[field].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    let since = parse("since");
+    assert!(since >= started - chrono::TimeDelta::seconds(1));
+    let retry = parse("retry_at") - since;
+    assert!(
+        (retry - chrono::TimeDelta::days(1)).num_seconds().abs() <= 2,
+        "{retry}"
+    );
+
+    // While the record stands the API is not tried at all.
+    generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(calls(&root), ["sk-test-one", "login", "login"]);
+
+    // A changed key file retries the API at once; a repeat failure keeps the first `since`.
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(options.api_key_file.as_ref().unwrap(), "sk-test-two\n").unwrap();
+    generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(
+        calls(&root),
+        ["sk-test-one", "login", "login", "sk-test-two", "login"]
+    );
+    assert_eq!(fallback(&root).unwrap()["since"], record["since"]);
+}
+
+#[test]
+fn an_expired_or_foreign_record_retries_the_api() {
+    let root = TempDir::new().unwrap();
+    let options = keyed_options(&root);
+    generate_message(DIFF, None, &options).unwrap();
+    let mut record = fallback(&root).unwrap();
+    let past = (chrono::Utc::now() - chrono::TimeDelta::minutes(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    record["retry_at"] = json!(past);
+    fs::write(root.path().join("api-fallback.json"), record.to_string()).unwrap();
+    generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(
+        calls(&root),
+        ["sk-test-one", "login", "sk-test-one", "login"]
+    );
+
+    let mut record = fallback(&root).unwrap();
+    record["key"] = json!("0-0-0");
+    fs::write(root.path().join("api-fallback.json"), record.to_string()).unwrap();
+    generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(calls(&root).len(), 6);
+}
+
+#[test]
+fn authentication_falls_back_but_other_api_errors_do_not() {
+    let root = TempDir::new().unwrap();
+    let options = keyed_options(&root);
+    let rejected = json!({"type": "result", "subtype": "success", "is_error": true,
+                          "result": "Invalid API key · Fix external API key", "api_error_status": 401})
+    .to_string();
+    fs::write(root.path().join("api"), rejected).unwrap();
+    generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(fallback(&root).unwrap()["reason"], "authentication");
+
+    let other = TempDir::new().unwrap();
+    let options = keyed_options(&other);
+    let overloaded =
+        json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+                            "result": "overloaded", "api_error_status": 529})
+        .to_string();
+    fs::write(other.path().join("api"), overloaded).unwrap();
+    let e = generate_message(DIFF, None, &options).unwrap_err();
+    assert!(matches!(e, GenerationError::Backend(_)), "{e}");
+    assert_eq!(calls(&other), ["sk-test-one"]);
+    assert!(fallback(&other).is_none());
+}
+
+#[test]
+fn api_success_keeps_another_key_files_record() {
+    let root = TempDir::new().unwrap();
+    let options = keyed_options(&root);
+    fs::write(root.path().join("api"), result(subject())).unwrap();
+    let r = root.path().display();
+    fs::write(
+        &options.claude_path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '%s\\n' '{HELP}'; exit 0; fi\ncat > /dev/null\ncat '{r}/api'\n"
+        ),
+    )
+    .unwrap();
+    let foreign = json!({"reason": "billing", "since": "2026-11-06T00:00:00+00:00",
+                         "retry_at": "2099-01-01T00:00:00+00:00", "key": "1-2-3"});
+    fs::write(root.path().join("api-fallback.json"), foreign.to_string()).unwrap();
+    generate_message(DIFF, None, &options).unwrap();
+    assert_eq!(fallback(&root).unwrap(), foreign);
+}
+
+#[test]
+fn billing_errors_are_classified() {
+    assert!(matches!(
+        generate(&billing_error(), 1),
+        Err(GenerationError::Billing)
+    ));
+    let payment = json!({"type": "result", "subtype": "success", "is_error": true,
+                         "result": "Payment required", "api_error_status": 402})
+    .to_string();
+    assert!(matches!(
+        generate(&payment, 1),
+        Err(GenerationError::Billing)
+    ));
+    // A successful result that quotes the words is not a billing error.
+    let quoted = [
+        init(json!(["StructuredOutput"]), json!([])),
+        json!({"type": "result", "subtype": "success", "is_error": false,
+               "result": "Explain the credit balance check", "structured_output": subject()})
+        .to_string(),
+    ]
+    .join("\n");
+    assert!(matches!(
+        generate(&quoted, 1),
+        Err(GenerationError::Backend(_))
+    ));
+}
+
+#[test]
+fn an_exposed_key_file_is_refused_before_the_cli_runs() {
+    let root = TempDir::new().unwrap();
+    let options = keyed_options(&root);
+    let key = options.api_key_file.as_ref().unwrap();
+    fs::set_permissions(key, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        generate_message(DIFF, None, &options),
+        Err(GenerationError::Backend(_))
+    ));
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(key, &link).unwrap();
+    fs::set_permissions(key, fs::Permissions::from_mode(0o600)).unwrap();
+    let linked = Options {
+        api_key_file: Some(link),
+        ..keyed_options(&root)
+    };
+    assert!(generate_message(DIFF, None, &linked).is_err());
+    assert!(calls(&root).is_empty());
+}
+
+#[test]
+fn key_configuration_is_validated() {
+    let root = TempDir::new().unwrap();
+    let claude = fake(&root, "exit 0");
+    let key = root.path().join("key");
+    let fallback = root.path().join("api-fallback.json");
+    let base = json!({"claude_path": claude, "model": "claude-haiku-5-5", "effort": "low"});
+    let mut keyed = base.clone();
+    keyed["api_key_file"] = json!(key);
+    keyed["api_fallback_file"] = json!(fallback);
+    let parsed = Options::from_value(&keyed).unwrap();
+    assert_eq!(parsed.api_key_file.as_deref(), Some(key.as_path()));
+    assert_eq!(
+        parsed.api_fallback_file.as_deref(),
+        Some(fallback.as_path())
+    );
+    assert!(Options::from_value(&base).unwrap().api_key_file.is_none());
+
+    let mut relative = base.clone();
+    relative["api_key_file"] = json!("key");
+    let mut orphan = base.clone();
+    orphan["api_fallback_file"] = json!(fallback);
+    for value in [relative, orphan] {
+        assert!(Options::from_value(&value).is_err(), "{value}");
+    }
+}
+
+#[test]
+fn live_generator_bills_a_configured_api_key() {
+    if std::env::var("RUN_CLAUDE_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipped: set RUN_CLAUDE_LIVE=1 to call the real Claude Code CLI");
+        return;
+    }
+    let Some(key) = std::env::var_os("CODEX_SKILLS_LIVE_API_KEY_FILE").map(PathBuf::from) else {
+        eprintln!(
+            "skipped: set CODEX_SKILLS_LIVE_API_KEY_FILE to a Claude API key file to check API billing"
+        );
+        return;
+    };
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set"));
+    let cli = resolve_cli(&home, std::env::var_os("PATH").as_deref()).expect("Claude Code CLI");
+    // Record the real CLI's event stream to see which credential it used.
+    let root = TempDir::new().unwrap();
+    let stream = root.path().join("stream.jsonl");
+    let before = claude_projects();
+    let wrapper = fake_with_help(
+        &root,
+        HELP,
+        &format!(
+            "'{}' \"$@\" | tee '{}'; exit 0",
+            cli.display(),
+            stream.display()
+        ),
+    );
+    let options = Options {
+        api_key_file: Some(key),
+        api_fallback_file: Some(root.path().join("api-fallback.json")),
+        ..options(wrapper, Duration::from_secs(180))
+    };
+    let message = generate_message(DIFF, None, &options).unwrap();
+    codex_skills::message::validate(&message).unwrap();
+    let events: Vec<Value> = fs::read_to_string(&stream)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let init = events
+        .iter()
+        .find(|e| e["type"] == "system" && e["subtype"] == "init")
+        .unwrap();
+    assert_eq!(init["apiKeySource"], "ANTHROPIC_API_KEY");
+    assert!(
+        !root.path().join("api-fallback.json").exists(),
+        "the API answered; no fallback"
+    );
     let temp = std::env::temp_dir();
     let roots = [sanitized(&temp), sanitized(&temp.canonicalize().unwrap())];
     let created: Vec<String> = claude_projects()

@@ -11,7 +11,7 @@ Read this skill's references with the Read tool, one complete file per call. For
 
 - Identify the audience, primary task, requested change, and relevant screens or states. Inspect the existing design system, components, assets, package versions, and project instructions before choosing an approach.
 - Follow explicit user requirements and established product conventions. The defaults below fill gaps; examples and conventions in the supporting references or plugin design guides do not override them. Preserve accessibility, security, and the actual runtime/tool contracts.
-- For a small change, work within the existing design. For a new interface or substantial redesign, choose a coherent direction for hierarchy, layout, typography, color, and interaction before implementation. Explain consequential choices briefly; produce wireframes, variants, or a formal design plan when useful or requested.
+- For a small change, work within the existing design. For a new interface or substantial redesign, choose a coherent direction for hierarchy, layout, typography, color, and interaction before implementation. Before choosing it, read `~/.claude/frontend-avoid.md` when that file exists: it lists visual patterns the user has declined as defaults. Explain consequential choices briefly; produce wireframes, variants, or a formal design plan when useful or requested.
 - Ask about conflicts that materially change the result. Reuse known preferences and make disclosed assumptions for reversible details. Keep reviews read-only unless changes are requested.
 
 ## Design for the purpose

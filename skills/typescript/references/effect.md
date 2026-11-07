@@ -1,6 +1,6 @@
 # Effect
 
-Use Effect as the default for new TypeScript application logic and effectful workflows. Adopt it incrementally in existing projects; preserve project requirements, framework contracts, and established integrations. Keep pure calculations and view logic ordinary TypeScript where an Effect adds no useful contract.
+Follow Effect where the project already uses it. Elsewhere, Effect is not the default: adopt it only where its typed errors, services, resource safety, or structured concurrency clearly pay for the added dependency and abstraction, and then incrementally at clear boundaries; preserve project requirements, framework contracts, and established integrations. Keep pure calculations and view logic ordinary TypeScript where an Effect adds no useful contract.
 
 ## Match the project
 

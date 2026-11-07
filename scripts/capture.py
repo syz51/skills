@@ -27,6 +27,8 @@ SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 # Distinctive headings that identify each loaded SKILL.md besides its frontmatter name.
 HEADINGS = {'frontend-ui': 'Frontend', 'content-research-writer': 'Content|Research', 'find-skills': 'Find Skills', 'tauri': 'Tauri', 'typescript': 'TypeScript', 'rust': 'Rust'}
 SINCE = '2026-10-09T14:45:00+00:00'
+# Bump when stored scan progress must not be reused even though the scanner's files are unchanged.
+SCAN_VERSION = 2
 # Claude Code records no turn-complete event; the newest finished reply waits this long for follow-on records.
 CLAUDE_QUIET = timedelta(minutes=15)
 MAX_RECORD_BYTES = 8_000_000
@@ -51,6 +53,11 @@ SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['notes']
         'required': ['skill', *FIELDS], 'properties': {'skill': {'type': 'string', 'enum': list(SKILLS)},
             **{key: {'type': 'string', 'maxLength': 1000} for key in FIELDS}}}}}}
 PROMPT = prompt_runtime.load('extract', root=prompt_runtime.DEFAULT_ROOT)
+# Title prefix of a frontend-ui note recording a visual pattern the user rejected as a default; the rest of
+# the title is the generic pattern. The maintainer proposes source-checked ones for the user's list.
+REJECTED_DEFAULT = prompt_runtime.REJECTED_DEFAULT
+REJECTED_DEFAULT_SKILL = 'frontend-ui'
+REJECTED_DEFAULT_TITLE = re.compile(r'\s*rejected\s+default\s*:(.*)', re.I | re.S)
 
 
 class CaptureBudgetExpired(RuntimeError):
@@ -108,6 +115,82 @@ def record_rate_limit(state_root, facts, now, api=False):
              'window': facts.get('rate_limit_type') or (previous['window'] if continues else None)}
     atomic(rate_limit_path(state_root, api), json.dumps(value, indent=2) + '\n')
     return value
+
+
+API_FALLBACK_CLASSES = ('billing', 'authentication')
+API_RETRY = timedelta(days=1)
+
+
+def api_fallback_path(state_root):
+    """The record that the Claude API was unavailable, shared by every restricted call and the Rust publisher."""
+    return Path(state_root) / 'api-fallback.json'
+
+
+def key_fingerprint(config):
+    """The API key file's identity; the Rust publisher computes the same. A replaced or edited key retries the API."""
+    try:
+        stat = Path(config['api_key_file']).expanduser().lstat()
+    except OSError:
+        return None
+    return f'{stat.st_ino}-{stat.st_size}-{stat.st_mtime_ns}'
+
+
+def read_api_fallback(state_root):
+    """The fallback record, or None. An unreadable record only means the API is tried again."""
+    path = api_fallback_path(state_root)
+    safe_path(path)
+    try:
+        value = json.loads(path.read_text())
+        if (not isinstance(value, dict) or set(value) != {'reason', 'since', 'retry_at', 'key'}
+                or value['reason'] not in API_FALLBACK_CLASSES
+                or not all(isinstance(value[name], str) for name in ('since', 'retry_at', 'key'))):
+            return None
+        timestamp(value['since'])
+        timestamp(value['retry_at'])
+    except (OSError, ValueError, TypeError):
+        return None
+    return value
+
+
+def active_api_fallback(config, state_root, now=None):
+    """The fallback record in effect, or None. In effect, calls go straight to the subscription: the API failed for
+    the configured key file and its daily retry is not due."""
+    if not config.get('api_key_file'):
+        return None
+    record = read_api_fallback(state_root)
+    now = now or datetime.now(timezone.utc)
+    return record if record and now < timestamp(record['retry_at']) and record['key'] == key_fingerprint(config) else None
+
+
+def clear_api_fallback(config, state_root):
+    """The API answered: drop the record, unless it belongs to another key file (the publisher can name its own)."""
+    record = read_api_fallback(state_root)
+    if record is None or record['key'] == key_fingerprint(config):
+        api_fallback_path(state_root).unlink(missing_ok=True)
+
+
+def record_api_fallback(config, state_root, reason, now):
+    previous = read_api_fallback(state_root)
+    value = {'reason': reason, 'since': previous['since'] if previous else now.isoformat(timespec='seconds'),
+             'retry_at': (now + API_RETRY).isoformat(timespec='seconds'), 'key': key_fingerprint(config) or ''}
+    atomic(api_fallback_path(state_root), json.dumps(value, indent=2) + '\n')
+    return value
+
+
+def model_backend(config, state_root):
+    """The backend the next restricted call starts on."""
+    return 'api' if config.get('api_key_file') and not active_api_fallback(config, state_root) else 'cli'
+
+
+def report_api_fallback(status, config, state_root):
+    """Name a subscription fallback in effect in a job status, so sync status and the monitor report it."""
+    record = active_api_fallback(config, state_root)
+    if not record:
+        return
+    status['api_fallback'] = record
+    status['warning'] = ' '.join(filter(None, (
+        f"Running on subscription fallback: the Claude API is unavailable ({record['reason']}) since {record['since']}; "
+        'top up or replace the API key.', status.get('warning'))))
 
 
 def rate_limit_summary(limit, count, now):
@@ -715,128 +798,295 @@ def parse_bytes(line):
     return INLINE_BASE64.sub(b'"[inline base64 omitted]"', line) if len(line) > MAX_RECORD_BYTES else line
 
 
-def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=None):
-    """Stream complete JSONL records; rescanning also handles appended/rollover files."""
+def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=None, cache=None):
+    """Stream complete JSONL records; rescanning also handles appended/rollover files. A `cache` resumes
+    each file where the previous scan's checkpoint left it."""
     turns = {}
     for path in sorted(paths):
-        meta, current, loaded, calls, reads, node_state = {}, None, set(), {}, [], {}
-        with path.open('rb') as stream:
-            for line_number, line in enumerate(stream, 1):
-                if not line.endswith(b'\n'):
-                    break  # An actively appended final line is not yet a record.
-                parse_line = parse_bytes(line)
-                if len(parse_line) > MAX_RECORD_BYTES:
-                    if errors is not None:
-                        errors.append({'file': path.name[:200], 'line': line_number, 'reason': 'oversized rollout record'})
-                    current = None
-                    continue
-                try:
-                    record = json.loads(parse_line)
-                except (ValueError, UnicodeError):
-                    if errors is not None:
-                        errors.append({'file': path.name[:200], 'line': line_number, 'reason': 'invalid rollout record'})
-                    current = None
-                    continue
-                if not isinstance(record, dict) or not isinstance(record.get('payload', {}), dict):
-                    if errors is not None:
-                        errors.append({'file': path.name[:200], 'line': line_number, 'reason': 'invalid rollout object'})
-                    current = None
-                    continue
-                payload = record.get('payload', {})
-                kind = record.get('type')
-                if kind == 'session_meta':
-                    meta = payload
-                    if 'subagent' in json.dumps(meta.get('source', '')) or meta.get('thread_source') == 'subagent':
-                        break
-                    continue
-                if kind == 'event_msg' and payload.get('type') == 'task_started':
-                    current = {'thread': meta.get('session_id') or meta.get('id'), 'turn': payload.get('turn_id'),
-                               'messages': [], 'calls': [], 'verified_skills': [], 'loaded_hash': 'unknown'}
-                    calls = {}
-                    source_hash = hashlib.sha256()
-                if current is None:
-                    continue
-                source_hash.update(line)
-                if kind == 'event_msg' and payload.get('type') == 'user_message':
-                    # Messages stay raw for local filters; message_context redacts them for models.
-                    message = payload.get('message')
-                    current['messages'].append({'role': 'user', 'text': message if isinstance(message, str) else ''})
-                if kind == 'response_item':
-                    item_type = payload.get('type')
-                    if item_type in ('function_call', 'custom_tool_call'):
-                        arguments = payload.get('arguments', payload.get('input', ''))
-                        raw = arguments if isinstance(arguments, str) else json.dumps(arguments)
-                        name = payload.get('name', '')
-                        skills = [s for s in SKILLS if re.search(r'(?<![\w.-])skills/' + re.escape(s) + r'/SKILL\.md\b', raw)]
-                        calls[payload.get('call_id')] = (skills, name, raw)
-                        current['calls'].append({'name': name})
-                    elif item_type in ('function_call_output', 'custom_tool_call_output'):
-                        skill_reads, name, raw = calls.get(payload.get('call_id'), ([], '', ''))
-                        output = str(payload.get('output', ''))
-                        if source_notes:
-                            created = creation_matches(raw, payload.get('output', ''), source_notes, record.get('timestamp'), name)
-                            if created:
-                                current['created_notes'] = sorted(set(current.get('created_notes', [])) | set(created))
-                        read = bool(re.search(r'\b(?:cat|sed|read_text|readFile|skills\.read|read_mcp_resource|read_guidance\.py)\b', raw))
-                        successful = not re.search(r'(?i)(?:exit_code["\s:]+[1-9]|exit code: [1-9]|no such file|isError["\s:]+true)', output)
-                        observed_reads = loaded_reads(raw, payload.get('output', ''), current['turn']) if read else []
-                        if name == 'mcp__node_repl__reset' and successful:
-                            node_state.clear()
-                        if name == 'mcp__node_repl__js':
-                            try:
-                                arguments = json.loads(raw)
-                                result = payload.get('output', '')
-                                result = json.loads(result) if isinstance(result, str) else result
-                                if not isinstance(result, dict) or result.get('isError') or result.get('error'):
-                                    raise ValueError('Unsuccessful Node result')
-                                text = '\n'.join(part['text'] for part in result.get('content', [])
-                                                 if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str))
-                                observations = activation_trace.node_read_observations(arguments['code'], text, node_state)
-                                if observations:
-                                    read, successful = True, True
-                                for observation in observations:
-                                    path = guidance_path(observation['path'])
-                                    content = observation['content']
-                                    if '\x00' in content:
-                                        continue
-                                    observed_reads.append({'path': path, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
-                                                           'coverage': observation['coverage'], 'read_turn': current['turn']})
-                            except (ValueError, TypeError, KeyError):
-                                node_state.clear()
-                        if read and (successful or observed_reads):
-                            proven = {entry['path'].split('/')[0] for entry in observed_reads
-                                      if entry['path'].endswith('/SKILL.md')}
-                            # Old shell transcripts sometimes have no exact output envelope.
-                            # Preserve eligibility only for one literal read and explicit success.
-                            legacy = literal_entrypoint(raw)
-                            if legacy and successful and re.match(r'^Exit code: 0\n', output):
-                                proven.add(legacy)
-                            loaded.update(skill for skill in proven if re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', output, re.I))
-                            for item in observed_reads:
-                                if not any(all(previous[key] == item[key] for key in ('path', 'sha256', 'coverage')) for previous in reads):
-                                    reads.append(item)
-                        # Web/research output and file contents stay out of the model input.
-                        if not skill_reads:
-                            status = re.findall(r'(?:Exit code: |exit_code[\" :]+)([0-9]+)', output)
-                            current['messages'].append({'role': 'tool', 'text': 'Tool returned; exit statuses: ' + ','.join(status[:8])})
-                    elif item_type == 'message' and payload.get('role') == 'user':
-                        text = text_content(payload)
-                        if not text.startswith(('# AGENTS.md instructions', '<environment_context>')):
-                            current['messages'].append({'role': 'user', 'text': text})
-                    elif item_type == 'message' and payload.get('role') == 'assistant':
-                        current['messages'].append({'role': 'assistant', 'text': text_content(payload)})
-                if kind == 'event_msg' and payload.get('type') == 'task_complete':
-                    finished = record.get('timestamp')
-                    if payload.get('turn_id') != current['turn'] or not finished:
-                        current = None
-                        continue
-                    current['completed_at'] = finished
-                    current['verified_skills'] = sorted(loaded)
-                    current['loaded_reads'] = list(reads)
-                    current['source_sha256'] = source_hash.hexdigest()
-                    keep_turn(turns, current, since, eligible_only)
-                    current = None
+        try:
+            found = cache.turns('codex', path, errors) if cache else codex_file(path, errors, source_notes)[0]
+        except FileNotFoundError:
+            continue  # Removed after it was listed: the scan sees it as already gone.
+        for current in found:
+            keep_turn(turns, current, since, eligible_only)
     return sorted(turns.values(), key=lambda t: (t['completed_at'], t['evidence_id']))
+
+
+def node_idle(node_state):
+    """Node bindings that are empty behave like no Node state at all."""
+    return not (node_state.get('bindings') or node_state.get('modules'))
+
+
+def codex_file(path, errors=None, source_notes=None, resume=None, digest=None):
+    """Completed turns of one rollout in file order, read from its start or from a checkpoint `resume`.
+
+    Also returns the file's own errors and its latest checkpoint: a line boundary outside any turn and with no
+    Node bindings, where the parser's whole state is the session identity and the file's skill reads. The turns
+    and errors before a checkpoint never change while the file only grows. `digest` hashes the bytes read."""
+    meta, loaded, reads, offset, count, done = {}, set(), [], 0, 0, False
+    if resume:
+        meta, loaded, reads = dict(resume['meta']), set(resume['loaded']), list(resume['reads'])
+        offset, count, done = resume['offset'], resume['line'], resume['done']
+    current, calls, node_state, found, file_errors = None, {}, {}, [], []
+
+    def mark():
+        return {'offset': offset, 'line': count, 'done': done, 'turns': len(found), 'errors': len(file_errors),
+                'meta': {key: meta[key] for key in ('session_id', 'id') if key in meta},
+                'loaded': sorted(loaded), 'reads': list(reads), 'digest': digest.copy() if digest else None}
+    checkpoint = mark()
+    with path.open('rb') as stream:
+        stream.seek(offset)
+        for line in stream if not done else ():
+            if not line.endswith(b'\n'):
+                break  # An actively appended final line is not yet a record.
+            if current is None and node_idle(node_state):
+                checkpoint = mark()
+            offset, count = offset + len(line), count + 1
+            if digest:
+                digest.update(line)
+            parse_line = parse_bytes(line)
+            if len(parse_line) > MAX_RECORD_BYTES:
+                file_errors.append({'file': path.name[:200], 'line': count, 'reason': 'oversized rollout record'})
+                current = None
+                continue
+            try:
+                record = json.loads(parse_line)
+            except (ValueError, UnicodeError):
+                file_errors.append({'file': path.name[:200], 'line': count, 'reason': 'invalid rollout record'})
+                current = None
+                continue
+            if not isinstance(record, dict) or not isinstance(record.get('payload', {}), dict):
+                file_errors.append({'file': path.name[:200], 'line': count, 'reason': 'invalid rollout object'})
+                current = None
+                continue
+            payload = record.get('payload', {})
+            kind = record.get('type')
+            if kind == 'session_meta':
+                meta = payload
+                if 'subagent' in json.dumps(meta.get('source', '')) or meta.get('thread_source') == 'subagent':
+                    done = True
+                    break
+                continue
+            if kind == 'event_msg' and payload.get('type') == 'task_started':
+                current = {'thread': meta.get('session_id') or meta.get('id'), 'turn': payload.get('turn_id'),
+                           'messages': [], 'calls': [], 'verified_skills': [], 'loaded_hash': 'unknown'}
+                calls = {}
+                source_hash = hashlib.sha256()
+            if current is None:
+                continue
+            source_hash.update(line)
+            if kind == 'event_msg' and payload.get('type') == 'user_message':
+                # Messages stay raw for local filters; message_context redacts them for models.
+                message = payload.get('message')
+                current['messages'].append({'role': 'user', 'text': message if isinstance(message, str) else ''})
+            if kind == 'response_item':
+                item_type = payload.get('type')
+                if item_type in ('function_call', 'custom_tool_call'):
+                    arguments = payload.get('arguments', payload.get('input', ''))
+                    raw = arguments if isinstance(arguments, str) else json.dumps(arguments)
+                    name = payload.get('name', '')
+                    skills = [s for s in SKILLS if re.search(r'(?<![\w.-])skills/' + re.escape(s) + r'/SKILL\.md\b', raw)]
+                    calls[payload.get('call_id')] = (skills, name, raw)
+                    current['calls'].append({'name': name})
+                elif item_type in ('function_call_output', 'custom_tool_call_output'):
+                    skill_reads, name, raw = calls.get(payload.get('call_id'), ([], '', ''))
+                    output = str(payload.get('output', ''))
+                    if source_notes:
+                        created = creation_matches(raw, payload.get('output', ''), source_notes, record.get('timestamp'), name)
+                        if created:
+                            current['created_notes'] = sorted(set(current.get('created_notes', [])) | set(created))
+                    read = bool(re.search(r'\b(?:cat|sed|read_text|readFile|skills\.read|read_mcp_resource|read_guidance\.py)\b', raw))
+                    successful = not re.search(r'(?i)(?:exit_code["\s:]+[1-9]|exit code: [1-9]|no such file|isError["\s:]+true)', output)
+                    observed_reads = loaded_reads(raw, payload.get('output', ''), current['turn']) if read else []
+                    if name == 'mcp__node_repl__reset' and successful:
+                        node_state.clear()
+                    if name == 'mcp__node_repl__js':
+                        try:
+                            arguments = json.loads(raw)
+                            result = payload.get('output', '')
+                            result = json.loads(result) if isinstance(result, str) else result
+                            if not isinstance(result, dict) or result.get('isError') or result.get('error'):
+                                raise ValueError('Unsuccessful Node result')
+                            text = '\n'.join(part['text'] for part in result.get('content', [])
+                                             if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str))
+                            observations = activation_trace.node_read_observations(arguments['code'], text, node_state)
+                            if observations:
+                                read, successful = True, True
+                            for observation in observations:
+                                guidance = guidance_path(observation['path'])
+                                content = observation['content']
+                                if '\x00' in content:
+                                    continue
+                                observed_reads.append({'path': guidance, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
+                                                       'coverage': observation['coverage'], 'read_turn': current['turn']})
+                        except (ValueError, TypeError, KeyError):
+                            node_state.clear()
+                    if read and (successful or observed_reads):
+                        proven = {entry['path'].split('/')[0] for entry in observed_reads
+                                  if entry['path'].endswith('/SKILL.md')}
+                        # Old shell transcripts sometimes have no exact output envelope.
+                        # Preserve eligibility only for one literal read and explicit success.
+                        legacy = literal_entrypoint(raw)
+                        if legacy and successful and re.match(r'^Exit code: 0\n', output):
+                            proven.add(legacy)
+                        loaded.update(skill for skill in proven if re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', output, re.I))
+                        for item in observed_reads:
+                            if not any(all(previous[key] == item[key] for key in ('path', 'sha256', 'coverage')) for previous in reads):
+                                reads.append(item)
+                    # Web/research output and file contents stay out of the model input.
+                    if not skill_reads:
+                        status = re.findall(r'(?:Exit code: |exit_code[\" :]+)([0-9]+)', output)
+                        current['messages'].append({'role': 'tool', 'text': 'Tool returned; exit statuses: ' + ','.join(status[:8])})
+                elif item_type == 'message' and payload.get('role') == 'user':
+                    text = text_content(payload)
+                    if not text.startswith(('# AGENTS.md instructions', '<environment_context>')):
+                        current['messages'].append({'role': 'user', 'text': text})
+                elif item_type == 'message' and payload.get('role') == 'assistant':
+                    current['messages'].append({'role': 'assistant', 'text': text_content(payload)})
+            if kind == 'event_msg' and payload.get('type') == 'task_complete':
+                finished = record.get('timestamp')
+                if payload.get('turn_id') != current['turn'] or not finished:
+                    current = None
+                    continue
+                current['completed_at'] = finished
+                current['verified_skills'] = sorted(loaded)
+                current['loaded_reads'] = list(reads)
+                current['source_sha256'] = source_hash.hexdigest()
+                found.append(current)
+                current = None
+    if done or (current is None and node_idle(node_state)):
+        checkpoint = mark()
+    if errors is not None:
+        errors.extend(file_errors)
+    return found, file_errors, checkpoint
+
+
+class ScanCache:
+    """Per-file progress of the hourly transcript scan, kept in `capture-scan.json`.
+
+    An unchanged file (same device, inode, size and modification time) is read only after its checkpoint; a file
+    that only grew, with every byte scanned before unchanged, resumes there. A replaced, shrunk or rewritten file,
+    a new file, a missing or unreadable record and any change to the scanner's code scan the whole file again, so
+    every result equals a full rescan. Only turns the eligible-only capture scan could keep are stored, unless the
+    cache is `complete`, as the source checks' cache in `evidence-scan.json` is: that one stores every turn.
+    Neither records which notes a turn created, so a scan that needs `source_notes` reads every file in full.
+    """
+
+    def __init__(self, path, complete=False):
+        self.path, self.files, self.complete = Path(path), {}, complete
+        self.identity = hashlib.sha256(json.dumps([SCAN_VERSION, SOURCE_SHA256, *(
+            hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+            for module in (activation_trace, sys.modules[guidance_path.__module__])),
+            *(['complete'] if complete else [])]).encode()).hexdigest()
+        safe_path(self.path)
+        try:
+            value = json.loads(self.path.read_text())
+            self.previous = value['files'] if value['identity'] == self.identity and isinstance(value['files'], dict) else {}
+        except (OSError, ValueError, KeyError, TypeError):
+            self.previous = {}
+        self.changed = False
+
+    def turns(self, kind, path, errors):
+        parse = codex_file if kind == 'codex' else claude_file
+        status = path.stat()
+        identity = [status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns]
+        entry, digest = valid_scan_entry(self.previous.get(str(path)), kind), None
+        if entry and entry['identity'] != identity:
+            # A grown file resumes only when every byte scanned before is unchanged: the prefix the checkpoint
+            # hashes and the tail after it, up to the old size.
+            offset, size = entry['checkpoint']['offset'], entry['identity'][2]
+            digest = prefix_digest(path, offset) if (
+                entry['identity'][:2] == identity[:2] and offset <= size <= status.st_size) else None
+            if (not digest or digest.hexdigest() != entry['checkpoint']['sha256']
+                    or tail_digest(path, offset, size) != entry['tail']):
+                entry, digest = None, None
+        if not entry:
+            digest = hashlib.sha256()
+        found, file_errors, checkpoint = parse(path, None, None, entry['checkpoint'] if entry else None, digest)
+        if digest:
+            # Stored before the caller's filters change the turns.
+            keep = [turn for turn in found[:checkpoint['turns']] if self.complete or turn['verified_skills'] and (
+                kind == 'codex' or (not turn['broken'] and turn['stop'] == 'end_turn'))]
+            saved = {key: value for key, value in checkpoint.items() if key not in ('turns', 'errors', 'digest')}
+            # A file that grew while it was read has no verified tail; it is scanned in full next time.
+            tail = tail_digest(path, checkpoint['offset'], status.st_size) if checkpoint['offset'] <= status.st_size else ''
+            self.changed = True
+            entry = {'kind': kind, 'identity': identity, 'checkpoint': {**saved, 'sha256': checkpoint['digest'].hexdigest()},
+                     'tail': tail or '', 'turns': (entry['turns'] if entry else []) + keep,
+                     'errors': (entry['errors'] if entry else []) + file_errors[:checkpoint['errors']]}
+            found = entry['turns'] + found[checkpoint['turns']:]
+            file_errors = entry['errors'] + file_errors[checkpoint['errors']:]
+        else:
+            # Unchanged: the same bytes after the same checkpoint give the same checkpoint again.
+            found, file_errors = entry['turns'] + found, entry['errors'] + file_errors
+        self.files[str(path)] = json.dumps(entry)
+        if errors is not None:
+            errors.extend(file_errors)
+        # Callers may change the turns they receive; only the serialized entry is saved.
+        return json.loads(json.dumps(found))
+
+    def save(self):
+        if not self.changed and self.files.keys() == self.previous.keys():
+            return
+        atomic(self.path, '{"identity": ' + json.dumps(self.identity) + ', "files": {'
+               + ', '.join(json.dumps(key) + ': ' + value for key, value in self.files.items()) + '}}\n')
+
+
+def valid_scan_entry(entry, kind):
+    """The stored progress of one file, or None when any part of it is missing or malformed."""
+    try:
+        point = entry['checkpoint']
+        strings = lambda value: isinstance(value, list) and all(isinstance(item, str) for item in value)
+        read_keys = {'path', 'sha256', 'coverage', 'read_turn'}
+        valid = (entry['kind'] == kind and isinstance(entry['identity'], list) and len(entry['identity']) == 4
+                 and all(type(value) is int for value in entry['identity'])
+                 and all(type(point[key]) is int and point[key] >= 0 for key in ('offset', 'line'))
+                 and isinstance(point['sha256'], str) and re.fullmatch(r'[0-9a-f]{64}', point['sha256'])
+                 and strings(point['loaded']) and isinstance(point['reads'], list)
+                 and all(isinstance(read, dict) and set(read) == read_keys for read in point['reads'])
+                 and isinstance(entry['tail'], str)
+                 and isinstance(entry['turns'], list) and all(valid_scan_turn(turn, kind) for turn in entry['turns'])
+                 and isinstance(entry['errors'], list) and all(isinstance(error, dict) for error in entry['errors'])
+                 and (isinstance(point['meta'], dict) and type(point['done']) is bool if kind == 'codex'
+                      else isinstance(point['context'], str)))
+        return entry if valid else None
+    except (KeyError, TypeError):
+        return None
+
+
+def valid_scan_turn(turn, kind):
+    """A stored turn with every field the capture filters read."""
+    return (isinstance(turn, dict) and all(key in turn for key in ('thread', 'turn', 'completed_at'))
+            and isinstance(turn.get('verified_skills'), list) and isinstance(turn.get('messages'), list)
+            and all(isinstance(message, dict) and isinstance(message.get('role'), str) and isinstance(message.get('text'), str)
+                    for message in turn['messages'])
+            and (kind == 'codex' or ('broken' in turn and 'stop' in turn)))
+
+
+def tail_digest(path, start, end):
+    """The hex SHA-256 of bytes `start` to `end`, or None when the file is shorter."""
+    digest, size = hashlib.sha256(), end - start
+    with path.open('rb') as stream:
+        stream.seek(start)
+        while size > 0:
+            chunk = stream.read(min(size, 1 << 20))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            size -= len(chunk)
+    return digest.hexdigest()
+
+
+def prefix_digest(path, size):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while size > 0:
+            chunk = stream.read(min(size, 1 << 20))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            size -= len(chunk)
+    return digest
 
 
 def keep_turn(turns, current, since, eligible_only):
@@ -889,7 +1139,7 @@ def write_matches(result, notes, recorded_at):
     return found
 
 
-def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None):
+def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None, cache=None):
     """Group Claude Code transcript records into completed prompt turns with the Codex turn shape."""
     now = now or datetime.now(timezone.utc)
     turns = {}
@@ -900,30 +1150,11 @@ def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=Non
             quiet = now - datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) >= CLAUDE_QUIET
         except OSError:
             continue
-        # As in Codex capture, a skill read stays in effect for the rest of the session file.
-        scan = {'finished': [], 'current': None, 'uses': {}, 'loaded': set(), 'reads': [], 'context': ''}
-        with path.open('rb') as stream:
-            for line_number, line in enumerate(stream, 1):
-                if not line.endswith(b'\n'):
-                    break  # An actively appended final line is not yet a record.
-                try:
-                    parse_line = parse_bytes(line)
-                    if len(parse_line) > MAX_RECORD_BYTES:
-                        raise ValueError('oversized transcript record')
-                    record = json.loads(parse_line)
-                    if not isinstance(record, dict):
-                        raise ValueError('invalid transcript object')
-                    claude_record(scan, record, line, source_notes)
-                except (ValueError, UnicodeError, TypeError, AttributeError, KeyError) as error:
-                    if errors is not None:
-                        reason = str(error) if str(error).startswith(('oversized', 'invalid transcript')) else 'invalid transcript record'
-                        errors.append({'file': path.name[:200], 'line': line_number, 'reason': reason})
-                    if scan['current']:
-                        scan['current']['broken'] = True
-        if scan['current']:
-            scan['current']['last'] = True
-            close_claude_turn(scan)
-        for current in scan['finished']:
+        try:
+            found = cache.turns('claude', path, errors) if cache else claude_file(path, errors, source_notes)[0]
+        except FileNotFoundError:
+            continue
+        for current in found:
             # Only a real final reply completes a turn; the newest also waits for the file to go quiet.
             if current.pop('broken') or current.pop('stop') != 'end_turn' or (current.pop('last', False) and not quiet):
                 continue
@@ -933,6 +1164,60 @@ def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=Non
                 if errors is not None:
                     errors.append({'file': path.name[:200], 'line': 0, 'reason': 'invalid transcript timestamp'})
     return sorted(turns.values(), key=lambda t: (t['completed_at'], t['evidence_id']))
+
+
+def claude_file(path, errors=None, source_notes=None, resume=None, digest=None):
+    """Prompt turns of one transcript in file order, read from its start or from a checkpoint `resume`; the
+    newest is marked `last`. Also returns the file's own errors and its latest checkpoint: the start of the line
+    that opened the newest turn, where the parser's whole state is the file's skill reads and the latest prompt.
+    The turns and errors before a checkpoint never change while the file only grows."""
+    # As in Codex capture, a skill read stays in effect for the rest of the session file.
+    scan = {'finished': [], 'current': None, 'uses': {}, 'loaded': set(), 'reads': [], 'context': ''}
+    offset = count = 0
+    if resume:
+        scan.update(loaded=set(resume['loaded']), reads=list(resume['reads']), context=resume['context'])
+        offset, count = resume['offset'], resume['line']
+    file_errors = []
+
+    def mark(at, line, context, errors_before, before):
+        return {'offset': at, 'line': line, 'context': context, 'loaded': sorted(scan['loaded']),
+                'reads': list(scan['reads']), 'turns': len(scan['finished']), 'errors': errors_before, 'digest': before}
+    checkpoint = mark(offset, count, scan['context'], 0, digest.copy() if digest else None)
+    with path.open('rb') as stream:
+        stream.seek(offset)
+        for line in stream:
+            if not line.endswith(b'\n'):
+                break  # An actively appended final line is not yet a record.
+            opened, context, at, line_before, errors_before = scan['current'], scan['context'], offset, count, len(file_errors)
+            before = digest.copy() if digest else None
+            offset, count = offset + len(line), count + 1
+            if digest:
+                digest.update(line)
+            try:
+                parse_line = parse_bytes(line)
+                if len(parse_line) > MAX_RECORD_BYTES:
+                    raise ValueError('oversized transcript record')
+                record = json.loads(parse_line)
+                if not isinstance(record, dict):
+                    raise ValueError('invalid transcript object')
+                claude_record(scan, record, line, source_notes)
+            except (ValueError, UnicodeError, TypeError, AttributeError, KeyError) as error:
+                reason = str(error) if str(error).startswith(('oversized', 'invalid transcript')) else 'invalid transcript record'
+                file_errors.append({'file': path.name[:200], 'line': count, 'reason': reason})
+                if scan['current']:
+                    scan['current']['broken'] = True
+            # Opening a turn closes the previous one and reads nothing else, so resuming from this line's start
+            # with the state as it stands rebuilds the same turn.
+            if scan['current'] is not None and scan['current'] is not opened:
+                checkpoint = mark(at, line_before, context, errors_before, before)
+    if scan['current']:
+        scan['current']['last'] = True
+        close_claude_turn(scan)
+    else:
+        checkpoint = mark(offset, count, scan['context'], len(file_errors), digest.copy() if digest else None)
+    if errors is not None:
+        errors.extend(file_errors)
+    return scan['finished'], file_errors, checkpoint
 
 
 def close_claude_turn(scan):
@@ -1123,6 +1408,13 @@ def validate_notes(value, turn):
     return value['notes']
 
 
+def rejected_default(title):
+    """The pattern a rejected-default note title names, or None for any other note. Only frontend-ui notes are
+    ever proposed, so the title is not validated here: a misused one must not cost a retried extraction."""
+    match = REJECTED_DEFAULT_TITLE.fullmatch(title)
+    return match[1].strip() if match else None
+
+
 def validate_summary(summary, skill='frontend-ui'):
     """Source-check summaries are committed as a note field, so the same field rules apply."""
     note = {'skill': skill, **{key: 'Source evidence assessment' for key in FIELDS}, 'evidence': summary}
@@ -1185,7 +1477,7 @@ def run_extractor(command, *, env, input, timeout, cwd=None):
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             stdout, stderr = process.communicate()
             expired = subprocess.TimeoutExpired('restricted extractor', timeout, output=stdout, stderr=stderr)
@@ -1195,7 +1487,7 @@ def run_extractor(command, *, env, input, timeout, cwd=None):
         except BaseException:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             process.communicate()
             raise
@@ -1221,12 +1513,39 @@ def usable(output):
 
 
 def model_response(config, state_root, prompt, data, response_schema, *, deadline=None, wait_for_rate_limit=True,
-                   role=None, cache_prefix=None):
+                   role=None, cache_prefix=None, backend=None):
     """Run one restricted call on the role's model: through the Claude API when the configuration names a key
-    file, otherwise through the Claude Code CLI. Until a recorded usage limit's reset, raise RateLimited
-    without calling, unless the caller asked for an immediate retry."""
+    file, otherwise through the Claude Code CLI. An exhausted API balance or a rejected key falls back to the
+    CLI's signed-in subscription and records it, so later calls start there until a day passes or the key file
+    changes. Until a recorded usage limit's reset, raise RateLimited without calling, unless the caller asked
+    for an immediate retry. A caller comparing answers passes `backend` to keep every call on one backend; a call
+    that cannot run there fails instead of moving."""
+    call = dict(deadline=deadline, wait_for_rate_limit=wait_for_rate_limit, role=role, cache_prefix=cache_prefix)
+    started = model_backend(config, state_root)
+    moved = ExtractorFailure('extractor backend changed', {'phase': 'startup', 'failure_class': 'backend changed', 'attempts': 0})
+    if backend == 'api' and started != 'api':
+        raise moved
+    if (backend or started) == 'api':
+        try:
+            output = backend_response(config, state_root, prompt, data, response_schema, api=True, **call)
+        except ExtractorFailure as error:
+            reason = error.diagnostics.get('failure_class')
+            if isinstance(error, RateLimited) or reason not in API_FALLBACK_CLASSES:
+                raise
+            record = record_api_fallback(config, state_root, reason, datetime.now(timezone.utc))
+            print(json.dumps({'event': 'api_fallback', 'reason': reason, 'retry_at': record['retry_at']}),
+                  file=sys.stderr, flush=True)
+            if backend:
+                raise moved from None
+        else:
+            clear_api_fallback(config, state_root)
+            return output
+    return backend_response(config, state_root, prompt, data, response_schema, api=False, **call)
+
+
+def backend_response(config, state_root, prompt, data, response_schema, *, api, deadline, wait_for_rate_limit, role,
+                     cache_prefix):
     model = claude_cli.ROLE_MODELS.get(role, claude_cli.RESTRICTED_MODEL)
-    api = bool(config.get('api_key_file'))
     limit = read_rate_limit(state_root, api)
     if wait_for_rate_limit and limit and datetime.now(timezone.utc) < timestamp(limit['retry_at']):
         raise RateLimited('extractor rate limit failure', {'phase': 'startup', 'failure_class': 'rate limit', 'attempts': 0},
@@ -1240,6 +1559,9 @@ def model_response(config, state_root, prompt, data, response_schema, *, deadlin
             verify_cli(cli, deadline=deadline)
             command = claude_cli.restricted_command(cli, response_schema, model=model)
             child_env = claude_cli.child_env()
+            if config.get('api_key_file'):
+                # The subscription fallback runs on the login, never on an inherited API key.
+                child_env.pop('ANTHROPIC_API_KEY', None)
         for attempt in range(1, 3):
             timeout = bounded_timeout(MODEL_TIMEOUT, deadline)
             began = time.monotonic()
@@ -1395,9 +1717,11 @@ def capture(config, state_root, *, now=None, retry_now=False):
             deployed = revision
     scan_errors = []
     since = timestamp(config.get('capture_since', SINCE))
-    turns = sorted(completed_turns([*sessions.rglob('*.jsonl'), *archived.rglob('*.jsonl')], since, scan_errors) +
-                   claude_turns(claude_projects(config).rglob('*.jsonl'), since, scan_errors, now=now),
+    cache = ScanCache(state_root / 'capture-scan.json')
+    turns = sorted(completed_turns([*sessions.rglob('*.jsonl'), *archived.rglob('*.jsonl')], since, scan_errors, cache=cache) +
+                   claude_turns(claude_projects(config).rglob('*.jsonl'), since, scan_errors, now=now, cache=cache),
                    key=lambda t: (t['completed_at'], t['evidence_id']))
+    cache.save()
     pending = [turn for turn in turns if turn['evidence_id'] not in state['processed']]
     # A moved or temporarily unavailable source must not disappear from job health.
     unavailable = ((set(state['pending']) | set(state['deferred'])) - set(state['processed']) -
@@ -1518,6 +1842,7 @@ def main():
             status = {key: old[key] for key in ('last_success_finished_at', 'last_failure_finished_at') if key in old}
             status.update(phase='running', success=None, started_at=now)
             atomic(status_path, json.dumps(status) + '\n')
+            config = {}
             try:
                 config = json.loads(args.config.read_text())
                 if config.get('host_id') not in ('client-host', 'maintainer-host') or not claude_cli.cli_path(config).is_file():
@@ -1530,6 +1855,7 @@ def main():
                 report_rate_limit(status, status['counts']['rate_limit'], 'turns')
             except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
                 status.update(success=False, error='Capture failed: ' + failure_reason(error) + '. Source evidence remains pending.')
+            report_api_fallback(status, config, root)
             finished = datetime.now(timezone.utc).isoformat()
             status.update(phase='finished', finished_at=finished)
             status['last_success_finished_at' if status['success'] else 'last_failure_finished_at'] = finished

@@ -140,6 +140,21 @@ class MonitorTests(unittest.TestCase):
         self.local['capture'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat(), 'counts': {'pending': 0}}
         self.assertNotIn('client-host:capture:backlog', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
 
+    def test_subscription_fallback_alerts_until_capture_reports_the_api_again(self):
+        fallback = {'reason': 'billing', 'since': NOW.isoformat(), 'retry_at': (NOW + timedelta(days=1)).isoformat(), 'key': '1-2-3'}
+        self.remote['jobs']['capture'] = {'loaded': True, 'running': False, 'last_exit': 0}
+        self.remote['capture'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat(), 'api_fallback': fallback}
+        first = monitor.evaluate(self.local, self.remote, self.previous, NOW)
+        self.assertEqual(first['problems']['maintainer-host:capture:fallback'],
+                         'maintainer-host: running on subscription fallback; the Claude API is unavailable (billing)')
+        self.assertEqual(monitor.problem_job('maintainer-host:capture:fallback'), ('maintainer-host', 'capture'))
+        # A running capture has not yet shown the API back.
+        self.remote['capture'] = {'phase': 'running', 'success': None, 'started_at': NOW.isoformat(),
+                                  'last_success_finished_at': NOW.isoformat()}
+        self.assertIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
+        self.remote['capture'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat()}
+        self.assertNotIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
+
     def test_hourly_sync_is_healthy_and_clears_stale_alert(self):
         self.remote['sync']['finished_at'] = (NOW - timedelta(hours=1)).isoformat()
         self.previous['problems'] = {'maintainer-host:sync:stale': 'stale'}

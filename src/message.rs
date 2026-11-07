@@ -1,9 +1,11 @@
 //! Generate commit text using only a supplied public diff, through an isolated,
-//! tool-less Claude Code CLI call with schema-constrained output.
+//! tool-less Claude Code CLI call with schema-constrained output. With an API key file the call
+//! is billed to that key; an exhausted balance or rejected key falls back to the signed-in login.
 use crate::{
     CommitMessage, Result,
     config::{Config, expand},
 };
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
     sys::signal::{Signal, killpg},
@@ -14,8 +16,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     ffi::OsString,
+    fs,
     io::{self, Read, Write},
-    os::{fd::AsFd, unix::process::CommandExt},
+    os::{
+        fd::AsFd,
+        unix::{fs::MetadataExt, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -98,6 +104,10 @@ struct Settings {
     effort: Effort,
     #[serde(default = "default_timeout")]
     timeout_seconds: u64,
+    #[serde(default)]
+    api_key_file: Option<PathBuf>,
+    #[serde(default)]
+    api_fallback_file: Option<PathBuf>,
 }
 fn default_timeout() -> u64 {
     120
@@ -111,6 +121,10 @@ pub struct Options {
     pub effort: Effort,
     pub timeout: Duration,
     pub cancellation: Option<Arc<AtomicBool>>,
+    /// A file holding a Claude API key; the CLI then bills the key instead of the login.
+    pub api_key_file: Option<PathBuf>,
+    /// The fallback record shared with the Python pipeline (`api-fallback.json`).
+    pub api_fallback_file: Option<PathBuf>,
 }
 impl Options {
     /// Parse and validate the private configuration's `generation` block.
@@ -126,12 +140,28 @@ impl Options {
         if !(1..=900).contains(&settings.timeout_seconds) {
             return Err("Message-generation timeout_seconds must be between 1 and 900".into());
         }
+        let absolute = |path: Option<PathBuf>| -> Result<Option<PathBuf>> {
+            let Some(path) = path.as_deref().map(expand).transpose()? else {
+                return Ok(None);
+            };
+            if !path.is_absolute() {
+                return Err("Message-generation key and fallback paths must be absolute".into());
+            }
+            Ok(Some(path))
+        };
+        let api_key_file = absolute(settings.api_key_file)?;
+        let api_fallback_file = absolute(settings.api_fallback_file)?;
+        if api_fallback_file.is_some() && api_key_file.is_none() {
+            return Err("Message-generation api_fallback_file requires api_key_file".into());
+        }
         Ok(Self {
             claude_path: path,
             model: settings.model,
             effort: settings.effort,
             timeout: Duration::from_secs(settings.timeout_seconds),
             cancellation: crate::cancellation::token(),
+            api_key_file,
+            api_fallback_file,
         })
     }
 }
@@ -151,6 +181,8 @@ pub enum GenerationError {
     Timeout,
     Cancelled,
     Authentication,
+    /// The API key's balance cannot pay for the call.
+    Billing,
     Backend(String),
     InvalidMessage,
     Io(io::Error),
@@ -166,6 +198,7 @@ impl std::fmt::Display for GenerationError {
             Self::Authentication => f.write_str(
                 "Claude Code authentication unavailable; sign in with the claude CLI and retry",
             ),
+            Self::Billing => f.write_str("Claude API credit balance is too low"),
             Self::Backend(detail) => {
                 write!(f, "restricted Claude Code generation failed: {detail}")
             }
@@ -233,13 +266,50 @@ pub fn generate_message(
             .unwrap_or_default(),
         serde_json::json!({ "public_diff": diff })
     );
-    let (ok, out, _) = run(
-        command(options, root.path()),
-        prompt.as_bytes(),
-        options,
-        end,
-    )?;
-    let message = parse_stream(&out, ok)?;
+    let generate = |auth: &Auth| {
+        let (ok, out, _) = run(
+            command(options, root.path(), auth),
+            prompt.as_bytes(),
+            options,
+            end,
+        )?;
+        parse_stream(&out, ok)
+    };
+    let message = match api_auth(options, Utc::now())? {
+        Some((key, fingerprint)) => match generate(&Auth::Key(key)) {
+            Ok(message) => {
+                // The API answered; a record for another key file (the pipeline can name its own) stays.
+                if let Some(path) = options.api_fallback_file.as_deref().filter(|path| {
+                    read_fallback(path).is_none_or(|record| record.key == fingerprint)
+                }) {
+                    match fs::remove_file(path) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => eprintln!(
+                            "codex-skills: could not clear the Claude API fallback record: {e}"
+                        ),
+                        _ => {}
+                    }
+                }
+                message
+            }
+            Err(error @ (GenerationError::Billing | GenerationError::Authentication)) => {
+                let reason = if matches!(error, GenerationError::Billing) {
+                    "billing"
+                } else {
+                    "authentication"
+                };
+                eprintln!(
+                    "codex-skills: Claude API unavailable ({reason}); generating with the Claude Code login"
+                );
+                if let Err(e) = record_fallback(options, reason, Utc::now()) {
+                    eprintln!("codex-skills: could not record the Claude API fallback: {e}");
+                }
+                generate(&Auth::Login)?
+            }
+            Err(error) => return Err(error),
+        },
+        None if options.api_key_file.is_some() => generate(&Auth::Login)?,
+        None => generate(&Auth::Inherit)?,
+    };
     validate(&message)?;
     validate_grounding(&message, diff)?;
     Ok(message)
@@ -279,16 +349,124 @@ fn child_env(base: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(OsStr
         .collect()
 }
 
-fn base_command(o: &Options, root: &Path) -> Command {
+/// Which credentials the CLI uses: the inherited environment, the configured API key, or the
+/// signed-in login with any inherited API key removed.
+enum Auth {
+    Inherit,
+    Key(String),
+    Login,
+}
+
+/// The API key to use and its file's fingerprint, or None for the login: no key file is configured,
+/// or the shared fallback record says the API was unavailable for this key file and its daily retry
+/// is not yet due.
+fn api_auth(
+    o: &Options,
+    now: DateTime<Utc>,
+) -> std::result::Result<Option<(String, String)>, GenerationError> {
+    let Some(file) = &o.api_key_file else {
+        return Ok(None);
+    };
+    let meta = fs::symlink_metadata(file)?;
+    if !meta.file_type().is_file() || meta.mode() & 0o077 != 0 {
+        return Err(GenerationError::Backend(
+            "Claude API key file must be a regular file readable only by its owner".into(),
+        ));
+    }
+    let fingerprint = key_fingerprint(&meta);
+    if let Some(record) = o.api_fallback_file.as_deref().and_then(read_fallback)
+        && record.key == fingerprint
+        && now < record.retry_at
+    {
+        return Ok(None);
+    }
+    let key = fs::read_to_string(file)?.trim().to_owned();
+    if key.is_empty() {
+        return Err(GenerationError::Backend(
+            "Claude API key file is empty".into(),
+        ));
+    }
+    Ok(Some((key, fingerprint)))
+}
+
+/// The key file's identity, as `scripts/capture.py` computes it: a replaced or edited key file
+/// retries the API at once.
+fn key_fingerprint(meta: &fs::Metadata) -> String {
+    let modified = i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
+    format!("{}-{}-{}", meta.ino(), meta.size(), modified)
+}
+
+struct Fallback {
+    since: String,
+    retry_at: DateTime<Utc>,
+    key: String,
+}
+
+/// The shared record, or None when it is absent or unreadable; an unreadable record only means
+/// the API is tried again.
+fn read_fallback(path: &Path) -> Option<Fallback> {
+    let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let object = value.as_object()?;
+    let text = |name: &str| object.get(name).and_then(Value::as_str);
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    if keys != ["key", "reason", "retry_at", "since"]
+        || !matches!(text("reason"), Some("billing" | "authentication"))
+    {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(text("since")?).ok()?;
+    Some(Fallback {
+        since: text("since")?.to_owned(),
+        retry_at: DateTime::parse_from_rfc3339(text("retry_at")?)
+            .ok()?
+            .with_timezone(&Utc),
+        key: text("key")?.to_owned(),
+    })
+}
+
+/// Record that the API is unavailable; later calls use the login until a day passes or the key
+/// file changes. The first failure's time is kept while the record continues.
+fn record_fallback(o: &Options, reason: &str, now: DateTime<Utc>) -> io::Result<()> {
+    let (Some(path), Some(file)) = (&o.api_fallback_file, &o.api_key_file) else {
+        return Ok(());
+    };
+    let since = read_fallback(path)
+        .map(|record| record.since)
+        .unwrap_or_else(|| now.to_rfc3339_opts(SecondsFormat::Secs, false));
+    let record = serde_json::json!({
+        "reason": reason,
+        "since": since,
+        "retry_at": (now + TimeDelta::days(1)).to_rfc3339_opts(SecondsFormat::Secs, false),
+        "key": key_fingerprint(&fs::symlink_metadata(file)?),
+    });
+    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(format!("{record:#}\n").as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+fn base_command(o: &Options, root: &Path, auth: &Auth) -> Command {
     let mut c = Command::new(&o.claude_path);
     c.env_clear()
         .envs(child_env(std::env::vars_os()))
         .current_dir(root);
+    match auth {
+        Auth::Inherit => {}
+        Auth::Key(key) => {
+            c.env("ANTHROPIC_API_KEY", key);
+        }
+        Auth::Login => {
+            c.env_remove("ANTHROPIC_API_KEY");
+        }
+    }
     c
 }
 
-fn command(o: &Options, root: &Path) -> Command {
-    let mut c = base_command(o, root);
+fn command(o: &Options, root: &Path, auth: &Auth) -> Command {
+    let mut c = base_command(o, root, auth);
     c.args([
         "--print",
         "--setting-sources",
@@ -324,7 +502,7 @@ fn require_flags(
     if supported(&SUPPORTED_CLIS.lock().unwrap_or_else(|e| e.into_inner())) {
         return Ok(());
     }
-    let mut help = base_command(o, root);
+    let mut help = base_command(o, root, &Auth::Inherit);
     help.arg("--help");
     let (ok, out, _) = run(help, b"", o, end)?;
     if !ok {
@@ -448,6 +626,10 @@ fn parse_stream(out: &[u8], exit_ok: bool) -> std::result::Result<CommitMessage,
         let status = result.api_error_status.as_ref().and_then(Value::as_u64);
         errors.push(result.result.as_deref().unwrap_or_default().to_lowercase());
         let text = errors.join("\n");
+        // Only an error result can report a balance; a successful answer may quote the words.
+        if result.is_error && (status == Some(402) || text.contains("credit balance")) {
+            return Err(GenerationError::Billing);
+        }
         if matches!(status, Some(401 | 403))
             || [
                 "/login",
@@ -928,6 +1110,8 @@ mod tests {
             effort: Effort::Low,
             timeout: Duration::from_secs(5),
             cancellation: None,
+            api_key_file: None,
+            api_fallback_file: None,
         };
         assert!(matches!(
             generate_message(&"x".repeat(MAX_DIFF_BYTES + 1), None, &options),

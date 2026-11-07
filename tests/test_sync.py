@@ -1,3 +1,4 @@
+import io
 import importlib.util
 import json
 import os
@@ -302,6 +303,30 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         (current / 'prompts/extract.md').write_text('Local prompt edit')
         with self.assertRaisesRegex(sync.SyncError, 'Installed prompts'):
             sync.deploy(self.args)
+
+    def test_deploy_keeps_current_and_previous_and_prunes_older_releases(self):
+        self.release()
+        home = self.root / 'home'
+        home.mkdir()
+        seen = []
+        with patch.object(sync, 'KEEP_RELEASES', 1), patch.object(Path, 'home', return_value=home), \
+                patch.dict(os.environ, {'CODEX_HOME': str(home / '.codex'), 'CLAUDE_CONFIG_DIR': ''}):
+            for index in range(3):
+                (self.repo / 'README.md').write_text('fixture ' + str(index) + '\n')
+                self.commit('Revise ' + str(index))
+                sync.git(self.repo, 'push', 'origin', 'main')
+                self.assertTrue(sync.deploy(self.args))
+                seen.append((self.args.install_root / 'current').resolve().name)
+        releases = sorted(path.name for path in (self.args.install_root / 'releases').iterdir())
+        self.assertEqual(releases, sorted(seen[1:]))
+
+    def test_unresolvable_path_stops_pruning_but_not_the_deployment(self):
+        self.release()
+        for error in (RuntimeError('Symlink loop'), ValueError('embedded null byte'), OSError(13, 'Permission denied')):
+            with self.subTest(error=error), patch.object(sync, 'prune', side_effect=error), \
+                    patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertTrue(sync.deploy(self.args))
+            self.assertIn('Pruning stopped', output.getvalue())
 
     def test_deploy_rejects_changed_immutable_prompt_release(self):
         self.release()
@@ -1180,6 +1205,96 @@ sync.deploy(args)
         with self.assertRaisesRegex(sync.SyncError, 'review edits'):
             sync.deploy(self.args)
         self.assertEqual(local.read_text(), 'review v1')
+
+class PruneTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve() / 'install'
+        self.home = Path(temp.name).resolve() / 'home'
+        self.home.mkdir()
+        env = patch.dict(os.environ, {'CODEX_HOME': str(self.home / '.codex'), 'CLAUDE_CONFIG_DIR': ''})
+        env.start()
+        self.addCleanup(env.stop)
+        self.open, self.real_open_files = [], sync.open_files
+        lsof = patch.object(sync, 'open_files', side_effect=lambda: None if self.open is None else [str(p) for p in self.open])
+        lsof.start()
+        self.addCleanup(lsof.stop)
+
+    def builds(self, folder, count, inner):
+        """`count` builds, oldest first, each with a distinct modification time."""
+        names = []
+        for index in range(count):
+            name = format(index, 'x') * 40
+            (folder / name / inner).mkdir(parents=True)
+            os.utime(folder / name, (1000 + index, 1000 + index))
+            names.append(name)
+        return names
+
+    def remaining(self, folder):
+        return sorted(path.name for path in folder.iterdir())
+
+    def test_releases_in_use_and_the_newest_are_kept(self):
+        releases = self.root / 'releases'
+        names = self.builds(releases, 12, 'skills/frontend-ui')
+        (self.root / 'current').symlink_to(releases / names[2])
+        (self.home / '.claude/skills').mkdir(parents=True)
+        (self.home / '.claude/skills/frontend-ui').symlink_to(releases / names[3] / 'skills/frontend-ui')
+        self.open = [releases / names[4] / 'skills/frontend-ui']
+        for extra in ('.stage-abandoned', '.stage-running', '.prune-' + names[6], 'notes'):
+            (releases / extra).mkdir()
+        # Another checkout's deployment may still be filling a recent staging directory.
+        os.utime(releases / '.stage-abandoned', (1000, 1000))
+        with patch('sys.stdout'):
+            sync.prune(self.root, releases / names[1], self.home)
+        kept = [names[i] for i in (1, 2, 3, 4, 7, 8, 9, 10, 11)]
+        self.assertEqual(self.remaining(releases), sorted(kept + ['.stage-running', 'notes']))
+
+    def test_export_builds_named_by_launchd_links_or_processes_are_kept(self):
+        bin_dir = self.root / 'public-export/bin'
+        names = self.builds(bin_dir, 8, 'x')
+        for name in names:
+            (bin_dir / name / 'codex-skills').write_text('binary')
+        (bin_dir / 'current').symlink_to(names[0] + '/codex-skills')
+        agents = self.home / 'Library/LaunchAgents'
+        agents.mkdir(parents=True)
+        def job(path, binary):
+            with path.open('wb') as stream:
+                sync.plistlib.dump({'Label': 'fixture', 'ProgramArguments': [str(bin_dir / binary / 'codex-skills'), 'daily']}, stream)
+        job(agents / 'org.example.skills.public-export.plist', names[1])
+        job(self.root / 'public-export/job.plist.bak-20261105T000000Z', names[2])
+        job(agents / 'com.example.other.plist', names[4])
+        # A build named inside a shell command or reached through a PATH list is in use too.
+        with (agents / 'org.example.skills.shell.plist').open('wb') as stream:
+            sync.plistlib.dump({'Label': 'shell', 'ProgramArguments': ['/bin/sh', '-c', 'exec "$HOME/x/bin/' + names[5]
+                                + '/codex-skills" daily'], 'EnvironmentVariables': {
+                                'PATH': str(bin_dir / names[6]) + ':/usr/bin', 'MODE': '~nosuchuser-x'}}, stream)
+        self.open = [bin_dir / names[3] / 'codex-skills']
+        with patch.object(sync, 'KEEP_EXPORT_BUILDS', 1), patch('sys.stdout'):
+            sync.prune(self.root, None, self.home)
+        self.assertEqual(self.remaining(bin_dir), sorted([*(names[i] for i in (0, 1, 2, 3, 5, 6, 7)), 'current']))
+        # An unreadable job definition leaves every build in place.
+        (agents / 'org.example.skills.public-export.plist').write_text('not a plist')
+        with patch.object(sync, 'KEEP_EXPORT_BUILDS', 0), patch('sys.stdout'):
+            sync.prune(self.root, None, self.home)
+        self.assertEqual(len(self.remaining(bin_dir)), 8)
+
+    def test_unknown_open_files_prune_nothing(self):
+        releases = self.root / 'releases'
+        names = self.builds(releases, 8, 'skills')
+        bin_dir = self.root / 'public-export/bin'
+        self.builds(bin_dir, 5, 'x')
+        self.open = None
+        with patch('sys.stdout'):
+            sync.prune(self.root, None, self.home)
+        self.assertEqual(self.remaining(releases), names)
+        self.assertEqual(len(self.remaining(bin_dir)), 5)
+
+    def test_open_files_lists_this_process(self):
+        with tempfile.NamedTemporaryFile(dir=self.home) as handle:
+            files = self.real_open_files()
+        self.assertIn(str(Path(handle.name).resolve()), files)
+
 
 if __name__ == '__main__':
     unittest.main()

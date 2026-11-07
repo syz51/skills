@@ -8,11 +8,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import unquote
 
 from evidence import latest_receipt, parse_receipt
@@ -20,6 +22,15 @@ from capture import SKILLS, codex_home
 
 HOSTS = ('client-host', 'maintainer-host')
 VALIDATOR = Path(__file__).resolve().with_name('validate_skill.py')
+# Deployment keeps the newest skill releases and public-export builds, and any other one still in use: the
+# previous release, a link into it, a launchd job or an open file. Git can rebuild every release.
+KEEP_RELEASES = 5
+KEEP_EXPORT_BUILDS = 3
+BUILD_NAME = re.compile(r'[a-f0-9]{40}|[a-f0-9]{64}')
+# A build name anywhere in a launchd value, such as inside a shell command or a PATH list.
+NAMED_BUILD = re.compile(r'(?<![a-f0-9])(?:[a-f0-9]{64}|[a-f0-9]{40})(?![a-f0-9])')
+# Deployments of other checkouts take other locks, so only a staging directory this old is known to be abandoned.
+STALE_STAGE = 86400
 
 class SyncError(Exception):
     pass
@@ -479,7 +490,7 @@ def atomic_write(path, data, prefix):
 
 def review_blob(repo, commit, name, published, trees):
     """Recovery proof is a regular blob in published history, never a hash alone."""
-    if not isinstance(commit, str) or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', commit):
+    if not isinstance(commit, str) or not BUILD_NAME.fullmatch(commit):
         raise SyncError('Invalid review recovery commit')
     if commit not in trees:
         git(repo, 'merge-base', '--is-ancestor', commit, published)
@@ -503,11 +514,11 @@ def review_recovery(args, path, previous, published, trees):
                 or not isinstance(value['reviews'], dict)):
             raise ValueError()
         base, target = value['base_commit'], value['target_commit']
-        if not isinstance(target, str) or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', target):
+        if not isinstance(target, str) or not BUILD_NAME.fullmatch(target):
             raise ValueError()
         git(args.repo, 'merge-base', '--is-ancestor', target, published)
         if base is not None:
-            if not isinstance(base, str) or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', base):
+            if not isinstance(base, str) or not BUILD_NAME.fullmatch(base):
                 raise ValueError()
             git(args.repo, 'merge-base', '--is-ancestor', base, target)
         if target not in trees:
@@ -541,6 +552,115 @@ def review_recovery(args, path, previous, published, trees):
     except (OSError, ValueError, KeyError, TypeError, SyncError):
         raise SyncError('Invalid or unverifiable review recovery state') from None
 
+def open_files():
+    """Every path a running process has open, its working directory and executable included; None if unknown."""
+    try:
+        result = subprocess.run(['lsof', '-n', '-P', '-w', '-F', 'n'], stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode or not result.stdout:
+        return None
+    return [os.fsdecode(line[1:]) for line in result.stdout.splitlines() if line.startswith(b'n')]
+
+
+def build_of(path, folder):
+    """The name of the build directory in `folder` that `path` lies in, or None."""
+    try:
+        parts = Path(path).relative_to(folder).parts
+    except ValueError:
+        return None
+    return parts[0] if parts else None
+
+
+def linked(folders):
+    """Where the links directly inside `folders` lead."""
+    for folder in folders:
+        try:
+            entries = list(folder.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                yield entry.resolve()
+
+
+def launch_builds(definitions, folder):
+    """The builds in `folder` that the launchd jobs name or reach: by a path, by a path in a PATH-style list, or
+    by a build name inside any value; None if a definition is unreadable."""
+    values = []
+    for definition in definitions:
+        try:
+            with definition.open('rb') as stream:
+                job = plistlib.load(stream)
+            values += [job.get('Program'), *job.get('ProgramArguments', []), *job.get('EnvironmentVariables', {}).values()]
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, AttributeError, TypeError, plistlib.InvalidFileException):
+            return None
+    values = [value for value in values if isinstance(value, str)]
+    names = {name for value in values for name in NAMED_BUILD.findall(value)}
+    for piece in (piece for value in values for piece in value.split(os.pathsep) if piece.startswith(('/', '~'))):
+        try:
+            names.add(build_of(Path(piece).expanduser().resolve(), folder))
+        except (RuntimeError, ValueError, OSError):
+            # A path launchd cannot follow either (an unknown user, a link loop); a build it names is kept above.
+            continue
+    return names
+
+
+def prune_builds(folder, protected, keep):
+    """Remove the build directories after the `keep` newest that are not `protected`; returns their names."""
+    if not folder.is_dir():
+        return []
+    for leftover in folder.glob('.prune-*'):
+        shutil.rmtree(leftover)
+    builds = sorted((entry for entry in folder.iterdir() if BUILD_NAME.fullmatch(entry.name) and entry.is_dir()
+                     and not entry.is_symlink()), key=lambda entry: (entry.stat().st_mtime_ns, entry.name), reverse=True)
+    removed = []
+    for build in builds[keep:]:
+        if build.name in protected:
+            continue
+        # Renamed first, so an interrupted removal leaves no half-deleted build under its own name.
+        trash = folder / ('.prune-' + build.name)
+        os.rename(build, trash)
+        shutil.rmtree(trash)
+        removed.append(build.name)
+    return removed
+
+
+def prune(root, previous, home=None):
+    """Remove old skill releases and public-export builds; runs under the synchronization lock."""
+    home = home or Path.home()
+    files = open_files()
+    if files is None:
+        print('Pruning skipped: the files running processes use are unknown.')
+        return
+    files = [Path(path) for path in files]
+    releases = (root / 'releases').resolve()
+    for leftover in releases.glob('.stage-*'):
+        if time.time() - leftover.lstat().st_mtime > STALE_STAGE:
+            shutil.rmtree(leftover)
+    discovery = [home / '.claude/skills', home / '.codex/skills', home / '.agents/skills', codex_home() / 'skills', root]
+    if os.environ.get('CLAUDE_CONFIG_DIR'):
+        discovery.append(Path(os.environ['CLAUDE_CONFIG_DIR']).expanduser() / 'skills')
+    used = [(root / 'current').resolve(), *([previous] if previous else []), *linked(discovery), *files]
+    removed = prune_builds(releases, {build_of(path, releases) for path in used}, KEEP_RELEASES)
+    exports = root / 'public-export/bin'
+    builds = []
+    if exports.is_dir():
+        exports = exports.resolve()
+        jobs = launch_builds([*(home / 'Library/LaunchAgents').glob('org.example.skills.*.plist'),
+                              *(root / 'public-export').glob('*.plist.bak-*')], exports)
+        if jobs is None:
+            print('Public-export build pruning skipped: a launchd job definition is unreadable.')
+        else:
+            used = {build_of(path, exports) for path in [*linked([exports]), *files]}
+            builds = prune_builds(exports, used | jobs, KEEP_EXPORT_BUILDS)
+    if removed or builds:
+        print(f'Pruned {len(removed)} old releases and {len(builds)} public-export builds.')
+
+
 def deploy(args):
     if not args.validator:
         raise SyncError('Deployment requires --validator')
@@ -549,7 +669,7 @@ def deploy(args):
     commit = git(args.repo, 'rev-parse', 'refs/remotes/origin/main').decode().strip()
     root = args.install_root
     current = root / 'current'
-    previous_commit = None
+    previous_commit = old = None
     if current.exists() or current.is_symlink():
         if not current.is_symlink() or not current.resolve().is_relative_to((root / 'releases').resolve()):
             raise SyncError('Current installation is not a managed release')
@@ -572,7 +692,7 @@ def deploy(args):
         review_changes = []
         journal_reviews = {}
         previous_reviews = {}
-        if isinstance(previous_commit, str) and re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', previous_commit):
+        if isinstance(previous_commit, str) and BUILD_NAME.fullmatch(previous_commit):
             try:
                 git(args.repo, 'merge-base', '--is-ancestor', previous_commit, commit)
                 previous_reviews = trees.setdefault(previous_commit, feedback_tree(args.repo, previous_commit))
@@ -672,6 +792,12 @@ def deploy(args):
             journal.unlink(missing_ok=True)
             sync_directory(root)
     print('Deployed validated release ' + commit[:12] + '.')
+    try:
+        prune(root, old)
+    except (OSError, RuntimeError, ValueError) as error:
+        # The switch is complete; an old release that could not be removed is retried on the next deployment. A
+        # path that cannot be resolved (a link loop, an unknown user) stops pruning, not the deployment.
+        print('Pruning stopped: ' + (getattr(error, 'strerror', None) or type(error).__name__) + '.')
     return True
 
 def main():

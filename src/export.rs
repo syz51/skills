@@ -12,11 +12,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -126,7 +126,7 @@ fn terminate_group(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
-fn command(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8>)> {
+fn command(mut cmd: Command, timeout: Duration) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     if crate::cancellation::requested() {
         return Err("Publication cancelled".into());
     }
@@ -204,7 +204,7 @@ fn command(mut cmd: Command, timeout: Duration) -> Result<(bool, Vec<u8>, Vec<u8
         thread::sleep(Duration::from_millis(10));
     }
     Ok((
-        status.ok_or("Missing child status")?.success(),
+        status.ok_or("Missing child status")?,
         stdout.ok_or("Missing stdout")?,
         stderr.ok_or("Missing stderr")?,
     ))
@@ -215,8 +215,8 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
-    let (ok, out, _) = command(c, Duration::from_secs(120))?;
-    if !ok {
+    let (status, out, _) = command(c, Duration::from_secs(120))?;
+    if !status.success() {
         return Err(format!(
             "Git operation failed: {}",
             args.first().unwrap_or(&"unknown")
@@ -371,7 +371,69 @@ fn matches(repo: &Path, rev: &str, path: &str, data: &[u8], t: &BTreeMap<String,
     t.get(path).is_some_and(|i| i.mode == "100644")
         && git(repo, &["show", &format!("{rev}:{path}")]).is_ok_and(|b| b == data)
 }
-pub fn prepare(repo: &Path, files: &Files, previous: Option<&str>) -> Result<bool> {
+/// Public commits the private source has imported, one full commit ID per line, with `#`
+/// comments. A public edit of a managed file needs no record when the export already contains
+/// it; the record covers the rest, such as an imported edit the private source then revised,
+/// a mode change or content the export rewrites.
+pub const IMPORTED: &str = "public/imported-commits";
+pub type Imported = BTreeSet<String>;
+pub fn imported(source: &Path, rev: &str) -> Result<Imported> {
+    if git(source, &["ls-tree", "-z", rev, "--", IMPORTED])?.is_empty() {
+        return Ok(Imported::new());
+    }
+    let text = String::from_utf8(git(source, &["show", &format!("{rev}:{IMPORTED}")])?)?;
+    let id = regex::Regex::new(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")?;
+    let mut commits = Imported::new();
+    for line in text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+    {
+        if line.is_empty() {
+            continue;
+        }
+        if !id.is_match(line) {
+            return Err(format!("Invalid {IMPORTED} entry: {line}").into());
+        }
+        commits.insert(line.to_owned());
+    }
+    Ok(commits)
+}
+/// Whether the export already contains a public edit of a managed file: merging the edit into
+/// the export, with the last trusted export as base, leaves the export unchanged. A merge
+/// conflict means it does not; any other Git failure stops publication.
+fn contained(repo: &Path, base: &Item, public: &Item, data: &[u8]) -> Result<bool> {
+    if public.mode != "100644" {
+        return Ok(false);
+    }
+    let dir = tempfile::tempdir()?;
+    let paths = [
+        dir.path().join("export"),
+        dir.path().join("base"),
+        dir.path().join("public"),
+    ];
+    fs::write(&paths[0], data)?;
+    fs::write(&paths[1], git(repo, &["cat-file", "blob", &base.oid])?)?;
+    fs::write(&paths[2], git(repo, &["cat-file", "blob", &public.oid])?)?;
+    let mut c = Command::new("git");
+    c.args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(repo)
+        .args(["merge-file", "--stdout"])
+        .args(&paths)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let (status, merged, _) = command(c, Duration::from_secs(120))?;
+    match status.code() {
+        Some(0) => Ok(merged == data),
+        // merge-file exits with the number of conflicts, capped at 127.
+        Some(1..=127) => Ok(false),
+        _ => Err("Git operation failed: merge-file".into()),
+    }
+}
+pub fn prepare(
+    repo: &Path,
+    files: &Files,
+    previous: Option<&str>,
+    imported: &Imported,
+) -> Result<bool> {
     let mut old = BTreeMap::new();
     let current;
     if !git(
@@ -407,14 +469,40 @@ pub fn prepare(repo: &Path, files: &Files, previous: Option<&str>) -> Result<boo
                 return Err("Public manifest changed".into());
             }
             for p in old.keys() {
-                if current.get(p) != trusted.get(p)
-                    && !((!current.contains_key(p) && !files.contains_key(p))
-                        || files
-                            .get(p)
-                            .is_some_and(|b| matches(repo, "HEAD", p, b, &current)))
+                if current.get(p) == trusted.get(p)
+                    || (!current.contains_key(p) && !files.contains_key(p))
                 {
-                    return Err("Public managed files changed; import first".into());
+                    continue;
                 }
+                if files
+                    .get(p)
+                    .is_some_and(|data| matches(repo, "HEAD", p, data, &current))
+                {
+                    continue;
+                }
+                let commits = text(repo, &["rev-list", &format!("{prev}..HEAD"), "--", p])?;
+                let missing: Vec<_> = commits
+                    .lines()
+                    .filter(|commit| !imported.contains(*commit))
+                    .map(|commit| &commit[..12])
+                    .collect();
+                if !commits.is_empty() && missing.is_empty() {
+                    continue;
+                }
+                if let (Some(data), Some(public)) = (files.get(p), current.get(p)) {
+                    let base = trusted.get(p).ok_or("Invalid trusted manifest")?;
+                    if contained(repo, base, public, data).map_err(|error| {
+                        format!("Could not compare the public edit of {p}: {error}")
+                    })? {
+                        continue;
+                    }
+                }
+                return Err(format!(
+                    "Public managed file changed; import it, then record its public commits in \
+                     {IMPORTED}: {p} ({})",
+                    missing.join(", ")
+                )
+                .into());
             }
         } else {
             if exact {
@@ -561,14 +649,14 @@ fn rust_checks(validation: &Path, state: &Path, cargo: &Path) -> Result<()> {
             .env("CARGO_TARGET_DIR", validation.join("target"));
         let result = command(cmd, deadline.saturating_duration_since(Instant::now()));
         match result {
-            Ok((ok, out, err)) => {
+            Ok((status, out, err)) => {
                 log.extend(out);
                 log.extend(err);
                 fs::write(
                     state.join("candidate-rust-tests.log"),
                     &log[log.len().saturating_sub(65536)..],
                 )?;
-                if !ok {
+                if !status.success() {
                     return Err("Public candidate Rust checks failed".into());
                 }
             }
@@ -660,6 +748,7 @@ fn execute_with_checks(
         &repo,
         &files,
         state.as_ref().map(|s| s.public_commit.as_str()),
+        &imported(&c.source_repo, &revision)?,
     )?;
     let mut result = ExportResult {
         changed,
@@ -686,7 +775,7 @@ fn execute_with_checks(
             .current_dir(&validation)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("UV_OFFLINE", "1");
-        let (ok, mut out, err) = match command(cmd, Duration::from_secs(600)) {
+        let (status, mut out, err) = match command(cmd, Duration::from_secs(600)) {
             Ok(result) => result,
             Err(error) => {
                 // Replace diagnostics from an older successful attempt even when
@@ -703,7 +792,7 @@ fn execute_with_checks(
             c.state_dir.join("candidate-tests.log"),
             &out[out.len().saturating_sub(65536)..],
         )?;
-        if !ok {
+        if !status.success() {
             return Err("Public candidate tests failed".into());
         }
         if files.contains_key("Cargo.toml") {

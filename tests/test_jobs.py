@@ -22,6 +22,13 @@ jobs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(jobs)
 
 
+def outcomes(stages):
+    """Stage results without their durations, after checking that each has one."""
+    for stage in stages.values():
+        assert type(stage['seconds']) in (int, float) and stage['seconds'] >= 0, stage
+    return {name: {key: value for key, value in stage.items() if key != 'seconds'} for name, stage in stages.items()}
+
+
 class WeeklyCadenceTests(unittest.TestCase):
     def test_monday_deadline_boundaries_and_timezone(self):
         cases = (
@@ -104,7 +111,7 @@ if sys.argv[1:] == ['--help']:
     record(kind='help')
     missing = root / 'missing-flag'
     flags = [flag for flag in ('--print', '--no-session-persistence', '--model', '--effort', '--permission-mode',
-                               '--output-format', '--verbose', '--json-schema', '--tools')
+                               '--settings', '--output-format', '--verbose', '--json-schema', '--tools')
              if not missing.exists() or flag != missing.read_text()]
     print('Usage: claude [options] [prompt]\\n\\nOptions:\\n' + '\\n'.join('  ' + flag + ' <value>  Fixture option' for flag in flags))
     sys.exit(0)
@@ -124,9 +131,12 @@ elif not (root / 'missing-report').exists():
     emit({{'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'Verified review report.'}})
 ''')
         self.claude.chmod(0o755)
+        self.sandbox = self.root.resolve() / 'sandbox.json'
+        self.sandbox.write_text(json.dumps({'sandbox': {'enabled': True, 'failIfUnavailable': True,
+                                                        'allowUnsandboxedCommands': False}}))
         self.config = self.state / 'config.json'
         self.config.write_text(json.dumps({'repo_path': str(self.repo), 'host_id': 'maintainer-host',
-            'install_root': str(self.root / 'install'),
+            'install_root': str(self.root / 'install'), 'review_settings': str(self.sandbox),
             'python_path': sys.executable, 'uv_path': sys.executable, 'claude_path': str(self.claude),
             'role': 'maintainer'}))
         for command in (['init', '-b', 'main'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'fixture']):
@@ -203,7 +213,7 @@ elif not (root / 'missing-report').exists():
         improved.assert_called_once()
         self.assertEqual(self.trace.read_text().splitlines().count('deploy'), 1)
         status = json.loads((self.state / 'weekly-status.json').read_text())
-        self.assertEqual(status['stages']['prompt_review'], {'success': True})
+        self.assertEqual(outcomes(status['stages'])['prompt_review'], {'success': True})
         self.assertNotIn('prompt_deploy', status['stages'])
         self.assertIn('completed_due', self.state_data())
 
@@ -214,7 +224,7 @@ elif not (root / 'missing-report').exists():
                 patch.object(jobs, 'review_prompts', side_effect=RuntimeError('private candidate text')):
             self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 13, 3, tzinfo=timezone.utc)), 1)
         status = json.loads((self.state / 'weekly-status.json').read_text())
-        self.assertEqual(status['stages']['deploy'], {'success': True})
+        self.assertEqual(outcomes(status['stages'])['deploy'], {'success': True})
         self.assertFalse(status['stages']['prompt_review']['success'])
         self.assertNotIn('prompt_deploy', status['stages'])
         self.assertNotIn('private candidate', json.dumps(status))
@@ -231,7 +241,7 @@ elif not (root / 'missing-report').exists():
                 self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 13, 3, tzinfo=timezone.utc)), 0)
                 self.assertEqual(self.trace.read_text().splitlines()[-2:], ['deploy', 'deploy'])
                 status = json.loads((self.state / 'weekly-status.json').read_text())
-                self.assertEqual(status['stages']['prompt_deploy'], {'success': True})
+                self.assertEqual(outcomes(status['stages'])['prompt_deploy'], {'success': True})
                 self.trace.unlink()
 
     def test_prompt_deployment_failure_retries_activation(self):
@@ -339,7 +349,7 @@ elif not (root / 'missing-report').exists():
         self.assertEqual(jobs.execute(self.args, tuesday), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'collect', 'claude', 'publish', 'deploy'])
         status = json.loads((self.state / 'weekly-status.json').read_text())
-        self.assertEqual(status['stages'], {name: {'success': True} for name in
+        self.assertEqual(outcomes(status['stages']), {name: {'success': True} for name in
                          ('capture', 'evidence', 'upload', 'collect', 'review', 'publish', 'deploy')})
         self.assertNotIn('error', status)
         self.assertEqual(self.state_data()['completed_due'], '2026-10-12T09:00:00+09:00')
@@ -372,7 +382,7 @@ elif not (root / 'missing-report').exists():
         lines = self.calls.read_text().splitlines() if self.calls.exists() else []
         return [call for call in map(json.loads, lines) if call['kind'] == kind]
 
-    def test_review_runs_claude_with_full_access_and_publishes_result(self):
+    def test_review_runs_claude_in_its_sandbox_and_publishes_result(self):
         self.initialize()
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)
         with patch.dict(os.environ, {'CLAUDECODE': '1', 'CLAUDE_CODE_ENTRYPOINT': 'cli'}):
@@ -390,11 +400,14 @@ elif not (root / 'missing-report').exists():
         self.assertEqual(argv[argv.index('--model') + 1], 'claude-opus-5-5')
         self.assertEqual(argv[argv.index('--effort') + 1], 'high')
         self.assertEqual(argv[argv.index('--output-format') + 1], 'stream-json')
+        self.assertEqual(argv[argv.index('--settings') + 1], str(self.sandbox))
         self.assertNotIn('--setting-sources', argv)
         self.assertEqual(os.path.realpath(call['cwd']), os.path.realpath(self.repo))
         self.assertNotIn('CLAUDECODE', call['env'])
         self.assertNotIn('CLAUDE_CODE_ENTRYPOINT', call['env'])
         self.assertEqual(call['env']['CLAUDE_CODE_DISABLE_AUTO_MEMORY'], '1')
+        # The long review keeps the 1-hour cache that the one-shot calls give up.
+        self.assertNotIn('CLAUDE_CODE_PROMPT_CACHE_TTL', call['env'])
         self.assertEqual(call['env']['PATH'].split(os.pathsep)[2], str(self.claude.parent))
         self.assertEqual((self.state / 'latest-weekly-report.md').read_text(), 'Verified review report.')
         log = (self.state / 'weekly.log').read_text()
@@ -409,7 +422,7 @@ elif not (root / 'missing-report').exists():
         env = dict(os.environ, SKILL_INVESTIGATION_CYCLE='/cycle', SKILL_INVESTIGATION_CONFIG='/config',
                    CLAUDECODE='1')
         with (self.root / 'review.log').open('a') as log:
-            jobs.review(self.claude, work, self.state, 'Review evidence only.', log, env, 30)
+            jobs.review(self.claude, work, self.state, 'Review evidence only.', log, env, 30, self.sandbox)
         [call] = self.calls_of('review')
         self.assertEqual(os.path.realpath(call['cwd']), os.path.realpath(work))
         self.assertEqual(call['env']['SKILL_INVESTIGATION_CYCLE'], '/cycle')
@@ -420,7 +433,8 @@ elif not (root / 'missing-report').exists():
     def test_long_event_stream_still_yields_final_report(self):
         (self.root / 'long-stream').touch()
         with (self.root / 'review.log').open('a') as log:
-            jobs.review(self.claude, self.repo, self.state, 'Review evidence only.', log, dict(os.environ), 30)
+            jobs.review(self.claude, self.repo, self.state, 'Review evidence only.', log, dict(os.environ), 30,
+                        self.sandbox)
         self.assertGreater((self.root / 'review.log').stat().st_size, 1000000)
         self.assertEqual((self.state / 'latest-weekly-report.md').read_text(), 'Verified review report.')
 
@@ -441,6 +455,68 @@ elif not (root / 'missing-report').exists():
                 self.assertEqual(list(self.state.glob('.weekly-review-*')), [])
                 (self.root / marker).unlink()
                 self.trace.unlink()
+
+    def test_timed_out_command_with_an_unreaped_group_still_reports_the_timeout(self):
+        real = os.killpg
+        def killpg(pid, sig):
+            if sig == signal.SIGKILL:
+                raise PermissionError(1, 'Operation not permitted')
+            real(pid, sig)
+        with (self.root / 'run.log').open('w') as log, patch.object(jobs.os, 'killpg', side_effect=killpg):
+            with self.assertRaisesRegex(RuntimeError, 'Command timed out'):
+                jobs.run([sys.executable, '-c', 'import time; time.sleep(30)'], log, dict(os.environ), timeout=.5)
+
+    def test_review_settings_must_enforce_the_sandbox(self):
+        valid = {'enabled': True, 'failIfUnavailable': True, 'allowUnsandboxedCommands': False}
+        self.assertEqual(jobs.review_settings({'review_settings': str(self.sandbox)}), self.sandbox)
+        with patch.object(jobs.claude_cli, 'REVIEW_SETTINGS', self.sandbox):
+            self.assertEqual(jobs.review_settings({}), self.sandbox)
+        for broken in ({**valid, 'enabled': False}, {**valid, 'failIfUnavailable': False},
+                       {**valid, 'allowUnsandboxedCommands': True}, {k: v for k, v in valid.items() if k != 'enabled'}):
+            with self.subTest(broken=broken):
+                self.sandbox.write_text(json.dumps({'sandbox': broken}))
+                with self.assertRaisesRegex(RuntimeError, 'sandbox settings'):
+                    jobs.review_settings({'review_settings': str(self.sandbox)})
+        for exempt in ({**valid, 'excludedCommands': ['bash']}, {**valid, 'enabledPlatforms': ['linux']}):
+            with self.subTest(exempt=exempt):
+                self.sandbox.write_text(json.dumps({'sandbox': exempt}))
+                with self.assertRaisesRegex(RuntimeError, 'sandbox settings'):
+                    jobs.review_settings({'review_settings': str(self.sandbox)})
+        self.sandbox.write_text(json.dumps({'sandbox': {**valid, 'excludedCommands': []}}))
+        user = self.root / 'user-config'
+        user.mkdir()
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(user)}):
+            self.assertEqual(jobs.review_settings({'review_settings': str(self.sandbox)}), self.sandbox.resolve())
+            for inherited in ({'enabled': False}, {'excludedCommands': []}):
+                (user / 'settings.json').write_text(json.dumps({'sandbox': inherited}))
+                self.assertEqual(jobs.review_settings({'review_settings': str(self.sandbox)}), self.sandbox.resolve())
+            for inherited in ('{"sandbox": {"excludedCommands": ["git"]}}', '{"sandbox": {"enabledPlatforms": []}}',
+                              'not json'):
+                with self.subTest(inherited=inherited):
+                    (user / 'settings.json').write_text(inherited)
+                    with self.assertRaisesRegex(RuntimeError, 'sandbox settings'):
+                        jobs.review_settings({'review_settings': str(self.sandbox)})
+        # A relative profile is resolved before the review, which runs in its own checkout, can read another one.
+        with contextlib.chdir(self.root):
+            self.assertEqual(jobs.review_settings({'review_settings': self.sandbox.name}), self.sandbox.resolve())
+        for text in ('not json', '[]', '{"sandbox": true}'):
+            with self.subTest(text=text):
+                self.sandbox.write_text(text)
+                with self.assertRaisesRegex(RuntimeError, 'sandbox settings'):
+                    jobs.review_settings({'review_settings': str(self.sandbox)})
+        with self.assertRaisesRegex(RuntimeError, 'sandbox settings'):
+            jobs.review_settings({'review_settings': str(self.root / 'missing.json')})
+
+    def test_unsandboxed_profile_blocks_review_and_publication(self):
+        self.initialize()
+        report = self.state / 'latest-weekly-report.md'
+        report.write_text('Previous successful report.')
+        self.sandbox.write_text(json.dumps({'sandbox': {'enabled': False}}))
+        self.assertEqual(jobs.execute(self.args, datetime(2026, 10, 13, 3, tzinfo=timezone.utc)), 1)
+        self.assertEqual(self.calls_of('review'), [])
+        self.assertNotIn('publish', self.trace.read_text().splitlines())
+        self.assertEqual(report.read_text(), 'Previous successful report.')
+        self.assertNotIn('completed_due', self.state_data())
 
     def test_missing_required_flag_blocks_review_and_publication(self):
         self.initialize()
@@ -527,7 +603,7 @@ elif not (root / 'missing-report').exists():
         self.assertEqual(jobs.execute(self.args), 0)
         status = json.loads((self.state / 'sync-status.json').read_text())
         self.assertTrue(status['success'])
-        self.assertEqual(status['stages']['capture'], {'success': True})
+        self.assertEqual(outcomes(status['stages'])['capture'], {'success': True})
         self.assertEqual(status['warnings'], ['Claude usage limit reached; 1 turns wait for its reset at 2026-11-05T04:31:00+00:00.'])
         (self.root / 'rate-limited').unlink()
         self.assertEqual(jobs.execute(self.args), 0)
@@ -537,6 +613,33 @@ elif not (root / 'missing-report').exists():
         self.args.command = 'sync'
         self.assertEqual(jobs.execute(self.args), 0)
         self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'deploy'])
+
+    def test_maintainer_sync_proposes_rejected_defaults_after_deploy(self):
+        (self.repo / 'scripts/frontend_avoid.py').write_text('''import pathlib, sys
+root = pathlib.Path(__file__).parents[2]
+with (root / 'trace').open('a') as stream: stream.write('frontend_avoid ' + sys.argv[2] + '\\n')
+if (root / 'fail-frontend').exists(): sys.exit(1)
+''')
+        self.args.command = 'sync'
+        self.assertEqual(jobs.execute(self.args), 0)
+        self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'deploy'])
+        config = json.loads(self.config.read_text())
+        config['frontend_avoid'] = {'repository': 'owner/dotfiles', 'path': 'claude/frontend-avoid.md'}
+        self.config.write_text(json.dumps(config))
+        self.trace.unlink()
+        self.assertEqual(jobs.execute(self.args), 0)
+        self.assertEqual(self.trace.read_text().splitlines(),
+                         ['capture', 'evidence', 'upload', 'deploy', 'frontend_avoid ' + str(self.config.resolve())])
+        (self.root / 'fail-frontend').touch()
+        self.assertEqual(jobs.execute(self.args), 1)
+        status = json.loads((self.state / 'sync-status.json').read_text())
+        self.assertEqual(outcomes(status['stages'])['frontend_avoid'], {'success': False, 'error': 'Rejected-default proposal failed'})
+        self.assertEqual(outcomes(status['stages'])['deploy'], {'success': True})
+        # A client never runs it.
+        self.trace.unlink()
+        self.config.write_text(json.dumps({**config, 'role': 'client', 'host_id': 'client-host'}))
+        self.assertEqual(jobs.execute(self.args), 0)
+        self.assertNotIn('frontend_avoid', self.trace.read_text())
 
     def test_capture_failure_still_transports_buffer_and_deploys(self):
         self.args.command = 'sync'
@@ -554,7 +657,7 @@ elif not (root / 'missing-report').exists():
         self.assertEqual(jobs.execute(self.args), 1)
         self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'deploy'])
         status = json.loads((self.state / 'sync-status.json').read_text())
-        self.assertEqual(status['stages'], {
+        self.assertEqual(outcomes(status['stages']), {
             'capture': {'success': False, 'error': 'Feedback capture failed'},
             'evidence': {'success': False, 'error': 'Source feedback verification failed'},
             'upload': {'success': True}, 'deploy': {'success': True}})
@@ -572,8 +675,8 @@ elif not (root / 'missing-report').exists():
                 self.assertEqual(self.trace.read_text().splitlines(), expected)
                 status = json.loads((self.state / 'sync-status.json').read_text())
                 self.assertEqual(status['error'], 'Feedback capture failed; ' + message)
-                self.assertEqual(status['stages'][name], {'success': False, 'error': message})
-                self.assertEqual(status['stages']['capture']['success'], False)
+                self.assertEqual(outcomes(status['stages'])[name], {'success': False, 'error': message})
+                self.assertEqual(outcomes(status['stages'])['capture']['success'], False)
                 (self.root / ('fail-' + name)).unlink()
                 self.trace.unlink()
 
@@ -737,7 +840,7 @@ class LearningTransactionTests(unittest.TestCase):
                 (self.root / 'transaction.log').open('a') as log:
             return jobs.review_learning_cycle(config, self.state, jobs.latest_due(datetime.now(timezone.utc)), log, dict(os.environ), 30)
 
-    def accepted_review(self, cli, work, state, prompt, log, env, timeout):
+    def accepted_review(self, cli, work, state, prompt, log, env, timeout, settings):
         self.assertEqual(Path(env['SKILL_INVESTIGATION_CONFIG']).parent, self.state.resolve())
         self.assertIn('SKILL_INVESTIGATION_CYCLE', prompt)
         (work / 'skills/frontend-ui').mkdir(parents=True, exist_ok=True)
@@ -782,8 +885,20 @@ class LearningTransactionTests(unittest.TestCase):
         self.assertNotIn('deploy', self.trace.read_text().splitlines())
         self.assertEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
 
+    def test_weekly_warns_when_investigation_checkouts_remain(self):
+        (self.repo / 'scripts/investigations.py').write_text('# available learning runner\n')
+        self.commit_at(self.repo)
+        self.args.run_now = True
+        summary = {'complete': True, 'open': 0, 'attempts_cleanup_failed': ['old: CalledProcessError']}
+        with patch.object(jobs, 'review_learning_cycle', return_value=summary):
+            self.assertEqual(jobs.execute(self.args), 0)
+        status = json.loads((self.state / 'weekly-status.json').read_text())
+        self.assertTrue(status['success'])
+        self.assertEqual(status['investigations']['attempts_cleanup_failed'], ['old: CalledProcessError'])
+        self.assertEqual(status['warnings'], ['Investigation checkouts were not all removed; see investigations in weekly status'])
+
     def test_advanced_canonical_archives_attempt_without_copying_its_edits(self):
-        def crash(cli, work, state, prompt, log, env, timeout):
+        def crash(cli, work, state, prompt, log, env, timeout, settings):
             (work / 'owned-draft').write_text('old baseline experiment')
             raise RuntimeError('review interrupted')
         with self.assertRaises(RuntimeError):
@@ -791,43 +906,122 @@ class LearningTransactionTests(unittest.TestCase):
         saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
         (self.repo / 'user-commit').write_text('new canonical baseline')
         self.commit_at(self.repo)
-        def fresh(cli, work, state, prompt, log, env, timeout):
+        def fresh(cli, work, state, prompt, log, env, timeout, settings):
             self.assertNotEqual(work, Path(saved['work']))
             self.assertFalse((work / 'owned-draft').exists())
             self.assertIn('read-only recovery context', prompt)
-            self.accepted_review(cli, work, state, prompt, log, env, timeout)
-        self.transaction(fresh)
+            self.accepted_review(cli, work, state, prompt, log, env, timeout, settings)
+        result = self.transaction(fresh)
         self.assertEqual((Path(saved['work']) / 'owned-draft').read_text(), 'old baseline experiment')
         self.assertEqual(json.loads((Path(saved['work']).parent / 'attempt.json').read_text())['status'], 'superseded')
+        self.assertEqual(result['attempts_kept'], [Path(saved['work']).parent.name])
+        self.assertNotIn('attempts_cleanup_failed', result)
+        self.assertTrue(Path(saved['config']).exists())
+
+    def supersede(self, crash):
+        with self.assertRaises(RuntimeError):
+            self.transaction(crash)
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        (self.repo / ('user-commit-' + Path(saved['work']).parent.name)).write_text('new canonical baseline')
+        self.commit_at(self.repo)
+        return saved
+
+    def interrupted(self, cli, work, state, prompt, log, env, timeout, settings):
+        raise RuntimeError('review interrupted')
+
+    def assert_kept(self, saved, result):
+        self.assertEqual(result['attempts_kept'], [Path(saved['work']).parent.name])
+        self.assertTrue(Path(saved['config']).exists())
+        self.assertIn(saved['work'], self.git_at(self.repo, 'worktree', 'list', '--porcelain'))
+
+    def test_superseded_attempt_with_unmerged_commit_is_kept(self):
+        def crash(cli, work, state, prompt, log, env, timeout, settings):
+            (work / 'committed-draft').write_text('failed experiment committed')
+            self.commit_at(work)
+            raise RuntimeError('review interrupted')
+        saved = self.supersede(crash)
+        result = self.transaction(self.accepted_review)
+        self.assert_kept(saved, result)
+        self.assertEqual((Path(saved['work']) / 'committed-draft').read_text(), 'failed experiment committed')
+
+    def test_superseded_attempt_with_reflog_only_commit_is_kept(self):
+        def crash(cli, work, state, prompt, log, env, timeout, settings):
+            base = self.git_at(work, 'rev-parse', 'HEAD')
+            (work / 'committed-draft').write_text('experiment later reset away')
+            self.commit_at(work)
+            self.git_at(work, 'reset', '--hard', base)
+            raise RuntimeError('review interrupted')
+        saved = self.supersede(crash)
+        self.assert_kept(saved, self.transaction(self.accepted_review))
+
+    def test_ignored_build_output_does_not_keep_a_superseded_checkout(self):
+        saved = self.supersede(self.interrupted)
+        (self.repo / '.gitignore').write_text('target/\n')
+        self.commit_at(self.repo)
+        self.git_at(Path(saved['work']), 'checkout', '--detach', self.git_at(self.repo, 'rev-parse', 'HEAD'))
+        (Path(saved['work']) / 'target').mkdir()
+        (Path(saved['work']) / 'target/cache').write_text('build output')
+        result = self.transaction(self.accepted_review)
+        self.assertNotIn('attempts_kept', result)
+        self.assertFalse(Path(saved['work']).exists())
+
+    def test_one_unreadable_attempt_does_not_stop_retiring_the_others(self):
+        first = self.supersede(self.interrupted)
+        second = self.supersede(self.interrupted)
+        (Path(first['work']).parent / 'attempt.json').write_text('null')
+        result = self.transaction(self.accepted_review)
+        self.assertEqual(result['attempts_cleanup_failed'], [Path(first['work']).parent.name + ': ValueError'])
+        self.assertTrue(Path(first['work']).exists())
+        self.assertFalse(Path(second['work']).exists())
+        self.assertFalse(Path(second['config']).exists())
+
+    def test_validated_attempt_left_behind_is_retired_by_the_next_one(self):
+        self.transaction(self.accepted_review)
+        folder = self.state / 'investigations/attempts/leftover'
+        folder.mkdir()
+        self.git_at(self.repo, 'worktree', 'add', '--detach', str(folder / 'work'), 'HEAD')
+        config = self.state / 'investigation-leftover-config.json'
+        config.write_text('{}')
+        (folder / 'attempt.json').write_text(json.dumps({'status': 'validated', 'work': str(folder / 'work'),
+                                                         'config': str(config), 'cleanup_pending': 'locked'}))
+        def second_review(cli, work, state, prompt, log, env, timeout, settings):
+            (work / 'skills/frontend-ui/guide.md').write_text('Second reviewed guidance')
+            self.commit_at(work)
+            (state / 'latest-weekly-report.md').write_text('Validated learning report')
+        result = self.transaction(second_review)
+        self.assertNotIn('attempts_cleanup_failed', result)
+        self.assertFalse((folder / 'work').exists())
+        self.assertFalse(config.exists())
+        self.assertEqual(len(self.git_at(self.repo, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
 
     def test_crashed_dirty_attempt_resumes_without_resetting_evidence(self):
-        def crash(cli, work, state, prompt, log, env, timeout):
+        def crash(cli, work, state, prompt, log, env, timeout, settings):
             (work / 'owned-draft').write_text('preserve failed experiment')
             raise RuntimeError('review interrupted')
         with self.assertRaisesRegex(RuntimeError, 'interrupted'):
             self.transaction(crash)
         saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
         work = Path(saved['work'])
-        def resume(cli, resumed, state, prompt, log, env, timeout):
+        def resume(cli, resumed, state, prompt, log, env, timeout, settings):
             self.assertEqual(resumed, work)
             self.assertEqual((resumed / 'owned-draft').read_text(), 'preserve failed experiment')
             (resumed / 'owned-draft').unlink()
-            self.accepted_review(cli, resumed, state, prompt, log, env, timeout)
+            self.accepted_review(cli, resumed, state, prompt, log, env, timeout, settings)
         self.transaction(resume)
         self.assertTrue((self.repo / 'skills/frontend-ui/guide.md').exists())
 
     def test_changed_cycle_evidence_preserves_old_draft_and_starts_clean(self):
         import investigations
-        def crash(cli, work, state, prompt, log, env, timeout):
+        def crash(cli, work, state, prompt, log, env, timeout, settings):
             (work / 'owned-draft').write_text('failed-cycle evidence')
             raise RuntimeError('review interrupted')
         with self.assertRaises(RuntimeError): self.transaction(crash)
         saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
         binding = {'skill': 'frontend-ui', 'note_sha256': 'a'*64, 'receipt_sha256': 'b'*64, 'source_machine': 'client-host'}
-        def fresh(cli, work, state, prompt, log, env, timeout):
+        def fresh(cli, work, state, prompt, log, env, timeout, settings):
             self.assertNotEqual(work, Path(saved['work']))
             self.assertFalse((work / 'owned-draft').exists())
-            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+            self.accepted_review(cli, work, state, prompt, log, env, timeout, settings)
         with patch.object(investigations, 'bindings', return_value=[binding]): self.transaction(fresh)
         self.assertEqual((Path(saved['work'])/'owned-draft').read_text(), 'failed-cycle evidence')
 
@@ -840,8 +1034,14 @@ class LearningTransactionTests(unittest.TestCase):
         def read_cycle(path):
             if str(path) == saved['cycle']: raise ValueError('Investigation runner changed')
             return original(path)
-        with patch.object(investigations, 'cycle_data', side_effect=read_cycle): self.transaction(self.accepted_review)
+        with patch.object(investigations, 'cycle_data', side_effect=read_cycle): result = self.transaction(self.accepted_review)
         self.assertEqual(json.loads((Path(saved['work']).parent/'attempt.json').read_text())['status'], 'superseded')
+        # The clean superseded attempt held no evidence, so the validated retry retires it.
+        self.assertFalse(Path(saved['work']).exists())
+        self.assertFalse(Path(saved['config']).exists())
+        self.assertNotIn('attempts_kept', result)
+        self.assertNotIn('attempts_cleanup_failed', result)
+        self.assertEqual(len(self.git_at(self.repo, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
 
     def test_failed_preparation_retains_a_retryable_attempt(self):
         import investigations
@@ -852,14 +1052,14 @@ class LearningTransactionTests(unittest.TestCase):
         self.assertIsNone(saved['cycle'])
         self.assertEqual(saved['status'], 'failed')
         self.assertEqual(saved['failure']['detail'], 'invalid source evidence')
-        def resume(cli, work, state, prompt, log, env, timeout):
+        def resume(cli, work, state, prompt, log, env, timeout, settings):
             self.assertEqual(work, Path(saved['work']))
-            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+            self.accepted_review(cli, work, state, prompt, log, env, timeout, settings)
         self.transaction(resume)
 
     def test_concurrent_canonical_edits_are_preserved(self):
-        def edit(cli, work, state, prompt, log, env, timeout):
-            self.accepted_review(cli, work, state, prompt, log, env, timeout)
+        def edit(cli, work, state, prompt, log, env, timeout, settings):
+            self.accepted_review(cli, work, state, prompt, log, env, timeout, settings)
             (self.repo / 'user-work').write_text('never overwrite')
         with self.assertRaisesRegex(RuntimeError, 'Canonical checkout changed'):
             self.transaction(edit)
@@ -869,7 +1069,7 @@ class LearningTransactionTests(unittest.TestCase):
     def test_scope_rejection_never_advances_canonical(self):
         import sync
         before = self.git_at(self.repo, 'rev-parse', 'HEAD')
-        def forbidden(cli, work, state, prompt, log, env, timeout):
+        def forbidden(cli, work, state, prompt, log, env, timeout, settings):
             (work / 'maintenance-prompt.md').write_text('forbidden automatic authority change')
             self.commit_at(work)
             (state / 'latest-weekly-report.md').write_text('Unsupported claim')

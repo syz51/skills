@@ -33,14 +33,15 @@ class ClaudeCliTests(unittest.TestCase):
         self.assertNotIn('--permission-mode', command)
 
     def test_review_command_keeps_user_configuration_without_prompts(self):
-        command = cli.review_command('/bin/claude')
+        command = cli.review_command('/bin/claude', '/p/sandbox.json')
         self.assertEqual(command[command.index('--permission-mode') + 1], 'bypassPermissions')
+        self.assertEqual(command[command.index('--settings') + 1], '/p/sandbox.json')
         self.assertEqual(command[command.index('--model') + 1], cli.REVIEW_MODEL)
         self.assertNotIn('--setting-sources', command)
 
     def test_every_required_flag_is_in_the_commands_it_guards(self):
         restricted = cli.restricted_command('c', SCHEMA)
-        review = cli.review_command('c')
+        review = cli.review_command('c', 's')
         self.assertEqual([flag for flag in cli.RESTRICTED_FLAGS if flag not in restricted], [])
         self.assertEqual([flag for flag in cli.REVIEW_FLAGS if flag not in review], [])
 
@@ -57,7 +58,7 @@ class ClaudeCliTests(unittest.TestCase):
         self.assertEqual(env, {'HOME': '/h', 'CLAUDE_CONFIG_DIR': '/c', 'ANTHROPIC_API_KEY': 'k',
                                'CLAUDE_CODE_OAUTH_TOKEN': 't', 'CLAUDE_CODE_USE_BEDROCK': '1',
                                'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1',
-                               'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1'})
+                               'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC': '1', 'CLAUDE_CODE_PROMPT_CACHE_TTL': '5m'})
 
     def test_cli_path_defaults_to_native_install(self):
         self.assertEqual(cli.cli_path({}), cli.DEFAULT_CLI)

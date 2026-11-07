@@ -2,7 +2,7 @@
 """Check feedback against original turns, preserving linked assessment history."""
 import argparse
 import prompt_runtime
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +14,7 @@ import capture
 import claude_cli
 import read_guidance
 
-from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, RateLimited, FIELDS, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
+from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, RateLimited, FIELDS, ScanCache, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
                      completed_turns, message_context, model_response, safe_path, timestamp, validate_notes)
 
 # Source checks need more room than extraction, which also carries duplicate-note context.
@@ -29,6 +29,14 @@ SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['status'
 PROMPT = prompt_runtime.load('verify', root=prompt_runtime.DEFAULT_ROOT)
 CORRECTION_SCHEMA = {**NOTE_SCHEMA, 'properties': {'notes': {**NOTE_SCHEMA['properties']['notes'], 'maxItems': 1}}}
 CORRECTION_PROMPT = prompt_runtime.load('correct', root=prompt_runtime.DEFAULT_ROOT)
+# A note whose source check settles nothing new (its source is missing or ambiguous, the check failed, or the
+# assessment stays unresolved) waits 1, 2, 4, 8 and 16 hours, then a day, before its next scheduled attempt.
+BACKOFF = 'evidence-backoff.json'
+BACKOFF_REASONS = ('unavailable', 'ambiguous', 'error', 'unresolved')
+MAX_BACKOFF = timedelta(hours=24)
+# Evidence starts after capture, whose budget is 15 minutes, so its hourly start drifts; an entry due within this
+# slack of a run is retried rather than skipped.
+BACKOFF_SLACK = timedelta(minutes=30)
 
 
 def field(note, name):
@@ -282,8 +290,57 @@ def checker_fingerprint(config):
     return digest.hexdigest()
 
 
-def verify(config, state_root, note_sha=None, recheck=False):
+def load_backoff(path, checker_sha, now):
+    """Per-note retry state, keyed by skill and note SHA-256. An entry written by another checker is void, so a
+    changed checker makes every note due again; a changed note has a new key. No wait outlasts the cap, even one
+    saved while the clock ran ahead."""
+    safe_path(path)
+    try:
+        value = json.loads(path.read_text())
+        entries = value['notes'] if value.get('version') == 1 and isinstance(value['notes'], dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        entries = {}
+    valid = {}
+    for key, entry in entries.items():
+        try:
+            if (entry['checker'] == checker_sha and entry['reason'] in BACKOFF_REASONS and type(entry['attempts']) is int
+                    and entry['attempts'] >= 1):
+                valid[key] = {**entry, 'retry_at': min(timestamp(entry['retry_at']), now + MAX_BACKOFF)}
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return valid
+
+
+def stepped_backoff(entry, checker_sha, reason, now):
+    """The next retry after an attempt that settled nothing; a different outcome than last time starts over."""
+    attempts = entry['attempts'] + 1 if entry and entry['reason'] == reason else 1
+    delay = min(MAX_BACKOFF, timedelta(hours=2 ** min(attempts - 1, 5)))
+    return {'checker': checker_sha, 'reason': reason, 'attempts': attempts, 'retry_at': now + delay - BACKOFF_SLACK}
+
+
+def save_backoff(path, entries):
+    atomic(path, json.dumps({'version': 1, 'notes': {key: {**entry, 'retry_at': entry['retry_at'].isoformat()}
+                                                     for key, entry in sorted(entries.items())}}, indent=2) + '\n')
+
+
+def count_outcome(counts, reason, previous):
+    """Count a note whose check settled nothing new, whether it ran now or is waiting for its retry."""
+    if reason == 'error':
+        counts['errors'] += 1
+        counts['pending'] += 1
+        return
+    if reason in ('unavailable', 'ambiguous'):
+        counts['unavailable'] += 1
+        counts['ambiguous'] += reason == 'ambiguous'
+    if previous:
+        count_assessment(counts, previous)
+
+
+def verify(config, state_root, note_sha=None, recheck=False, now=None):
     deadline = time.monotonic() + CYCLE_TIMEOUT
+    now = now or datetime.now(timezone.utc)
     feedback = Path(config.get('feedback_dir', codex_home() / 'skill-feedback'))
     safe_path(feedback)
     targets = []
@@ -294,6 +351,10 @@ def verify(config, state_root, note_sha=None, recheck=False):
               'supported': 0, 'partial': 0, 'unsupported': 0, 'corrected': 0, 'unresolved': 0,
               'recovered': 0, 'ambiguous': 0, 'rate_limited': 0, 'rate_limit': None}
     checker_sha = checker_fingerprint(config)
+    # A requested check runs at once and updates only its own note's schedule.
+    backoff_path = Path(state_root) / BACKOFF
+    backoff = load_backoff(backoff_path, checker_sha, now)
+    schedule = {}
     for skill in SKILLS:
         for path in sorted((feedback / skill / 'notes').glob('*.md')):
             safe_path(path)
@@ -323,13 +384,23 @@ def verify(config, state_root, note_sha=None, recheck=False):
                     continue
             if previous and previous['schema_version'] >= 2 and not recheck and not unresolved(previous):
                 count_assessment(counts, previous)
-            else:
-                targets.append((skill, note, digest, directory, previous_sha, previous))
-                if not previous and (not field(note, 'Thread') or not field(note, 'Turn')):
-                    recovery_notes[digest] = {'skill': skill, 'name': path.name, 'text': note}
+                continue
+            key = skill + '/' + digest
+            entry = backoff.get(key)
+            if entry and entry['retry_at'] > now and not note_sha:
+                schedule[key] = entry
+                count_outcome(counts, entry['reason'], previous)
+                continue
+            targets.append((skill, note, digest, directory, previous_sha, previous))
+            if not previous and (not field(note, 'Thread') or not field(note, 'Turn')):
+                recovery_notes[digest] = {'skill': skill, 'name': path.name, 'text': note}
     if note_sha and not found:
         raise ValueError('Requested source note is unavailable on this host')
+    if note_sha:
+        # Other notes keep their entries; the requested note's entry is whatever this check leaves.
+        schedule = {**{key: entry for key, entry in backoff.items() if not key.endswith('/' + note_sha)}, **schedule}
     if not targets:
+        save_backoff(backoff_path, schedule)
         return counts
     # A check requested for one note is attempted at once; scheduled checks wait for a usage limit's reset.
     limit, wait = None, not note_sha
@@ -344,17 +415,30 @@ def verify(config, state_root, note_sha=None, recheck=False):
         except (ValueError, AttributeError):
             pass
     since = min(dates)
+    # Matching a note without a recorded turn needs the note writes a full read finds; otherwise every unchanged
+    # transcript is answered from the stored scan.
+    cache = None if recovery_notes else ScanCache(Path(state_root) / 'evidence-scan.json', complete=True)
     turns = completed_turns([*sessions.rglob('*.jsonl'), *archived.rglob('*.jsonl')], since, errors,
-                            eligible_only=False, source_notes=recovery_notes)
+                            eligible_only=False, source_notes=recovery_notes, cache=cache)
     turns += claude_turns(claude_projects(config).rglob('*.jsonl'), since, errors,
-                          eligible_only=False, source_notes=recovery_notes)
+                          eligible_only=False, source_notes=recovery_notes, cache=cache)
+    if cache:
+        cache.save()
     by_id = {(turn['thread'], turn['turn']): turn for turn in turns}
     by_evidence = {turn['evidence_id']: turn for turn in turns}
-    counts['errors'] = len(errors)
+    counts['errors'] += len(errors)
     by_thread = {}
     for item in turns:
         by_thread.setdefault(item['thread'], []).append(item)
     for skill, note, digest, directory, previous_sha, previous in targets:
+        key = skill + '/' + digest
+
+        def settled(reason):
+            schedule[key] = stepped_backoff(backoff.get(key), checker_sha, reason, now)
+
+        def deferred():
+            if key in backoff:
+                schedule[key] = backoff[key]
         thread = field(note, 'Thread') or (previous['thread'] if previous else '')
         turn_id = field(note, 'Turn') or (previous['turn'] if previous else '')
         recovered = False
@@ -369,12 +453,10 @@ def verify(config, state_root, note_sha=None, recheck=False):
                           (not thread or item['thread'] == thread) and (not turn_id or item['turn'] == turn_id)]
             if len(candidates) == 1:
                 turn, recovered = candidates[0], True
-            elif len(candidates) > 1:
-                counts['ambiguous'] += 1
         if not turn:
-            counts['unavailable'] += 1
-            if previous:
-                count_assessment(counts, previous)
+            reason = 'ambiguous' if digest in recovery_notes and len(candidates) > 1 else 'unavailable'
+            settled(reason)
+            count_outcome(counts, reason, previous)
             continue
         follow_ups = sorted((item for item in by_thread[turn['thread']] if item['turn'] != turn['turn'] and
                             timestamp(item['completed_at']) > timestamp(turn['completed_at'])),
@@ -383,9 +465,11 @@ def verify(config, state_root, note_sha=None, recheck=False):
         fingerprint = evidence_fingerprint(turn)
         if (previous and not recheck and previous.get('checkerSha256') == checker_sha and
                 previous.get('evidenceSha256') == fingerprint):
+            settled('unresolved')
             count_assessment(counts, previous)
             continue
         if counts['checked'] >= 10 or time.monotonic() >= deadline:
+            deferred()
             counts['pending'] += 1
             continue
         try:
@@ -408,23 +492,28 @@ def verify(config, state_root, note_sha=None, recheck=False):
             counts['checked'] += 1
             counts['recovered'] += int(recovered)
             count_assessment(counts, value)
+            if unresolved(value):
+                settled('unresolved')
         except CaptureBudgetExpired:
+            deferred()
             counts['pending'] += 1
         except RateLimited as error:
+            deferred()
             limit, wait = error.limit, True
             counts['pending'] += 1
             counts['rate_limited'] += 1
             # A requested check that could not run is a failure of that request.
             counts['errors'] += int(bool(note_sha))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            counts['errors'] += 1
-            counts['pending'] += 1
+            settled('error')
+            count_outcome(counts, 'error', None)
             if isinstance(error, ExtractorFailure) and len(counts.get('extractor_diagnostics', [])) < 10:
                 counts.setdefault('extractor_diagnostics', []).append(error.diagnostics)
     if counts['rate_limited']:
         counts['rate_limit'] = capture.rate_limit_summary(limit, counts['rate_limited'], datetime.now(timezone.utc))
         if counts['rate_limit']['overdue'] and not note_sha:
             counts['errors'] += counts['rate_limited']
+    save_backoff(backoff_path, schedule)
     return counts
 
 
@@ -454,6 +543,7 @@ def main():
                                + counts['rate_limit']['retry_at'] + '.')
         else:
             capture.report_rate_limit(status, counts['rate_limit'], 'source checks')
+        capture.report_api_fallback(status, config, root)
         atomic(root / 'evidence-status.json', json.dumps(status, indent=2) + '\n')
         print(json.dumps(status))
         return 0 if status['success'] else 1

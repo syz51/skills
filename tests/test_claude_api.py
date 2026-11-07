@@ -302,7 +302,8 @@ class ApiBackendTests(unittest.TestCase):
             with self.assertRaises(capture.ExtractorFailure) as caught:
                 capture.model_response(self.config, self.state, 'p', '{}', {'type': 'object'})
         self.assertEqual((run.call_count, caught.exception.reason), (2, 'extractor connection failure'))
-        for category, reason in (('billing', 'extractor billing failure'), ('refusal', 'extractor refusal failure')):
+        # Billing and authentication fall back to the subscription (ApiFallbackTests); other failures stand.
+        for category, reason in (('refusal', 'extractor refusal failure'), ('invalid request', 'extractor invalid request failure')):
             failed = self.completed({'type': 'error', 'category': category, 'status': None}, 1)
             with self.subTest(category=category), patch.object(capture, 'run_extractor', return_value=failed), \
                     patch.object(capture.sys, 'stderr', io.StringIO()):
@@ -310,6 +311,204 @@ class ApiBackendTests(unittest.TestCase):
                     capture.model_response(self.config, self.state, 'p', '{}', {'type': 'object'})
                 self.assertEqual(caught.exception.reason, reason)
                 self.assertNotIsInstance(caught.exception, capture.RateLimited)
+                self.assertFalse(capture.api_fallback_path(self.state).exists())
+
+
+def cli_answer(output):
+    """A restricted CLI run that answered through StructuredOutput."""
+    events = [{'type': 'system', 'subtype': 'init', 'tools': ['StructuredOutput'], 'mcp_servers': []},
+              {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'StructuredOutput', 'input': output}]}},
+              {'type': 'result', 'subtype': 'success', 'is_error': False, 'structured_output': output}]
+    return capture.subprocess.CompletedProcess([], 0, ''.join(json.dumps(event) + '\n' for event in events), '')
+
+
+class ApiFallbackTests(unittest.TestCase):
+    """An exhausted API balance or rejected key falls back to the CLI's subscription and stays there."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+        self.key = self.state / 'key'
+        self.key.write_text('sk-ant-secret\n')
+        self.key.chmod(0o600)
+        (self.state / 'uv').write_text('')
+        self.config = {'api_key_file': str(self.key), 'uv_path': str(self.state / 'uv'),
+                       'claude_path': str(self.state / 'claude')}
+        self.calls = []
+        self.api_answer = {'type': 'error', 'category': 'billing', 'status': 400}
+        patcher = patch.object(capture, 'verify_cli')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_extractor(self, command, **kwargs):
+        api = command[0] == str(self.state / 'uv')
+        self.calls.append('api' if api else 'cli')
+        if api:
+            code = 1 if self.api_answer.get('type') == 'error' else 0
+            return capture.subprocess.CompletedProcess([], code, json.dumps(self.api_answer) + '\n', '')
+        self.assertNotIn('sk-ant-secret', json.dumps(kwargs['env']))
+        return cli_answer({'from': 'cli'})
+
+    def call(self):
+        with patch.object(capture, 'run_extractor', side_effect=self.run_extractor), \
+                patch.object(capture.sys, 'stderr', io.StringIO()) as log:
+            output = capture.model_response(self.config, self.state, 'p', '{}', {'type': 'object'}, role='verify')
+        return output, [json.loads(line) for line in log.getvalue().splitlines()]
+
+    def test_billing_falls_back_and_sticks_until_the_key_changes(self):
+        started = datetime.now(timezone.utc)
+        output, log = self.call()
+        self.assertEqual((output, self.calls), ({'from': 'cli'}, ['api', 'cli']))
+        record = capture.read_api_fallback(self.state)
+        stat = self.key.lstat()
+        self.assertEqual((record['reason'], record['key']), ('billing', f'{stat.st_ino}-{stat.st_size}-{stat.st_mtime_ns}'))
+        since = capture.timestamp(record['since'])
+        self.assertLessEqual(abs((since - started).total_seconds()), 2)
+        self.assertEqual(capture.timestamp(record['retry_at']) - since, capture.API_RETRY)
+        self.assertIn({'event': 'api_fallback', 'reason': 'billing', 'retry_at': record['retry_at']}, log)
+        self.assertEqual(capture.model_backend(self.config, self.state), 'cli')
+
+        # While the record stands, calls go straight to the subscription.
+        self.call()
+        self.assertEqual(self.calls, ['api', 'cli', 'cli'])
+
+        # A changed key file retries the API at once; a repeat failure keeps the first `since`.
+        self.key.write_text('sk-ant-other-secret\n')
+        self.call()
+        self.assertEqual(self.calls, ['api', 'cli', 'cli', 'api', 'cli'])
+        self.assertEqual(capture.read_api_fallback(self.state)['since'], record['since'])
+
+    def test_the_daily_retry_or_an_unreadable_record_tries_the_api_and_success_clears_it(self):
+        self.call()
+        record = capture.read_api_fallback(self.state)
+        record['retry_at'] = (datetime.now(timezone.utc) - capture.timedelta(minutes=1)).isoformat(timespec='seconds')
+        capture.api_fallback_path(self.state).write_text(json.dumps(record))
+        self.call()
+        self.assertEqual(self.calls, ['api', 'cli', 'api', 'cli'])
+        capture.api_fallback_path(self.state).write_text('not json')
+        self.assertIsNone(capture.read_api_fallback(self.state))
+        self.api_answer = {'type': 'result', 'structured_output': {'from': 'api'}}
+        output, _ = self.call()
+        self.assertEqual((output, self.calls[-1]), ({'from': 'api'}, 'api'))
+        self.assertFalse(capture.api_fallback_path(self.state).exists())
+        self.assertEqual(capture.model_backend(self.config, self.state), 'api')
+
+    def test_authentication_falls_back_but_rate_limits_and_other_failures_do_not(self):
+        self.api_answer = {'type': 'error', 'category': 'authentication', 'status': 401}
+        self.assertEqual(self.call()[0], {'from': 'cli'})
+        self.assertEqual(capture.read_api_fallback(self.state)['reason'], 'authentication')
+        capture.api_fallback_path(self.state).unlink()
+        reset = int(datetime.now(timezone.utc).timestamp()) + 3600
+        for answer, error in (({'type': 'error', 'category': 'rate limit', 'status': 429, 'rate_limit_resets_at': reset},
+                               capture.RateLimited),
+                              ({'type': 'error', 'category': 'refusal', 'status': None}, capture.ExtractorFailure)):
+            self.api_answer, self.calls = answer, []
+            with self.subTest(answer=answer['category']), self.assertRaises(error):
+                self.call()
+            self.assertEqual(self.calls, ['api'])
+            self.assertFalse(capture.api_fallback_path(self.state).exists())
+            capture.rate_limit_path(self.state, api=True).unlink(missing_ok=True)
+
+    def test_the_fallback_honors_the_subscription_usage_limit(self):
+        self.call()
+        reset = int(datetime.now(timezone.utc).timestamp()) + 5 * 3600
+        capture.record_rate_limit(self.state, {'rate_limit_resets_at': reset}, datetime.now(timezone.utc))
+        self.calls = []
+        with self.assertRaises(capture.RateLimited):
+            self.call()
+        self.assertEqual(self.calls, [])
+        # A requested immediate retry still runs, on the subscription.
+        with patch.object(capture, 'run_extractor', side_effect=self.run_extractor), \
+                patch.object(capture.sys, 'stderr', io.StringIO()):
+            capture.model_response(self.config, self.state, 'p', '{}', {'type': 'object'}, wait_for_rate_limit=False)
+        self.assertEqual(self.calls, ['cli'])
+
+    def test_status_names_a_standing_fallback(self):
+        status = {'success': True, 'warning': 'Claude usage limit reached.'}
+        capture.report_api_fallback(status, self.config, self.state)
+        self.assertEqual(status, {'success': True, 'warning': 'Claude usage limit reached.'})
+        self.call()
+        capture.report_api_fallback(status, self.config, self.state)
+        self.assertEqual(status['api_fallback'], capture.read_api_fallback(self.state))
+        self.assertTrue(status['warning'].startswith('Running on subscription fallback: the Claude API is unavailable (billing)'))
+        self.assertTrue(status['warning'].endswith('Claude usage limit reached.'))
+        # Without a key file a leftover record is not reported.
+        plain = {'success': True}
+        capture.report_api_fallback(plain, {}, self.state)
+        self.assertEqual(plain, {'success': True})
+
+    def test_a_record_no_longer_in_effect_is_not_reported(self):
+        self.call()
+        self.key.write_text('sk-ant-replaced\n')
+        status = {'success': True}
+        capture.report_api_fallback(status, self.config, self.state)
+        self.assertEqual((status, capture.model_backend(self.config, self.state)), ({'success': True}, 'api'))
+        record = capture.read_api_fallback(self.state)
+        stat = self.key.lstat()
+        capture.api_fallback_path(self.state).write_text(json.dumps(dict(
+            record, key=f'{stat.st_ino}-{stat.st_size}-{stat.st_mtime_ns}',
+            retry_at=(datetime.now(timezone.utc) - capture.timedelta(seconds=1)).isoformat(timespec='seconds'))))
+        capture.report_api_fallback(status, self.config, self.state)
+        self.assertEqual(status, {'success': True})
+
+    def test_api_success_keeps_another_key_files_record(self):
+        other = {**self.config, 'api_key_file': str(self.state / 'other-key')}
+        (self.state / 'other-key').write_text('sk-ant-other\n')
+        foreign = capture.record_api_fallback(other, self.state, 'billing', datetime.now(timezone.utc))
+        self.api_answer = {'type': 'result', 'structured_output': {'from': 'api'}}
+        self.call()
+        self.assertEqual(capture.read_api_fallback(self.state), foreign)
+
+    def test_the_fallback_drops_an_inherited_api_key(self):
+        envs = []
+        def run(command, **kwargs):
+            envs.append(kwargs['env'])
+            return self.run_extractor(command, **kwargs)
+        with patch.dict(capture.os.environ, {'ANTHROPIC_API_KEY': 'sk-ant-inherited'}), \
+                patch.object(capture, 'run_extractor', side_effect=run), patch.object(capture.sys, 'stderr', io.StringIO()):
+            capture.model_response(self.config, self.state, 'p', '{}', {'type': 'object'})
+        self.assertEqual(self.calls, ['api', 'cli'])
+        self.assertNotIn('ANTHROPIC_API_KEY', envs[1])
+        # Without a key file the CLI backend keeps the caller's credentials, as before.
+        envs.clear()
+        with patch.dict(capture.os.environ, {'ANTHROPIC_API_KEY': 'sk-ant-inherited'}), \
+                patch.object(capture, 'run_extractor', side_effect=run), patch.object(capture.sys, 'stderr', io.StringIO()):
+            capture.model_response({'claude_path': self.config['claude_path']}, self.state, 'p', '{}', {'type': 'object'})
+        self.assertEqual(envs[0]['ANTHROPIC_API_KEY'], 'sk-ant-inherited')
+
+    def test_a_pinned_backend_never_moves(self):
+        def pinned(backend):
+            with patch.object(capture, 'run_extractor', side_effect=self.run_extractor), \
+                    patch.object(capture.sys, 'stderr', io.StringIO()):
+                return capture.model_response(self.config, self.state, 'p', '{}', {'type': 'object'}, backend=backend)
+        # A billing failure is still recorded for everyone else, but the pinned call fails instead of moving.
+        with self.assertRaises(capture.ExtractorFailure) as caught:
+            pinned('api')
+        self.assertEqual((caught.exception.reason, self.calls), ('extractor backend changed', ['api']))
+        self.assertEqual(capture.read_api_fallback(self.state)['reason'], 'billing')
+        with self.assertRaises(capture.ExtractorFailure):
+            pinned('api')
+        self.assertEqual(self.calls, ['api'])
+        # A run pinned to the CLI stays there after the API recovers.
+        capture.api_fallback_path(self.state).unlink()
+        self.assertEqual(pinned('cli'), {'from': 'cli'})
+        self.assertEqual(self.calls, ['api', 'cli'])
+
+    def test_record_matches_the_rust_publisher_format(self):
+        now = datetime(2026, 11, 6, 3, 4, 5, 678000, tzinfo=timezone.utc)
+        record = capture.record_api_fallback(self.config, self.state, 'billing', now)
+        self.assertEqual(json.loads(capture.api_fallback_path(self.state).read_text()), record)
+        self.assertEqual((record['since'], record['retry_at']), ('2026-11-06T03:04:05+00:00', '2026-11-07T03:04:05+00:00'))
+        # The publisher writes the same shape; Python honors it.
+        rust = dict(record, since='2026-11-06T03:04:05+00:00',
+                    retry_at=(datetime.now(timezone.utc) + capture.timedelta(hours=1)).isoformat(timespec='seconds'))
+        capture.api_fallback_path(self.state).write_text(json.dumps(rust, indent=2) + '\n')
+        self.assertEqual(capture.active_api_fallback(self.config, self.state), rust)
+        for broken in ({**rust, 'reason': 'refusal'}, {**rust, 'extra': 1}, {**rust, 'since': 'yesterday'}, {**rust, 'since': 5},
+                       {**rust, 'retry_at': None}, {**rust, 'key': 7}, [rust]):
+            capture.api_fallback_path(self.state).write_text(json.dumps(broken))
+            self.assertIsNone(capture.read_api_fallback(self.state), broken)
 
 
 if __name__ == '__main__':
