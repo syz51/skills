@@ -16,7 +16,9 @@ concurrency:
 jobs:
   # Every export pushes to main, and each run scans the whole history, so an export whose own
   # run is cancelled by a later push is still scanned by that later run. Exemptions come only
-  # from .gitleaks.toml: gitleaks:allow comments and .gitleaksignore files are ignored.
+  # from .gitleaks.toml: gitleaks:allow comments are ignored and a .gitleaksignore fails the
+  # job. Repository attributes such as -diff, and NUL bytes, would reduce a file's history to
+  # "Binary files differ"; the highest-precedence attributes file makes git show its text.
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest
@@ -38,6 +40,12 @@ jobs:
             --output "$scratch/$archive"
           (cd "$scratch" && printf '%s  %s\n' 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$archive" | sha256sum --check)
           tar -xzf "$scratch/$archive" -C "$scratch" gitleaks
+          if [ -e .gitleaksignore ] || [ -L .gitleaksignore ]; then
+            echo '::error::Remove .gitleaksignore; scan exemptions belong in .gitleaks.toml'
+            exit 1
+          fi
+          mkdir -p .git/info
+          printf '* diff\n' > .git/info/attributes
           "$scratch/gitleaks" git --config .gitleaks.toml --redact=100 \
             --ignore-gitleaks-allow --gitleaks-ignore-path "$scratch"
           GITLEAKS="$scratch/gitleaks" python3 -B -m unittest discover -s tests -p test_secret_scan.py

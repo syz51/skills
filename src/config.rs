@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use std::{
     collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -33,10 +33,16 @@ pub struct Config {
     pub json_drop_keys: Vec<String>,
     #[serde(default = "python")]
     pub python_path: PathBuf,
+    /// The pinned gitleaks that scans each changed export before it is pushed.
+    #[serde(default = "gitleaks")]
+    pub gitleaks_path: PathBuf,
     pub generation: Option<Value>,
 }
 fn python() -> PathBuf {
     "python3".into()
+}
+fn gitleaks() -> PathBuf {
+    "gitleaks".into()
 }
 pub fn expand(path: &Path) -> Result<PathBuf> {
     if path == Path::new("~") {
@@ -136,6 +142,7 @@ impl Config {
         if c.source_repo.as_os_str().is_empty()
             || c.state_dir.as_os_str().is_empty()
             || c.python_path.as_os_str().is_empty()
+            || c.gitleaks_path.as_os_str().is_empty()
             || c.cycle_lock
                 .as_ref()
                 .is_some_and(|p| p.as_os_str().is_empty())
@@ -146,6 +153,51 @@ impl Config {
         c.state_dir = expand(&c.state_dir)?;
         c.cycle_lock = c.cycle_lock.as_deref().map(expand).transpose()?;
         c.python_path = expand(&c.python_path)?;
+        c.gitleaks_path = expand(&c.gitleaks_path)?;
+        // The scan runs inside the candidate checkout, so a relative path would name a
+        // file there; only an absolute path or a bare name looked up on PATH is accepted.
+        let mut parts = c.gitleaks_path.components();
+        let bare = matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        );
+        if !c.gitleaks_path.is_absolute() && !bare {
+            return Err("gitleaks_path must be absolute or a program name on PATH".into());
+        }
         Ok(c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gitleaks_path_is_absolute_or_a_program_name() {
+        let source = tempfile::tempdir().unwrap();
+        let load = |gitleaks: Option<&str>| {
+            let mut value = json!({"schema_version": 1, "source_repo": source.path(), "state_dir": "state",
+                "author_name": "Test", "author_email": "test@example.invalid",
+                "target_url": "https://github.com/example/skills.git",
+                "files": [{"source": "skills/guide.md", "target": "skills/guide.md"}]});
+            if let Some(path) = gitleaks {
+                value["gitleaks_path"] = json!(path);
+            }
+            Config::from_value(value).map(|c| c.gitleaks_path)
+        };
+        assert_eq!(load(None).unwrap(), Path::new("gitleaks"));
+        assert_eq!(
+            load(Some("/opt/gitleaks")).unwrap(),
+            Path::new("/opt/gitleaks")
+        );
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(
+            load(Some("~/bin/gitleaks")).unwrap(),
+            home.join("bin/gitleaks")
+        );
+        for relative in ["tools/gitleaks", "./gitleaks", ".", "..", ""] {
+            assert!(load(Some(relative)).is_err(), "{relative}");
+        }
     }
 }

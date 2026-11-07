@@ -39,7 +39,7 @@ The exporter manages only its selected paths and its manifest. Other public-owne
 
 The history ruleset blocks force pushes and deletion of `main` for everyone, including repository administrators. A separate ruleset requires the public CI checks for ordinary changes, with a repository-admin bypass for the existing owner-operated daily publisher. The publisher uses the same owner SSH credential as before; it is not a separately scoped bot identity. The only current repository administrator is the owner.
 
-The exporter runs its local checks before pushing. Public CI independently runs on pull requests and every push to `main`, checking the final public tree, including public-owned additions. Its secret scan runs pinned gitleaks over the full public history with the published `.gitleaks.toml`, so each export is scanned after it is pushed; it is not a pre-push gate. The local exporter executes only the managed snapshot so public-owned tests cannot run with private credentials. Administrators can bypass the required-check ruleset, but cannot bypass the separate history ruleset. The owner should use the passing public checks when reviewing contributions.
+The exporter runs its local checks before pushing. Public CI independently runs on pull requests and every push to `main`, checking the final public tree, including public-owned additions. Before running any candidate code or pushing, the exporter scans the staged public commit with the pinned gitleaks and the snapshot's `.gitleaks.toml`, and stops publication on any finding, a `.gitleaksignore`, a missing config, or a missing or different gitleaks. Public CI's secret scan runs the same gitleaks over the full public history with the published `.gitleaks.toml`. The local exporter executes only the managed snapshot so public-owned tests cannot run with private credentials. Administrators can bypass the required-check ruleset, but cannot bypass the separate history ruleset. The owner should use the passing public checks when reviewing contributions.
 
 ## Contributions
 
@@ -49,11 +49,12 @@ A successful public export means the checked public content was published. It do
 
 ## Generation configuration
 
-The Rust configuration retains the existing schema-1 inventory and state paths. Add an explicit Python executable for legacy candidate checks and a generation section:
+The Rust configuration retains the existing schema-1 inventory and state paths. Add an explicit Python executable for legacy candidate checks, the gitleaks 8.30.1 executable for the pre-push secret scan (an absolute path, or a program name on `PATH`; default `gitleaks`), and a generation section:
 
 ```json
 {
   "python_path": "python3",
+  "gitleaks_path": "/absolute/path/to/gitleaks",
   "generation": {
     "claude_path": "/absolute/path/to/claude",
     "model": "claude-haiku-5-5",

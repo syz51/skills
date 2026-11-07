@@ -42,6 +42,8 @@ class SecretScanTests(unittest.TestCase):
         self.assertIn('--config .gitleaks.toml', scan)
         self.assertIn('--ignore-gitleaks-allow', scan)
         self.assertIn('--gitleaks-ignore-path "$scratch"', scan)
+        self.assertLess(job.index('if [ -e .gitleaksignore ] || [ -L .gitleaksignore ]; then'), job.index(scan))
+        self.assertLess(job.index("printf '* diff\\n' > .git/info/attributes"), job.index(scan))
         self.assertNotIn('--max-decode-depth', scan)
         self.assertIn('GITLEAKS="$scratch/gitleaks" python3 -B -m unittest discover -s tests -p test_secret_scan.py', job)
 
@@ -86,6 +88,8 @@ class SecretScanTests(unittest.TestCase):
         planted = {
             'notes.txt': f'token = "{token}"\n',
             'docs/config.md': f'api_key = "{digest}"\n',
+            # Attributes that hide a file's diff do not hide its key.
+            '.gitattributes': '*.md -diff\n',
             # A token in an allowlisted manifest is still reported by its own rule.
             'skills/example/sources.json': json.dumps(
                 {'sources': {'up': {'sha256': {'references/api-and-errors.md': digest}}, 'auth': token}},
@@ -97,6 +101,9 @@ class SecretScanTests(unittest.TestCase):
             repo.mkdir()
             shutil.copy(published_file('.gitleaks.toml'), repo / '.gitleaks.toml')
             subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            # As public CI does before its scan.
+            (repo / '.git/info').mkdir(parents=True, exist_ok=True)
+            (repo / '.git/info/attributes').write_text('* diff\n')
 
             def commit(files, message):
                 for relative, text in files.items():

@@ -647,31 +647,119 @@ fn rust_checks(validation: &Path, state: &Path, cargo: &Path) -> Result<()> {
         cmd.args(*args)
             .current_dir(validation)
             .env("CARGO_TARGET_DIR", validation.join("target"));
-        let result = command(cmd, deadline.saturating_duration_since(Instant::now()));
-        match result {
+        let outcome = match command(cmd, deadline.saturating_duration_since(Instant::now())) {
             Ok((status, out, err)) => {
                 log.extend(out);
                 log.extend(err);
-                fs::write(
-                    state.join("candidate-rust-tests.log"),
-                    &log[log.len().saturating_sub(65536)..],
-                )?;
-                if !status.success() {
-                    return Err("Public candidate Rust checks failed".into());
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err("Public candidate Rust checks failed".into())
                 }
             }
             Err(error) => {
                 // Static subprocess diagnostics; no model or private source text.
                 log.extend(error.to_string().bytes());
-                fs::write(
-                    state.join("candidate-rust-tests.log"),
-                    &log[log.len().saturating_sub(65536)..],
-                )?;
-                return Err(error);
+                Err(error)
             }
-        }
+        };
+        record(&state.join("candidate-rust-tests.log"), &log, outcome)?;
     }
     Ok(())
+}
+
+/// Keep the last 64 KiB of a candidate check's output as its log, replacing any older
+/// attempt's. A failed write is reported along with the check's outcome, never instead of it.
+fn record(log: &Path, output: &[u8], outcome: Result<()>) -> Result<()> {
+    let written = fs::write(log, &output[output.len().saturating_sub(65536)..]);
+    match (outcome, written) {
+        (outcome, Ok(())) => outcome,
+        (Ok(()), Err(write)) => Err(write.into()),
+        (Err(error), Err(write)) => {
+            Err(format!("{error}; writing {} also failed: {write}", log.display()).into())
+        }
+    }
+}
+
+/// The gitleaks release whose rules and flags the published `.gitleaks.toml` is tested with.
+pub const GITLEAKS_VERSION: &str = "8.30.1";
+/// The snapshot's scan config; public CI scans with the same file.
+pub const SCAN_CONFIG: &str = ".gitleaks.toml";
+/// Scan the staged public commit before any candidate code runs and before any message is
+/// generated or anything is pushed: public history cannot be rewritten, so public CI's scan
+/// finds leaks too late. Exemptions come only from the snapshot's config: inline
+/// `gitleaks:allow` comments are ignored and a `.gitleaksignore` in the checkout stops
+/// publication, as do a missing config, a missing binary or another version.
+fn secret_scan(
+    gitleaks: &Path,
+    repo: &Path,
+    config: Option<&Vec<u8>>,
+    scratch: &Path,
+    state: &Path,
+) -> Result<()> {
+    let run = || -> Result<(ExitStatus, Vec<u8>)> {
+        let config = config.ok_or(format!("Public candidate has no {SCAN_CONFIG}"))?;
+        // gitleaks always applies a .gitleaksignore at the root of the scanned folder.
+        if repo.join(".gitleaksignore").symlink_metadata().is_ok() {
+            return Err(
+                "Public candidate has a .gitleaksignore; exemptions belong in .gitleaks.toml"
+                    .into(),
+            );
+        }
+        let mut version = candidate_check(gitleaks);
+        version.arg("version");
+        let (status, out, _) = command(version, Duration::from_secs(30))?;
+        let found = String::from_utf8_lossy(&out).trim().to_owned();
+        if !status.success() || found != GITLEAKS_VERSION {
+            return Err(
+                format!("Secret scan needs gitleaks {GITLEAKS_VERSION}, found {found:?}").into(),
+            );
+        }
+        // A folder of its own holds the config and is the ignore path, so it has no
+        // .gitleaksignore and nothing the candidate wrote can change either.
+        fs::create_dir(scratch)?;
+        let config_path = scratch.join(SCAN_CONFIG);
+        fs::write(&config_path, config)?;
+        // gitleaks reads `git diff`, which shows only "Binary files differ" for a file
+        // whose attributes say `-diff` or `binary`, or that holds a NUL byte. These
+        // highest-precedence attributes make git show every file's text during the scan.
+        let attributes = repo.join(".git/info/attributes");
+        fs::create_dir_all(repo.join(".git/info"))?;
+        fs::write(&attributes, "* diff\n")?;
+        let mut scan = candidate_check(gitleaks);
+        scan.args([
+            "git",
+            "--pre-commit",
+            "--staged",
+            "--no-banner",
+            "--no-color",
+            "--verbose",
+            "--redact=100",
+            "--ignore-gitleaks-allow",
+            "--exit-code",
+            "1",
+        ])
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--gitleaks-ignore-path")
+        .arg(scratch)
+        .arg(".")
+        .current_dir(repo);
+        let (status, mut out, err) = command(scan, Duration::from_secs(120))?;
+        fs::remove_file(&attributes)?;
+        out.extend(err);
+        Ok((status, out))
+    };
+    let (output, outcome) = match run() {
+        Ok((status, out)) if status.success() => (out, Ok(())),
+        Ok((_, out)) => (out, Err("Public candidate secret scan failed".into())),
+        Err(error) => (
+            format!("{error}; publication stopped.\n").into_bytes(),
+            Err(error),
+        ),
+    };
+    // Redacted findings: rule, file and line, never the matched secret.
+    record(&state.join("candidate-secret-scan.log"), &output, outcome)
 }
 
 pub fn execute(
@@ -762,6 +850,13 @@ fn execute_with_checks(
         return Ok(result);
     }
     if changed {
+        secret_scan(
+            &c.gitleaks_path,
+            &repo,
+            files.get(SCAN_CONFIG),
+            &tmp.path().join("secret-scan"),
+            &c.state_dir,
+        )?;
         let validation = tmp.path().join("validation");
         fs::create_dir(&validation)?;
         for (p, b) in &files {
@@ -775,26 +870,24 @@ fn execute_with_checks(
             .current_dir(&validation)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("UV_OFFLINE", "1");
-        let (status, mut out, err) = match command(cmd, Duration::from_secs(600)) {
-            Ok(result) => result,
-            Err(error) => {
-                // Replace diagnostics from an older successful attempt even when
-                // the process could not start or could not return its output.
-                fs::write(
-                    c.state_dir.join("candidate-tests.log"),
-                    b"Public candidate test subprocess failed to start or complete; publication stopped.\n",
-                )?;
-                return Err(error);
+        let (output, outcome) = match command(cmd, Duration::from_secs(600)) {
+            Ok((status, mut out, err)) => {
+                out.extend(err);
+                let outcome = if status.success() {
+                    Ok(())
+                } else {
+                    Err("Public candidate tests failed".into())
+                };
+                (out, outcome)
             }
+            // The process could not start or could not return its output.
+            Err(error) => (
+                b"Public candidate test subprocess failed to start or complete; publication stopped.\n"
+                    .to_vec(),
+                Err(error),
+            ),
         };
-        out.extend(err);
-        fs::write(
-            c.state_dir.join("candidate-tests.log"),
-            &out[out.len().saturating_sub(65536)..],
-        )?;
-        if !status.success() {
-            return Err("Public candidate tests failed".into());
-        }
+        record(&c.state_dir.join("candidate-tests.log"), &output, outcome)?;
         if files.contains_key("Cargo.toml") {
             rust_checks(&validation, &c.state_dir, cargo)?;
         }
@@ -983,6 +1076,10 @@ mod tests {
                 "import unittest\nclass Tests(unittest.TestCase):\n def test_ok(self): self.assertTrue(True)\n",
             ),
             ("feedback/private.md", "Private source context"),
+            (
+                "public/files/.gitleaks.toml",
+                "[extend]\nuseDefault = true\n",
+            ),
         ] {
             let p = source.join(p);
             fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1000,8 +1097,233 @@ mod tests {
             ],
         )
         .unwrap();
-        let c=Config::from_value(json!({"schema_version":1,"source_repo":source,"state_dir":t.path().join("state"),"author_name":"Test","author_email":"test@example.invalid","target_url":"https://github.com/example/skills.git","files":[{"source":"skills/guide.md","target":"skills/guide.md"},{"source":"tests/test_fixture.py","target":"tests/test_fixture.py"}]})).unwrap();
+        let mut c=Config::from_value(json!({"schema_version":1,"source_repo":source,"state_dir":t.path().join("state"),"author_name":"Test","author_email":"test@example.invalid","target_url":"https://github.com/example/skills.git","files":[{"source":"public/files/.gitleaks.toml","target":".gitleaks.toml"},{"source":"skills/guide.md","target":"skills/guide.md"},{"source":"tests/test_fixture.py","target":"tests/test_fixture.py"}]})).unwrap();
+        c.gitleaks_path = fake_gitleaks(t.path(), GITLEAKS_VERSION, 0);
         (t, c, remote)
+    }
+    /// Write an executable shell script that exits at once when its first argument is
+    /// `--probe`, then wait until it can run. A thread that forks while the file is open for
+    /// writing holds it until the child execs, and running it before then fails with
+    /// "Text file busy".
+    fn fake_program(path: &Path, body: &str) {
+        fs::write(
+            path,
+            format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{body}"),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        while let Err(error) = Command::new(path).arg("--probe").status() {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "{error}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    /// A gitleaks stand-in that reports `version`, records every scan's arguments in
+    /// `gitleaks-calls` and the scan's git attributes in `gitleaks-attributes` beside it,
+    /// and exits with `scan_exit`.
+    fn fake_gitleaks(dir: &Path, version: &str, scan_exit: i32) -> PathBuf {
+        let path = dir.join("gitleaks");
+        let calls = dir.join("gitleaks-calls");
+        let attributes = dir.join("gitleaks-attributes");
+        fake_program(
+            &path,
+            &format!(
+                "if [ \"$1\" = version ]; then echo {version}; exit 0; fi\necho \"$*\" >> '{}'\ncat .git/info/attributes > '{}'\necho 'finding: README.md'\nexit {scan_exit}\n",
+                calls.display(),
+                attributes.display()
+            ),
+        );
+        path
+    }
+    fn scan_calls(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("gitleaks-calls"))
+            .map(|calls| calls.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+    fn assert_scan_blocked(config: &Config, remote: &Path, reason: &str) {
+        let Err(error) = execute_with_destination(
+            config,
+            true,
+            &|_, _| panic!("A failed secret scan must precede generation"),
+            remote.to_str().unwrap(),
+        ) else {
+            panic!("The export published despite the secret scan");
+        };
+        let error = error.to_string();
+        assert!(error.contains(reason), "{error}");
+        assert!(git(remote, &["for-each-ref"]).unwrap().is_empty());
+        assert!(!config.state_dir.join("export-state.json").exists());
+    }
+    #[test]
+    fn secret_scan_checks_the_staged_candidate_before_generation_and_noop_skips_it() {
+        let (temp, config, remote) = fixture();
+        let generate = |_: &str, _: Option<&str>| {
+            assert_eq!(scan_calls(temp.path()).len(), 1);
+            Ok(message())
+        };
+        execute_with_destination(&config, true, &generate, remote.to_str().unwrap()).unwrap();
+        let calls = scan_calls(temp.path());
+        assert_eq!(calls.len(), 1);
+        let args: Vec<&str> = calls[0].split(' ').collect();
+        assert_eq!(
+            &args[..10],
+            [
+                "git",
+                "--pre-commit",
+                "--staged",
+                "--no-banner",
+                "--no-color",
+                "--verbose",
+                "--redact=100",
+                "--ignore-gitleaks-allow",
+                "--exit-code",
+                "1"
+            ]
+        );
+        // The config and the ignore path are a folder of their own, not a checkout's.
+        assert_eq!(args[10], "--config");
+        assert!(
+            args[11].ends_with("/secret-scan/.gitleaks.toml"),
+            "{}",
+            args[11]
+        );
+        assert_eq!(args[12], "--gitleaks-ignore-path");
+        assert_eq!(Path::new(args[13]), Path::new(args[11]).parent().unwrap());
+        assert_eq!(args[14], ".");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("gitleaks-attributes")).unwrap(),
+            "* diff\n"
+        );
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("candidate-secret-scan.log")).unwrap(),
+            "finding: README.md\n"
+        );
+        execute_with_destination(&config, true, &generate, remote.to_str().unwrap()).unwrap();
+        assert_eq!(scan_calls(temp.path()), calls);
+    }
+    #[test]
+    fn secret_scan_failure_blocks_generation_and_push() {
+        let (temp, mut config, remote) = fixture();
+        config.gitleaks_path = fake_gitleaks(temp.path(), GITLEAKS_VERSION, 1);
+        assert_scan_blocked(&config, &remote, "Public candidate secret scan failed");
+        assert_eq!(scan_calls(temp.path()).len(), 1);
+        assert_eq!(
+            fs::read_to_string(config.state_dir.join("candidate-secret-scan.log")).unwrap(),
+            "finding: README.md\n"
+        );
+        // The scan comes first, so no candidate code ran.
+        assert!(!config.state_dir.join("candidate-tests.log").exists());
+    }
+    #[test]
+    fn a_gitleaksignore_in_the_candidate_stops_publication() {
+        let (temp, mut config, remote) = fixture();
+        let ignore = config.source_repo.join("public/files/.gitleaksignore");
+        fs::write(&ignore, "skills/guide.md:generic-api-key:2\n").unwrap();
+        git(&config.source_repo, &["add", "."]).unwrap();
+        git(&config.source_repo, &["commit", "-m", "Ignore"]).unwrap();
+        config.files.push(crate::config::Entry {
+            source: "public/files/.gitleaksignore".into(),
+            target: ".gitleaksignore".into(),
+        });
+        assert_scan_blocked(&config, &remote, "Public candidate has a .gitleaksignore");
+        assert!(scan_calls(temp.path()).is_empty());
+    }
+    #[test]
+    fn secret_scan_refuses_another_version_a_missing_binary_or_config() {
+        let (temp, mut config, remote) = fixture();
+        let log = config.state_dir.join("candidate-secret-scan.log");
+        fs::create_dir_all(&config.state_dir).unwrap();
+        fs::write(&log, "stale success").unwrap();
+        config.gitleaks_path = fake_gitleaks(temp.path(), "8.31.0", 0);
+        assert_scan_blocked(&config, &remote, "needs gitleaks 8.30.1, found \"8.31.0\"");
+        assert!(scan_calls(temp.path()).is_empty());
+        assert!(
+            fs::read_to_string(&log)
+                .unwrap()
+                .ends_with("publication stopped.\n")
+        );
+
+        fs::write(&log, "stale success").unwrap();
+        config.gitleaks_path = temp.path().join("missing-gitleaks");
+        assert_scan_blocked(&config, &remote, "Unable to start subprocess");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "Unable to start subprocess; publication stopped.\n"
+        );
+
+        config.gitleaks_path = fake_gitleaks(temp.path(), GITLEAKS_VERSION, 0);
+        config.files.retain(|entry| entry.target != SCAN_CONFIG);
+        assert_scan_blocked(&config, &remote, "Public candidate has no .gitleaks.toml");
+        assert!(scan_calls(temp.path()).is_empty());
+    }
+    #[test]
+    fn a_failed_log_write_keeps_the_check_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("missing/candidate.log");
+        let error = record(
+            &log,
+            b"out",
+            Err("Public candidate secret scan failed".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("Public candidate secret scan failed; writing ")
+                && error.contains("also failed"),
+            "{error}"
+        );
+        assert!(record(&log, b"out", Ok(())).is_err());
+        let log = temp.path().join("candidate.log");
+        let output = vec![b'x'; 70_000];
+        record(&log, &output, Ok(())).unwrap();
+        assert_eq!(fs::read(&log).unwrap().len(), 65536);
+    }
+    /// The real scanner, when `GITLEAKS` names gitleaks 8.30.1: a planted key in a
+    /// managed file stops the export, and the clean candidate then publishes.
+    #[test]
+    fn real_gitleaks_stops_a_planted_key_before_push() {
+        let Some(binary) = std::env::var_os("GITLEAKS") else {
+            eprintln!("skipped: set GITLEAKS to gitleaks {GITLEAKS_VERSION}");
+            return;
+        };
+        let (_temp, mut config, remote) = fixture();
+        config.gitleaks_path = binary.into();
+        // A key the exporter's own pattern scan does not know, so only gitleaks stops it.
+        let key = hash(b"synthetic credential");
+        let guide = config.source_repo.join("skills/guide.md");
+        fs::write(&guide, format!("Public guide\napi_key = \"{key}\"\n")).unwrap();
+        git(&config.source_repo, &["commit", "-am", "Plant"]).unwrap();
+        assert_scan_blocked(&config, &remote, "Public candidate secret scan failed");
+        let log = fs::read_to_string(config.state_dir.join("candidate-secret-scan.log")).unwrap();
+        assert!(
+            log.contains("generic-api-key") && !log.contains(&key) && !log.contains('\x1b'),
+            "{log}"
+        );
+        // Neither attributes that hide a file's diff nor a NUL byte hide the key.
+        let attributes = config.source_repo.join("public/files/.gitattributes");
+        fs::write(&attributes, "*.md -diff\n").unwrap();
+        git(&config.source_repo, &["add", "."]).unwrap();
+        git(&config.source_repo, &["commit", "-m", "Attributes"]).unwrap();
+        config.files.push(crate::config::Entry {
+            source: "public/files/.gitattributes".into(),
+            target: ".gitattributes".into(),
+        });
+        assert_scan_blocked(&config, &remote, "Public candidate secret scan failed");
+        fs::write(&attributes, "").unwrap();
+        fs::write(&guide, format!("Public guide\0\napi_key = \"{key}\"\n")).unwrap();
+        git(&config.source_repo, &["commit", "-am", "Binary"]).unwrap();
+        assert_scan_blocked(&config, &remote, "Public candidate secret scan failed");
+        fs::write(&guide, "Public guide\n").unwrap();
+        git(&config.source_repo, &["commit", "-am", "Remove"]).unwrap();
+        let generate = |_: &str, _: Option<&str>| Ok(message());
+        assert!(
+            execute_with_destination(&config, true, &generate, remote.to_str().unwrap())
+                .unwrap()
+                .changed
+        );
     }
     /// Private identifiers and credentials the scanner rejects, built so this file passes it.
     /// Case variants are included: replacements match exactly, so these stay unreplaced.
@@ -1148,16 +1470,14 @@ mod tests {
         git(&config.source_repo, &["commit", "-m", "Add Rust fixture"]).unwrap();
         let cargo = temp.path().join("cargo");
         let log = temp.path().join("calls");
-        fs::write(
+        fake_program(
             &cargo,
-            format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1\" != '{}' ]\n",
+            &format!(
+                "echo \"$*\" >> '{}'\n[ \"$1\" != '{}' ]\n",
                 log.display(),
                 fail
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (temp, config, remote, cargo)
     }
     #[test]
