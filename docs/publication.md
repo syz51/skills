@@ -39,7 +39,7 @@ The exporter manages only its selected paths and its manifest. Other public-owne
 
 The history ruleset blocks force pushes and deletion of `main` for everyone, including repository administrators. A separate ruleset requires the public CI checks for ordinary changes, with a repository-admin bypass for the existing owner-operated daily publisher. The publisher uses the same owner SSH credential as before; it is not a separately scoped bot identity. The only current repository administrator is the owner.
 
-The exporter runs its local checks before pushing. Public CI independently runs on pull requests and every push to `main`, checking the final public tree, including public-owned additions. The local exporter executes only the managed snapshot so public-owned tests cannot run with private credentials. Administrators can bypass the required-check ruleset, but cannot bypass the separate history ruleset. The owner should use the passing public checks when reviewing contributions.
+The exporter runs its local checks before pushing. Public CI independently runs on pull requests and every push to `main`, checking the final public tree, including public-owned additions. Its secret scan runs pinned gitleaks over the full public history with the published `.gitleaks.toml`, so each export is scanned after it is pushed; it is not a pre-push gate. The local exporter executes only the managed snapshot so public-owned tests cannot run with private credentials. Administrators can bypass the required-check ruleset, but cannot bypass the separate history ruleset. The owner should use the passing public checks when reviewing contributions.
 
 ## Contributions
 

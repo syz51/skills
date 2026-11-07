@@ -10,7 +10,7 @@ Use Python, Git, and `uv` on a Unix-like system:
 uv run --no-project python -m unittest discover -s tests
 ```
 
-CI runs the offline suite on Python 3.13 and 3.14, including checks against the actual skill references, packaged license notices, prompt bundle, and synthetic evaluation cases. Add focused tests for non-trivial logic or regressions. A synthetic evaluation is not evidence of improved behavior on real tasks.
+CI runs the offline suite on Python 3.13, 3.14 and 3.15, including checks against the actual skill references, packaged license notices, prompt bundle, and synthetic evaluation cases. It also scans the full history for secrets with pinned gitleaks and `.gitleaks.toml`; run `gitleaks git --config .gitleaks.toml --ignore-gitleaks-allow` locally, and put gitleaks 8.30.1 on `PATH` or in `GITLEAKS` to run the test that checks the config. Add focused tests for non-trivial logic or regressions. A synthetic evaluation is not evidence of improved behavior on real tasks.
 
 Do not enable transcript capture, model evaluation, or publishing to test an ordinary contribution. Use synthetic fixtures and temporary repositories. Never include credentials, real feedback, private transcripts, operational logs, or personal machine configuration. Report security problems through the [security policy](SECURITY.md).
 

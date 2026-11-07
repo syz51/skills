@@ -14,6 +14,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Every export pushes to main, and each run scans the whole history, so an export whose own
+  # run is cancelled by a later push is still scanned by that later run. Exemptions come only
+  # from .gitleaks.toml: gitleaks:allow comments and .gitleaksignore files are ignored.
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan history with pinned gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          archive=gitleaks_8.30.1_linux_x64.tar.gz
+          curl --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$archive" \
+            --output "$scratch/$archive"
+          (cd "$scratch" && printf '%s  %s\n' 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$archive" | sha256sum --check)
+          tar -xzf "$scratch/$archive" -C "$scratch" gitleaks
+          "$scratch/gitleaks" git --config .gitleaks.toml --redact=100 \
+            --ignore-gitleaks-allow --gitleaks-ignore-path "$scratch"
+          GITLEAKS="$scratch/gitleaks" python3 -B -m unittest discover -s tests -p test_secret_scan.py
+
   tests:
     name: tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest

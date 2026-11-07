@@ -1,0 +1,33 @@
+title = "skills secret scanning"
+[extend]
+useDefault = true
+
+# Each allowlist covers only the rule its false positives come from, so other rules still
+# report anything in these files.
+
+# The export manifest maps each published path to its SHA-256 content hash.
+[[allowlists]]
+description = "SHA-256 content hashes in the export manifest"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^\.public-export\.json$''']
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{64}$''']
+
+# Skill manifests map reference paths to SHA-256 content hashes.
+[[allowlists]]
+description = "SHA-256 content hashes in skill source manifests"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^skills/[^/]+/sources\.json$''']
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{64}$''']
+
+# VueUse's useJwt documentation uses the public jwt.io sample token.
+[[allowlists]]
+description = "jwt.io sample token in the VueUse useJwt reference"
+condition = "AND"
+targetRules = ["jwt"]
+paths = ['''^skills/frontend-ui/references/frameworks/vueuse-functions/references/useJwt\.md$''']
+regexTarget = "secret"
+regexes = ['''^[A-Za-z0-9_-]+\.eyJzdWIiOiIxMjM0NTY3ODkwIiwiaWF0IjoxNTE2MjM5MDIyfQ\.[A-Za-z0-9_-]+$''']
