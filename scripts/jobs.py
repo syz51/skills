@@ -242,7 +242,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         save(folder / 'attempt.json', attempt)
         save(active, attempt)
         try:
-            cycle = investigations.prepare(scoped, state_root, due.isoformat(), trusted_base=base)
+            cycle = investigations.prepare(scoped, state_root, trusted_base=base)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
             attempt['status'] = 'failed'
             attempt['failure'] = {'class': type(exc).__name__, 'detail': str(exc)[:2000]}
@@ -258,7 +258,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         if scoped != dict(config, repo_path=str(work)):
             raise ValueError('Investigation configuration changed')
         if attempt['cycle'] is None:
-            attempt['cycle'] = str(investigations.prepare(scoped, state_root, due.isoformat(), trusted_base=base))
+            attempt['cycle'] = str(investigations.prepare(scoped, state_root, trusted_base=base))
         cycle = Path(attempt['cycle'])
         if not cycle.resolve().is_relative_to(state_root / 'investigations/cycles') or cycle.is_symlink():
             raise ValueError('Unsafe saved investigation cycle')
@@ -275,7 +275,10 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
         'Use uv run --no-project python scripts/investigations.py report --config '
         '"$SKILL_INVESTIGATION_CONFIG" --cycle "$SKILL_INVESTIGATION_CYCLE". '
         'Use run and record with the same config/cycle for actual experiments and dispositions. '
-        'Complete required evidence and due investigations before finishing; keep future follow-ups visible. '
+        'Complete required evidence dispositions before finishing. File each open issue or provisional revision '
+        'as a dotfiles work board task and cite its id as board_task in the record; the board, not the records, '
+        'carries open work. Before filing, search the board for a task citing the issue and reuse it. Claim an '
+        'issue\'s task before recording an event for it, and skip issues whose task another agent holds. '
         'A saved attempt may contain your earlier failed work: inspect it, preserve evidence, '
         'and finish through scoped forward commits. Do not alter the canonical checkout.\n')
     if attempt.get('recovery'):
@@ -286,17 +289,17 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
                timeout=max(1, timeout - (time.monotonic() - began)), settings=settings)
         summary = investigations.validate_cycle(scoped, state_root, cycle)
         _, heads = investigations.inventory(work)
-        outstanding = sorted((v for v in heads.values() if v['state'] != 'resolved'),
-                             key=lambda v: (v['follow_up']['next_due'], v['skill'], v['issue_id']))
+        outstanding = sorted((v for v in heads.values() if v['state'] in investigations.OPEN_STATES),
+                             key=lambda v: (v['skill'], v['issue_id']))
         summary['outstanding'] = [{'skill': v['skill'], 'issue_id': v['issue_id'],
-                                  'state': v['state'], **v['follow_up']} for v in outstanding]
+                                  'state': v['state'], 'board_task': v['board_task']} for v in outstanding]
         report = folder / 'latest-weekly-report.md'
         with report.open('a') as stream:
             stream.write('\n\nValidated investigation result: ' + str(summary['open'])
                          + ' outstanding issues (including provisional and blocked issues).\n')
             for issue in summary['outstanding']:
                 stream.write('- ' + issue['skill'] + '/' + issue['issue_id'] + ' [' + issue['state']
-                             + '], due ' + issue['next_due'] + ': ' + issue['next_action'] + '\n')
+                             + ']: board task ' + issue['board_task'] + '\n')
         if not clean(work):
             raise RuntimeError('Investigation review must commit its owned changes')
         candidate = git(work, 'rev-parse', 'HEAD')

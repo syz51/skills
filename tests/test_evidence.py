@@ -439,12 +439,39 @@ class EvidenceTests(unittest.TestCase):
             evidence.verify(self.config, self.root)
         value = json.loads(next(self.feedback.rglob('*.json')).read_text())
         self.assertEqual(value['status'], 'unsupported')
-        for summary in ('First line\nsecond line', '', 'x' * 1001):
+        for summary in ('', ' \n\r\n ', 'x' * 1001):
             with self.subTest(summary=summary), patch.object(evidence, 'model_response',
                                                              return_value={'status': 'supported', 'summary': summary}) as model:
                 with self.assertRaises(ValueError):
                     evidence.verify_note(self.config, self.root, self.path.read_text(), self.turn, 'frontend-ui')
             self.assertEqual(model.call_count, 1)
+
+    def test_multiline_summary_and_correction_are_stored_as_one_line(self):
+        # Neither the schema nor the prompts ask for one line, so a line break is joined, not a failed check.
+        responses = [{'status': 'partial', 'summary': 'The result is overstated.\n\n- The fix is only reported.\r\n'},
+                     {'notes': [{**self.correction, 'evidence': 'First line\n  second line'}]},
+                     {'status': 'supported', 'summary': 'The revision\nkeeps attribution qualified.'}]
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=responses) as model:
+            counts = evidence.verify(self.config, self.root)
+        self.assertEqual((model.call_count, counts['checked'], counts['errors'], counts['corrected']), (3, 1, 0, 1))
+        self.assertNotIn('check_diagnostics', counts)
+        value = evidence.assessment_inventory(self.feedback)['latest'][0]
+        self.assertEqual(value['summary'], 'The result is overstated. - The fix is only reported.')
+        self.assertEqual(value['correction']['note'], {**self.correction, 'evidence': 'First line second line'})
+        self.assertEqual(value['correction']['summary'], 'The revision keeps attribution qualified.')
+        self.assertIn('- Evidence: First line second line\n', json.loads(model.call_args_list[2].args[3])['note'])
+
+    def test_rejected_check_reports_its_static_error_without_note_text(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': 'x' * 1001}):
+            counts = evidence.verify(self.config, self.root)
+        digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        self.assertEqual((counts['checked'], counts['errors']), (0, 1))
+        self.assertEqual(counts['check_diagnostics'], [{'note': 'frontend-ui/' + digest, 'error_class': 'ValueError',
+                                                        'message': 'Invalid capture note field'}])
+        self.assertNotIn('extractor_diagnostics', counts)
+        self.assertEqual(list(self.feedback.rglob('*.json')), [])
 
     def test_unverified_correction_is_not_published_or_retried_hourly(self):
         responses = [{'status': 'unsupported', 'summary': 'The observation misstates the reported result.'},
@@ -577,7 +604,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(value['supersedes'], hashlib.sha256(data).hexdigest())
 
     def test_correction_failures_preserve_history_and_fail_the_job(self):
-        unsafe = {'notes': [{**self.correction, 'evidence': 'two\nlines'}]}
+        unsafe = {'notes': [{**self.correction, 'evidence': 'x' * 1001}]}
         # A rejected correction is not retried; the job fails without a receipt.
         for cycle, failures in enumerate(([RuntimeError('Service unavailable')], [unsafe])):
             with self.subTest(failures=failures), patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(
@@ -616,7 +643,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(value['correction']['inputSha256'], hashlib.sha256(checked.encode()).hexdigest())
 
     def test_invalid_summary_or_correction_fails_without_retry(self):
-        with patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': 'two\nlines'}) as model:
+        with patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': '\n'}) as model:
             with self.assertRaises(ValueError):
                 evidence.verify_note(self.config, self.root, 'Abstract note', self.turn, 'frontend-ui')
         self.assertEqual(model.call_count, 1)

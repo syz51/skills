@@ -370,6 +370,30 @@ def verify_release(root, validator=None):
             raise SyncError('Invalid referenced review record')
     return checksum
 
+def verify_published(checkout, validator):
+    """Validate a published tree with the workflow code in that tree.
+
+    Deployment never updates a host's checkout, so its scripts can be older than main. A commit that
+    changes a validator together with records that need the change would then fail deployment on
+    every host not yet fast-forwarded. The tree's own code judges it instead, in a separate process.
+    Main's scripts change only through reviewed pushes (publication rejects them), so they are the
+    code a fast-forward would install anyway. An explicit --validator still overrides the tree's.
+    """
+    own = checkout / 'scripts' / 'sync.py'
+    if own.is_symlink() or not own.is_file():
+        # Only test fixtures publish a tree without workflow code; this checkout validates those.
+        return verify_release(checkout, validator)
+    command = [sys.executable, '-B', str(own), 'verify', '--repo', str(checkout)]
+    if Path(validator) != VALIDATOR:
+        command += ['--validator', str(validator)]
+    result = subprocess.run(command, capture_output=True, cwd=checkout)
+    if result.returncode:
+        # Raw output can carry dependency URLs; relay only the tree's own sanitized stop reason.
+        stops = [line for line in result.stdout.decode(errors='replace').splitlines() if line.startswith('Sync stopped: ')]
+        raise SyncError('Published tree failed its own validation: '
+                        + (stops[-1][len('Sync stopped: '):][:300] if stops else 'validation command failed'))
+    return skills_hash(checkout)
+
 def publication_scope(repo, base, head, *, bootstrap=False):
     """Validate a forward publication without modifying Git or contacting remotes."""
     git(repo, 'merge-base', '--is-ancestor', base, head)
@@ -681,7 +705,7 @@ def deploy(args):
             raise SyncError('Installed prompts have local edits; deployment refused')
         previous_commit = previous_manifest.get('commit')
     with worktree(args.repo, commit) as checkout:
-        checksum = verify_release(checkout, args.validator)
+        checksum = verify_published(checkout, args.validator)
         prompts_checksum = prompt_hash(checkout)
         safe_tree(checkout / 'feedback')
         safe_local_parents(args.feedback_dir)
@@ -802,7 +826,7 @@ def deploy(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('upload', 'collect', 'publish', 'deploy'))
+    parser.add_argument('command', choices=('upload', 'collect', 'publish', 'deploy', 'verify'))
     parser.add_argument('--repo', type=Path, default=Path.home() / '.local/share/codex-skills/repository')
     parser.add_argument('--host-id', choices=HOSTS, default='client-host')
     parser.add_argument('--feedback-dir', type=Path, default=codex_home() / 'skill-feedback')
@@ -811,6 +835,10 @@ def main():
     parser.add_argument('--bootstrap', action='store_true', help='Allow initial skill population without prior reviews')
     args = parser.parse_args()
     try:
+        if args.command == 'verify':
+            # A read-only check of one tree, which deploy runs while it holds the lock below.
+            print(verify_release(args.repo, args.validator))
+            return 0
         common = Path(git(args.repo, 'rev-parse', '--git-common-dir').decode().strip())
         if not common.is_absolute():
             common = args.repo / common

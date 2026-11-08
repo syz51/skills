@@ -857,6 +857,35 @@ class LearningTransactionTests(unittest.TestCase):
         self.assertFalse((self.state / 'investigations/active-attempt.json').exists())
         self.assertEqual(len(self.git_at(self.repo, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
 
+    def test_report_lists_open_issues_with_their_board_tasks(self):
+        import investigations
+
+        def review_with_open_issue(cli, work, state, prompt, log, env, timeout, settings):
+            self.assertIn('as a dotfiles work board task and cite its id as board_task', prompt)
+            # A retry after a failed attempt reuses the tasks it filed, and claiming keeps one writer per chain.
+            self.assertIn('search the board for a task citing the issue and reuse it', prompt)
+            self.assertIn("Claim an issue's task before recording an event for it, and skip issues whose task "
+                          'another agent holds', prompt)
+            dropped = {'schema_version': 2, 'issue_id': 'tone', 'skill': 'frontend-ui', 'supersedes': None,
+                       'evidence': [], 'action': 'keep', 'state': 'dropped', 'change': None, 'experiments': [],
+                       'summary': 'The owner rejected the Proposal for this issue', 'board_task': 'dotfiles-63',
+                       'baseline_commit': 'c' * 40, 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00'}
+            investigations.save(work / 'feedback/frontend-ui/investigations'
+                                / ('tone--' + investigations.digest(dropped) + '.json'), dropped)
+            event = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None,
+                     'evidence': [], 'action': 'investigate', 'state': 'blocked', 'change': None, 'experiments': [],
+                     'summary': 'Focus replay waits for an original project revision', 'board_task': 'dotfiles-62',
+                     'baseline_commit': 'c' * 40, 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00'}
+            investigations.save(work / 'feedback/frontend-ui/investigations'
+                                / ('focus--' + investigations.digest(event) + '.json'), event)
+            self.accepted_review(cli, work, state, prompt, log, env, timeout, settings)
+
+        result = self.transaction(review_with_open_issue)
+        self.assertEqual(result['outstanding'], [{'skill': 'frontend-ui', 'issue_id': 'focus',
+                                                  'state': 'blocked', 'board_task': 'dotfiles-62'}])
+        self.assertIn('- frontend-ui/focus [blocked]: board task dotfiles-62\n',
+                      (self.state / 'latest-weekly-report.md').read_text())
+
     def test_missing_disposition_preserves_candidate_and_canonical_main(self):
         before = self.git_at(self.repo, 'rev-parse', 'HEAD')
         with self.assertRaisesRegex(ValueError, 'missing disposition'):

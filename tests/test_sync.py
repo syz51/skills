@@ -887,6 +887,60 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
             with self.assertRaisesRegex(sync.SyncError, 'Skill validation command failed for frontend-ui'):
                 sync.publish(self.args)
 
+    def test_deploy_validates_a_published_tree_with_its_own_workflow(self):
+        # A host's checkout lags behind main until someone fast-forwards it. When one commit changes the investigation
+        # validator and adds records only the new validator accepts, the host's old validator must not judge them.
+        import shutil
+        import investigations
+        shutil.copytree(Path(sync.__file__).parent, self.repo / 'scripts', ignore=shutil.ignore_patterns('__pycache__'))
+        self.prompt_release()
+        self.release()
+        event = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                 'action': 'investigate', 'state': 'blocked', 'change': None, 'experiments': [],
+                 'baseline_commit': sync.git(self.repo, 'rev-parse', 'HEAD').decode().strip(),
+                 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00', 'board_task': 'dotfiles-62',
+                 'summary': 'Focus replay waits for an original project revision'}
+        records = self.repo / 'feedback/frontend-ui/investigations'
+        investigations.save(records / ('focus--' + investigations.digest(event) + '.json'), event)
+        self.commit('Record a schema 2 investigation')
+        self.assertTrue(sync.publish(self.args))
+        original = investigations.validate_event
+
+        def schema_1_only(value):
+            # The validator before schema 2: any other version is an invalid event.
+            if value.get('schema_version') != 1:
+                raise ValueError('Invalid investigation event')
+            return original(value)
+
+        current = self.args.install_root / 'current'
+        with patch.object(investigations, 'validate_event', schema_1_only):
+            with self.assertRaisesRegex(sync.SyncError, 'Invalid investigation event'):
+                sync.verify_release(self.repo, self.validator)
+            self.assertTrue(sync.deploy(self.args))
+        self.assertEqual(json.loads((current / 'manifest.json').read_text())['commit'],
+                         sync.git(self.repo, 'rev-parse', 'HEAD').decode().strip())
+        # The tree's own validator still gates deployment, and its stop reason is relayed.
+        previous = current.resolve()
+        broken = dict(event, supersedes=investigations.digest(event), board_task='example-62',
+                      recorded_at='2026-11-08T00:00:00+00:00')
+        investigations.save(records / ('focus--' + investigations.digest(broken) + '.json'), broken)
+        self.commit('Record an invalid investigation')
+        sync.git(self.repo, 'push', 'origin', 'main')
+        with self.assertRaisesRegex(sync.SyncError, 'failed its own validation: Invalid investigation history: '
+                                                    'board_task must be a dotfiles board task id'):
+            sync.deploy(self.args)
+        self.assertEqual(current.resolve(), previous)
+
+    def test_verify_runs_without_the_sync_lock(self):
+        # Deploy holds the lock on the shared Git directory while the published tree verifies itself.
+        self.release()
+        output = io.StringIO()
+        with patch.object(sys, 'argv', ['sync.py', 'verify', '--repo', str(self.repo), '--validator', str(self.validator)]), \
+                patch.object(sync.fcntl, 'flock', side_effect=AssertionError('verify took the lock')), \
+                patch('sys.stdout', output):
+            self.assertEqual(sync.main(), 0)
+        self.assertEqual(output.getvalue().strip(), sync.skills_hash(self.repo))
+
     def test_deploy_last_known_good_and_local_edits(self):
         self.release()
         self.assertTrue(sync.deploy(self.args))

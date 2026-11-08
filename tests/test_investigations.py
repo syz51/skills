@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -27,15 +29,26 @@ class InvestigationTests(unittest.TestCase):
         self.patcher = patch.object(inv, 'bindings', return_value=[]); self.patcher.start(); self.addCleanup(self.patcher.stop)
         self.validation = patch.object(inv, 'validate_events', return_value=0); self.validation.start(); self.addCleanup(self.validation.stop)
 
-    def cycle(self, due='2026-11-02'):
-        return inv.prepare(self.config, self.state, due)
+    def cycle(self):
+        return inv.prepare(self.config, self.state)
 
     def decision(self, cycle, **changes):
-        return {'schema_version': 1, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None,
+        return {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None,
                 'evidence': [], 'action': 'investigate', 'state': 'open',
                 'summary': 'Investigate conditional focus and retained draft behavior',
                 'baseline_commit': inv.cycle_data(cycle)['base_commit'], 'change': None,
-                'experiments': [], 'follow_up': {'next_action': 'Run the conditional focus case and contrast fixture', 'next_due': '2026-11-09T00:00:00+00:00'}, **changes}
+                'experiments': [], 'board_task': 'dotfiles-12', **changes}
+
+    def legacy_open_event(self):
+        # A schema 1 record from before open work moved to the board, committed as history.
+        event = {'schema_version': 1, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                 'action': 'investigate', 'state': 'blocked', 'baseline_commit': inv.git(self.repo, 'rev-parse', 'HEAD'),
+                 'change': None, 'experiments': [], 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-04T00:00:00+00:00',
+                 'summary': 'Focus replay waits for an original project revision',
+                 'follow_up': {'next_action': 'Replay the focus case from a project revision', 'next_due': '2026-11-09T00:00:00+00:00'}}
+        inv.save(self.repo / 'feedback/frontend-ui/investigations' / ('focus--' + inv.digest(event) + '.json'), event)
+        inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'legacy investigation')
+        return inv.digest(event)
 
     def fixture(self, code='import sys; sys.exit(1 if sys.argv[-1]=="baseline" else 0)'):
         case = self.repo / 'skills/frontend-ui/evaluations/focus/case.json'; case.parent.mkdir(parents=True)
@@ -59,6 +72,164 @@ class InvestigationTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 inv.validate_event({**base, **changes})
 
+    def test_schema_2_open_issue_cites_a_board_task_instead_of_a_follow_up(self):
+        base = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                'action': 'investigate', 'state': 'blocked', 'baseline_commit': 'c' * 40, 'change': None, 'experiments': [],
+                'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00',
+                'summary': 'Focus replay waits for an original project revision', 'board_task': 'dotfiles-62'}
+        inv.validate_event(base)
+        runs = ['1' * 64, '2' * 64, '3' * 64]
+        inv.validate_event({**base, 'state': 'resolved', 'action': 'keep', 'board_task': None, 'experiments': runs})
+        inv.validate_event({**base, 'state': 'resolved', 'action': 'keep', 'experiments': runs})
+        rejected = ({'board_task': None}, {'state': 'provisional', 'board_task': None}, {'board_task': 'dotfiles'},
+                    {'board_task': 'dotfiles-0'}, {'board_task': 'Dotfiles-4'}, {'board_task': 62},
+                    # Only the dotfiles board carries investigation work.
+                    {'board_task': 'example-62'}, {'board_task': 'board-feedback-36'}, {'board_task': 'xdotfiles-4'},
+                    {'schema_version': 3})
+        for changes in rejected:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                inv.validate_event({**base, **changes})
+        with self.assertRaisesRegex(ValueError, 'dotfiles board task id'):
+            inv.validate_event({**base, 'board_task': 'example-62'})
+        with self.assertRaisesRegex(ValueError, 'need board_task'):
+            inv.validate_event({k: v for k, v in base.items() if k != 'board_task'})
+        follow = {'next_action': 'Replay the focus case later', 'next_due': '2026-11-09T00:00:00+00:00'}
+        with self.assertRaisesRegex(ValueError, 'carry no follow_up'):
+            inv.validate_event({**base, 'follow_up': follow})
+        with self.assertRaisesRegex(ValueError, 'carry no follow_up'):
+            inv.validate_event({**{k: v for k, v in base.items() if k != 'board_task'}, 'follow_up': follow})
+
+    def test_resolved_schema_2_event_counts_its_behavior_evidence(self):
+        # Run receipts stay host-local, so sync cannot check them, but it can refuse a resolution
+        # without the baseline, candidate and contrast runs that the cycle gate would demand.
+        base = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                'action': 'keep', 'state': 'resolved', 'baseline_commit': 'c' * 40, 'change': None,
+                'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00', 'board_task': 'dotfiles-62',
+                'summary': 'Focus replay passes candidate and contrast', 'experiments': ['1' * 64, '2' * 64, '3' * 64]}
+        inv.validate_event(base)
+        for experiments in ([], ['1' * 64, '2' * 64], ['1' * 64, '1' * 64, '2' * 64]):
+            with self.subTest(experiments=experiments), self.assertRaisesRegex(ValueError, 'behavior evidence'):
+                inv.validate_event({**base, 'experiments': experiments})
+        # Schema 1 history keeps its own rules.
+        legacy = {k: v for k, v in base.items() if k != 'board_task'}
+        inv.validate_event({**legacy, 'schema_version': 1, 'follow_up': None, 'experiments': []})
+
+    def test_dropped_task_is_a_terminal_disposition_that_claims_no_fix(self):
+        base = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                'action': 'keep', 'state': 'dropped', 'baseline_commit': 'c' * 40, 'change': None, 'experiments': [],
+                'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00', 'board_task': 'dotfiles-62',
+                'summary': 'The owner rejected the Proposal; the provisional wording stays unproven'}
+        inv.validate_event(base)
+        inv.validate_event({**base, 'action': 'investigate'})
+        for changes in ({'board_task': None}, {'action': 'revise'}, {'action': 'revert'}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                inv.validate_event({**base, **changes})
+        legacy = {**{k: v for k, v in base.items() if k != 'board_task'}, 'schema_version': 1, 'follow_up': None}
+        with self.assertRaisesRegex(ValueError, 'cannot be dropped'):
+            inv.validate_event(legacy)
+        # Recorded through a cycle, it closes the issue's open work without behavior evidence.
+        first = self.cycle(); opened = inv.record(self.config, self.state, first, self.decision(first))
+        inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'open investigation')
+        later = self.cycle()
+        dropped = inv.record(self.config, self.state, later, self.decision(
+            later, supersedes=inv.digest(opened), action='keep', state='dropped',
+            summary='The owner dropped dotfiles-12; the issue stays unresolved'))
+        self.assertEqual(dropped['board_task'], 'dotfiles-12')
+        summary = inv.validate_cycle(self.config, self.state, later)
+        self.assertEqual((summary['complete'], summary['open'], summary['dispositions']), (True, 0, 1))
+        inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'drop investigation')
+        self.assertEqual(inv.cycle_data(self.cycle())['outstanding'], {})
+
+    def test_resolved_schema_1_head_stays_valid_history(self):
+        event = {'schema_version': 1, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                 'action': 'keep', 'state': 'resolved', 'baseline_commit': inv.git(self.repo, 'rev-parse', 'HEAD'),
+                 'change': None, 'experiments': [], 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-04T00:00:00+00:00',
+                 'summary': 'Focus replay passed before the board held open work', 'follow_up': None}
+        inv.save(self.repo / 'feedback/frontend-ui/investigations' / ('focus--' + inv.digest(event) + '.json'), event)
+        inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'legacy resolution')
+        _, heads = inv.inventory(self.repo)
+        self.assertEqual(list(heads.values()), [event])
+        cycle = self.cycle()
+        self.assertEqual(inv.cycle_data(cycle)['outstanding'], {})
+        self.assertEqual(inv.validate_cycle(self.config, self.state, cycle)['open'], 0)
+        # A later schema 2 event may reopen it on a board task.
+        reopened = inv.record(self.config, self.state, cycle, self.decision(cycle, supersedes=inv.digest(event)))
+        self.assertEqual(list(inv.inventory(self.repo)[1].values()), [reopened])
+
+    def test_schema_1_event_cannot_supersede_schema_2(self):
+        head = inv.git(self.repo, 'rev-parse', 'HEAD')
+        newer = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                 'action': 'investigate', 'state': 'blocked', 'baseline_commit': head, 'change': None, 'experiments': [],
+                 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00', 'board_task': 'dotfiles-62',
+                 'summary': 'Focus replay waits for an original project revision'}
+        older = {k: v for k, v in newer.items() if k != 'board_task'}
+        older.update(schema_version=1, supersedes=inv.digest(newer), state='resolved', action='keep',
+                     recorded_at='2026-11-08T00:00:00+00:00', follow_up=None)
+        with self.assertRaisesRegex(ValueError, 'schema 1 investigation event cannot supersede'):
+            inv.heads_for({inv.digest(newer): newer, inv.digest(older): older})
+        cycle = self.cycle()
+        with self.assertRaisesRegex(ValueError, 'schema 2 investigation events only'):
+            inv.record(self.config, self.state, cycle, {**self.decision(cycle), 'schema_version': 1})
+
+    def test_open_head_check_follows_board_task_not_the_current_schema_number(self):
+        event = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': None, 'evidence': [],
+                 'action': 'investigate', 'state': 'blocked', 'baseline_commit': 'c' * 40, 'change': None,
+                 'experiments': [], 'cycle_id': 'd' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00',
+                 'board_task': 'dotfiles-62', 'summary': 'Focus replay waits for an original project revision'}
+        with patch.object(inv, 'SCHEMA_VERSION', 3):
+            self.assertEqual(list(inv.heads_for({inv.digest(event): event}).values()), [event])
+
+    def test_record_refuses_a_chain_another_writer_extended(self):
+        cycle = self.cycle(); base = inv.git(self.repo, 'rev-parse', 'HEAD')
+        inv.record(self.config, self.state, cycle, self.decision(cycle, summary='Another writer extended this issue first'))
+        inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'their event')
+        theirs = inv.git(self.repo, 'rev-parse', 'HEAD')
+        inv.git(self.repo, 'reset', '--hard', base)
+        inv.git(self.repo, 'update-ref', 'refs/remotes/origin/main', theirs)
+        with self.assertRaisesRegex(ValueError, 'another writer extended it'):
+            inv.record(self.config, self.state, cycle, self.decision(cycle))
+        # A chain recorded before the other writer's event landed is caught by the cycle gate.
+        inv.git(self.repo, 'update-ref', 'refs/remotes/origin/main', base)
+        inv.record(self.config, self.state, cycle, self.decision(cycle))
+        self.assertTrue(inv.validate_cycle(self.config, self.state, cycle)['complete'])
+        inv.git(self.repo, 'update-ref', 'refs/remotes/origin/main', theirs)
+        with self.assertRaisesRegex(ValueError, 'another writer extended it'):
+            inv.validate_cycle(self.config, self.state, cycle)
+
+    def test_command_line_runs_the_documented_cycle(self):
+        config = self.state / 'config.json'; config.write_text(json.dumps(self.config))
+        def main(*args):
+            output = io.StringIO()
+            with patch.object(sys, 'argv', ['investigations.py', *args, '--config', str(config)]), redirect_stdout(output):
+                self.assertEqual(inv.main(), 0)
+            return json.loads(output.getvalue())
+        cycle = main('prepare')['cycle']
+        self.assertNotIn('due', inv.cycle_data(cycle))
+        decision = self.state / 'decision.json'
+        decision.write_text(json.dumps({k: v for k, v in self.decision(cycle).items() if k != 'schema_version'}))
+        self.assertEqual(main('record', '--cycle', cycle, '--decision', str(decision))['schema_version'], 2)
+        result = main('validate', '--cycle', cycle)
+        self.assertEqual((result['complete'], result['open'], result['dispositions']), (True, 1, 1))
+        self.assertEqual(set(main('report', '--cycle', cycle)), {'cycle_id', 'base_commit', 'required', 'outstanding'})
+
+    def test_legacy_open_issue_must_move_to_a_board_task(self):
+        legacy = self.legacy_open_event()
+        with self.assertRaisesRegex(ValueError, 'frontend-ui/focus must cite its board task'):
+            inv.inventory(self.repo)
+        with self.assertRaisesRegex(ValueError, 'must cite its board task'):
+            self.cycle()
+        # The migration appends a schema 2 event to the chain; the schema 1 record stays as history.
+        moved = {'schema_version': 2, 'issue_id': 'focus', 'skill': 'frontend-ui', 'supersedes': legacy, 'evidence': [],
+                 'action': 'investigate', 'state': 'blocked', 'baseline_commit': inv.git(self.repo, 'rev-parse', 'HEAD'),
+                 'change': None, 'experiments': [], 'cycle_id': 'e' * 64, 'recorded_at': '2026-11-07T00:00:00+00:00',
+                 'summary': 'Focus replay waits for an original project revision', 'board_task': 'dotfiles-62'}
+        inv.save(self.repo / 'feedback/frontend-ui/investigations' / ('focus--' + inv.digest(moved) + '.json'), moved)
+        events, heads = inv.inventory(self.repo)
+        self.assertEqual(len(events), 2)
+        self.assertEqual([v['board_task'] for v in heads.values()], ['dotfiles-62'])
+        inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'move investigation to the board')
+        self.assertEqual([v['board_task'] for v in inv.cycle_data(self.cycle())['outstanding'].values()], ['dotfiles-62'])
+
     def test_cycle_fingerprint_rejects_tampering(self):
         path = self.cycle(); data = inv.read(path); data['required'].append(self.binding); path.write_text(json.dumps(data))
         with self.assertRaisesRegex(ValueError, 'modified'): inv.validate_cycle(self.config, self.state, path)
@@ -70,19 +241,22 @@ class InvestigationTests(unittest.TestCase):
             inv.record(self.config, self.state, cycle, self.decision(cycle, evidence=[{k:v for k,v in self.binding.items() if k!='skill'}]))
             self.assertTrue(inv.validate_cycle(self.config, self.state, cycle)['complete'])
 
-    def test_pending_issue_carries_and_cannot_be_rubberstamped(self):
+    def test_open_issue_is_cited_by_board_task_not_carried_and_cannot_be_rubberstamped(self):
         first = self.cycle(); event = inv.record(self.config, self.state, first, self.decision(first)); h = inv.digest(event)
+        self.assertEqual((event['schema_version'], event['board_task']), (2, 'dotfiles-12'))
         inv.git(self.repo, 'add', '.'); inv.git(self.repo, 'commit', '-m', 'retain investigation')
-        same_week = self.cycle()
-        self.assertFalse(inv.cycle_data(same_week)['pending'])
-        self.assertEqual(len(inv.cycle_data(same_week)['outstanding']), 1)
-        self.assertTrue(inv.validate_cycle(self.config, self.state, same_week)['complete'])
-        second = self.cycle('2026-11-09')
-        with self.assertRaisesRegex(ValueError, 'not revisited'): inv.validate_cycle(self.config, self.state, second)
+        later = self.cycle()
+        self.assertNotIn('pending', inv.cycle_data(later))
+        self.assertEqual({k: v['board_task'] for k, v in inv.cycle_data(later)['outstanding'].items()}, {h: 'dotfiles-12'})
+        # The board task carries the issue, so a later cycle need not revisit it.
+        self.assertTrue(inv.validate_cycle(self.config, self.state, later)['complete'])
+        with self.assertRaisesRegex(ValueError, 'cite its board task'):
+            inv.record(self.config, self.state, later, self.decision(later, supersedes=h, state='blocked', board_task=None))
         with self.assertRaisesRegex(ValueError, 'behavior evidence'):
-            inv.record(self.config, self.state, second, self.decision(second, supersedes=h, action='keep', state='resolved', follow_up=None))
-        inv.record(self.config, self.state, second, self.decision(second, supersedes=h, state='blocked'))
-        self.assertTrue(inv.validate_cycle(self.config, self.state, second)['complete'])
+            inv.record(self.config, self.state, later, self.decision(later, supersedes=h, action='keep', state='resolved'))
+        inv.record(self.config, self.state, later, self.decision(later, supersedes=h, state='blocked', board_task='dotfiles-13'))
+        summary = inv.validate_cycle(self.config, self.state, later)
+        self.assertEqual((summary['complete'], summary['open'], summary['dispositions']), (True, 1, 1))
 
     def test_event_hash_and_chain_tampering_rejected(self):
         cycle = self.cycle(); event = inv.record(self.config, self.state, cycle, self.decision(cycle))
@@ -144,25 +318,32 @@ class InvestigationTests(unittest.TestCase):
     def test_handwritten_resolved_event_cannot_bypass_behavior_gate(self):
         cycle=self.cycle();event=inv.record(self.config,self.state,cycle,self.decision(cycle))
         path=next((self.repo/'feedback/frontend-ui/investigations').glob('*.json'));path.unlink()
-        event['state']='resolved';event['action']='keep';event['follow_up']=None
-        inv.save(path.with_name('focus--'+inv.digest(event)+'.json'),event)
+        event['state']='resolved';event['action']='keep';event['board_task']=None
+        written=path.with_name('focus--'+inv.digest(event)+'.json');inv.save(written,event)
+        # Without runs, sync's own validation already refuses it.
+        with self.assertRaisesRegex(ValueError,'behavior evidence'):inv.inventory(self.repo)
         with self.assertRaisesRegex(ValueError,'behavior evidence'):inv.validate_cycle(self.config,self.state,cycle)
+        written.unlink();event['experiments']=['1'*64,'2'*64,'3'*64]
+        inv.save(path.with_name('focus--'+inv.digest(event)+'.json'),event)
+        # Invented run hashes pass that count but not the cycle gate, which reads the receipts.
+        inv.inventory(self.repo)
+        with self.assertRaisesRegex(ValueError,'evidence file'):inv.validate_cycle(self.config,self.state,cycle)
 
     def test_minimal_handwritten_run_receipts_are_rejected(self):
         cycle = self.cycle(); frozen = inv.cycle_data(cycle)
         hashes = []
-        for variant in ('candidate', 'contrast'):
+        for variant in ('baseline', 'candidate', 'contrast'):
             fake = {'cycle_id': frozen['cycle_id'], 'runner_sha256': frozen['runner_sha256'],
                     'skill': 'frontend-ui', 'issue_id': 'focus', 'variant': variant, 'passed': True,
                     'plan_sha256': 'a'*64, 'fixture_sha256': 'b'*64, 'evidence_scope': 'synthetic_behavior'}
             h = inv.digest(fake); inv.save(self.state/'investigations/runs'/(h+'.json'), fake); hashes.append(h)
         with self.assertRaisesRegex(ValueError, 'Incomplete execution receipt'):
-            inv.record(self.config, self.state, cycle, self.decision(cycle, action='keep', state='resolved', follow_up=None, experiments=hashes))
+            inv.record(self.config, self.state, cycle, self.decision(cycle, action='keep', state='resolved', board_task=None, experiments=hashes))
 
     def test_final_gate_rejects_stale_guidance_and_missing_logs(self):
         cycle = self.cycle(); case = self.fixture()
         runs = [inv.run(self.config, self.state, cycle, case, v)['run_sha256'] for v in ('baseline', 'candidate', 'contrast')]
-        decision = self.decision(cycle, action='keep', state='resolved', follow_up=None, experiments=runs)
+        decision = self.decision(cycle, action='keep', state='resolved', board_task=None, experiments=runs)
         inv.record(self.config, self.state, cycle, decision)
         self.assertTrue(inv.validate_cycle(self.config, self.state, cycle)['complete'])
         nested = case.parents[2]/'references/new.md'; nested.parent.mkdir(); nested.write_text('untested nested policy')
@@ -178,7 +359,7 @@ class InvestigationTests(unittest.TestCase):
         runs = [inv.run(self.config, self.state, cycle, case, v)['run_sha256'] for v in ('baseline', 'candidate', 'contrast')]
         (case.parents[2]/'SKILL.md').write_text('untested subsequent guidance')
         with self.assertRaisesRegex(ValueError, 'current guidance'):
-            inv.record(self.config, self.state, cycle, self.decision(cycle, action='keep', state='resolved', follow_up=None, experiments=runs))
+            inv.record(self.config, self.state, cycle, self.decision(cycle, action='keep', state='resolved', board_task=None, experiments=runs))
 
     def test_refresh_cannot_grandfather_failed_draft_events_or_reviews(self):
         first = self.cycle()

@@ -20,7 +20,15 @@ import evidence
 HEX = re.compile(r'[a-f0-9]{64}')
 ID = re.compile(r'[a-z0-9][a-z0-9-]{0,79}')
 ACTIONS = {'keep', 'revise', 'revert', 'investigate'}
-STATES = {'open', 'provisional', 'resolved', 'blocked'}
+OPEN_STATES = {'open', 'provisional', 'blocked'}
+# 'dropped' ends work without resolving the issue: its board task was dropped or its Proposal
+# rejected. It claims no fix, so it needs no closure evidence; a later event may reopen the issue.
+STATES = OPEN_STATES | {'resolved', 'dropped'}
+# Open work lives on the owner's work board (the dotfiles board), not in these records: an
+# unresolved schema 2 event cites the board task that carries its next action. Only the id's form
+# is checked; whether the task exists is not known offline.
+BOARD_TASK = re.compile(r'dotfiles-[1-9][0-9]{0,8}')
+SCHEMA_VERSION = 2
 RUNNER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
@@ -59,19 +67,25 @@ def bindings(root):
             for item in evidence.assessment_inventory(root / 'feedback')['latest']]
 
 
-def instant(value, allow_date=False):
+def instant(value):
     if not isinstance(value, str): raise ValueError('Expected timestamp text')
     parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
     if parsed.tzinfo is None:
-        if allow_date and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value): return parsed.replace(tzinfo=timezone.utc)
         raise ValueError('Investigation timestamps require a timezone')
     return parsed
 
 
 def validate_event(value):
-    expected = {'schema_version', 'issue_id', 'skill', 'supersedes', 'evidence', 'action', 'state',
-                'summary', 'baseline_commit', 'change', 'experiments', 'follow_up', 'cycle_id', 'recorded_at'}
-    if set(value) != expected or value['schema_version'] != 1 or value['skill'] not in capture.SKILLS:
+    common = {'schema_version', 'issue_id', 'skill', 'supersedes', 'evidence', 'action', 'state',
+              'summary', 'baseline_commit', 'change', 'experiments', 'cycle_id', 'recorded_at'}
+    # Schema 1 carried its own follow-up; those records stay valid as append-only history.
+    version = value.get('schema_version') if isinstance(value, dict) else None
+    if version == 2 and 'follow_up' in value:
+        raise ValueError('Schema 2 investigation events carry no follow_up; cite the board task as board_task')
+    if version == 2 and 'board_task' not in value:
+        raise ValueError('Schema 2 investigation events need board_task (null only when resolved)')
+    expected = common | ({'follow_up'} if version == 1 else {'board_task'})
+    if version not in (1, 2) or set(value) != expected or value['skill'] not in capture.SKILLS:
         raise ValueError('Invalid investigation event')
     if not isinstance(value['issue_id'], str) or not ID.fullmatch(value['issue_id']):
         raise ValueError('Invalid investigation identity')
@@ -94,7 +108,21 @@ def validate_event(value):
             raise ValueError('Invalid source binding')
     if any(not isinstance(h, str) or not HEX.fullmatch(h) for h in value['experiments']):
         raise ValueError('Invalid execution hash')
-    if value['state'] != 'resolved':
+    if version == 2:
+        task = value['board_task']
+        if task is not None and (not isinstance(task, str) or not BOARD_TASK.fullmatch(task)):
+            raise ValueError('board_task must be a dotfiles board task id (dotfiles-<n>)')
+        if task is None and value['state'] != 'resolved':
+            raise ValueError('Open or dropped investigation must cite its board task')
+        # Only the cycle gate can check the run receipts, which stay host-local; any validator can
+        # count them, so a hand-written resolution without a comparison fails sync too.
+        if value['state'] == 'resolved' and len(set(value['experiments'])) < 3:
+            raise ValueError('A resolved investigation needs baseline, candidate and contrast behavior evidence')
+        if value['state'] == 'dropped' and value['action'] not in ('keep', 'investigate'):
+            raise ValueError('A dropped investigation cannot claim a revision')
+    elif value['state'] == 'dropped':
+        raise ValueError('Schema 1 investigation events cannot be dropped')
+    elif value['state'] != 'resolved':
         follow = value['follow_up']
         if not isinstance(follow, dict) or set(follow) != {'next_action', 'next_due'} or not isinstance(follow['next_action'], str) or not 12 <= len(follow['next_action'].strip()) <= 1000 or '\n' in follow['next_action']:
             raise ValueError('Open investigation requires a concrete follow-up')
@@ -111,11 +139,16 @@ def heads_for(events):
         if prior is not None:
             if prior not in events or prior in consumed or any(events[prior][k] != value[k] for k in ('issue_id', 'skill')) or capture.timestamp(events[prior]['recorded_at']) > capture.timestamp(value['recorded_at']):
                 raise ValueError('Broken or branching investigation chain')
+            if value['schema_version'] == 1 and events[prior]['schema_version'] != 1:
+                raise ValueError('A schema 1 investigation event cannot supersede a schema 2 event')
             consumed.add(prior)
     heads = {h: v for h, v in events.items() if h not in consumed}
     identities = [(v['skill'], v['issue_id']) for v in heads.values()]
     if len(identities) != len(set(identities)):
         raise ValueError('Unlinked investigation histories')
+    for v in heads.values():
+        if v['state'] in OPEN_STATES and (v['schema_version'] == 1 or v.get('board_task') is None):
+            raise ValueError('Open investigation ' + v['skill'] + '/' + v['issue_id'] + ' must cite its board task in a schema 2 event')
     return heads
 
 
@@ -130,6 +163,27 @@ def inventory(root):
                 raise ValueError('Investigation identity mismatch')
             events[h] = value
     return events, heads_for(events)
+
+
+def remote_issue_events(root, skill, issue_id):
+    """Hashes of one issue's events on origin/main, or None when the checkout has no origin/main."""
+    try:
+        ref = git(root, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main')
+    except subprocess.CalledProcessError:
+        return None
+    name = re.compile(re.escape(issue_id) + r'--([a-f0-9]{64})\.json')
+    found = (name.fullmatch(PurePosixPath(n).name)
+             for n in git(root, 'ls-tree', '--name-only', ref, '--', 'feedback/' + skill + '/investigations/').splitlines())
+    return {match.group(1) for match in found if match}
+
+
+def require_unbranched(root, events, skill, issue_id):
+    # Two writers extending one chain at once branch it, which breaks sync on main. Claiming the
+    # issue's board task first prevents that; this catches a chain another writer already extended.
+    remote = remote_issue_events(root, skill, issue_id)
+    if remote is not None and not remote <= set(events):
+        raise ValueError('Investigation ' + skill + '/' + issue_id + ' has events on origin/main that this checkout '
+                         'lacks: another writer extended it. Update the checkout and claim its board task first')
 
 
 def blob_hash(root, commit, name):
@@ -201,7 +255,7 @@ def validate_events(root):
     return len(events)
 
 
-def prepare(config, state_root, due, trusted_base=None):
+def prepare(config, state_root, trusted_base=None):
     root = Path(config['repo_path']).resolve(); state = Path(state_root)
     validate_events(root)
     current = bindings(root)
@@ -228,11 +282,10 @@ def prepare(config, state_root, due, trusted_base=None):
         if not covered and not all(re.search(r'(?<![a-f0-9])' + binding[k] + r'(?![a-f0-9])', texts) for k in ('note_sha256', 'receipt_sha256')):
             required.append(binding)
     if digest(Path(__file__).read_bytes()) != RUNNER_SHA256: raise ValueError('Investigation runner changed; start a fresh cycle')
-    due_at = instant(str(due), allow_date=True)
-    outstanding = {h: v for h, v in heads.items() if v['state'] != 'resolved'}
-    value = {'schema_version': 1, 'runner_sha256': RUNNER_SHA256, 'due': str(due), 'base_commit': base,
+    # Open issues are queued as board tasks; the cycle only cites them.
+    outstanding = {h: v for h, v in heads.items() if v['state'] in OPEN_STATES}
+    value = {'schema_version': 2, 'runner_sha256': RUNNER_SHA256, 'base_commit': base,
              'created_at': datetime.now(timezone.utc).isoformat(), 'bindings': current, 'required': required,
-             'pending': {h: v for h, v in outstanding.items() if instant(v['follow_up']['next_due']) <= due_at},
              'outstanding': outstanding, 'prior_events': sorted(events)}
     value['cycle_id'] = digest(value)
     path = state / 'investigations/cycles' / (value['cycle_id'] + '.json'); save(path, value)
@@ -334,13 +387,16 @@ def closure_proof(root, value, runs):
 def record(config, state_root, cycle_path, decision):
     cycle = cycle_data(cycle_path); root = Path(config['repo_path']).resolve()
     git(root, 'merge-base', '--is-ancestor', cycle['base_commit'], 'HEAD')
-    _, heads = inventory(root)
+    events, heads = inventory(root)
     value = dict(decision)
-    value.update(schema_version=1, cycle_id=cycle['cycle_id'], recorded_at=datetime.now(timezone.utc).isoformat())
+    if value.get('schema_version', SCHEMA_VERSION) != SCHEMA_VERSION:
+        raise ValueError('record writes schema 2 investigation events only')
+    value.update(schema_version=SCHEMA_VERSION, cycle_id=cycle['cycle_id'], recorded_at=datetime.now(timezone.utc).isoformat())
     validate_event(value)
     previous = {h: v for h, v in heads.items() if v['skill'] == value['skill'] and v['issue_id'] == value['issue_id']}
     if value['supersedes'] != next(iter(previous), None):
         raise ValueError('Disposition must extend the latest issue head')
+    require_unbranched(root, events, value['skill'], value['issue_id'])
     for item in value['evidence']:
         if {'skill': value['skill'], **item} not in cycle['bindings']:
             raise ValueError('Disposition source binding is not current')
@@ -368,14 +424,9 @@ def validate_cycle(config, state_root, cycle_path):
     for binding in cycle['required']:
         if not any(v['skill'] == binding['skill'] and {k: binding[k] for k in ('note_sha256', 'receipt_sha256', 'source_machine')} in v['evidence'] for v in new.values()):
             raise ValueError('New evidence has no investigation disposition')
-    for h in cycle['pending']:
-        descendants = {h}
-        for _ in range(len(new) + 1):
-            descendants |= {k for k, v in new.items() if v['supersedes'] in descendants}
-        if descendants == {h}:
-            raise ValueError('Pending investigation was not revisited')
     for v in new.values():
         if v['baseline_commit'] != cycle['base_commit']: raise ValueError('Disposition baseline is not the frozen cycle base')
+        require_unbranched(root, events, v['skill'], v['issue_id'])
         validate_change(root, v)
         if any({'skill': v['skill'], **b} not in cycle['bindings'] for b in v['evidence']):
             raise ValueError('Disposition source binding is not current')
@@ -388,7 +439,7 @@ def validate_cycle(config, state_root, cycle_path):
             closure_proof(root, v, runs)
 
     return {'cycle_id': cycle['cycle_id'], 'dispositions': len(new),
-            'open': sum(v['state'] != 'resolved' for v in heads.values()), 'complete': True}
+            'open': sum(v['state'] in OPEN_STATES for v in heads.values()), 'complete': True}
 
 
 def relative(name):
@@ -596,18 +647,19 @@ def snapshot_project(config, project_id, files, destination):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument('command', choices=('prepare', 'report', 'run', 'record', 'snapshot'))
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument('command', choices=('prepare', 'report', 'run', 'record', 'validate', 'snapshot'))
     parser.add_argument('--config', type=Path, required=True); parser.add_argument('--cycle', type=Path)
-    parser.add_argument('--due', default=datetime.now(timezone.utc).isoformat()); parser.add_argument('--case', type=Path)
+    parser.add_argument('--case', type=Path)
     parser.add_argument('--variant', choices=('baseline', 'candidate', 'contrast')); parser.add_argument('--issue'); parser.add_argument('--decision', type=Path)
     parser.add_argument('--project'); parser.add_argument('--files', nargs='+'); parser.add_argument('--destination', type=Path)
     args = parser.parse_args(); config = read(args.config); state = args.config.resolve().parent
-    if args.command == 'prepare': result = {'cycle': str(prepare(config, state, args.due))}
+    if args.command == 'prepare': result = {'cycle': str(prepare(config, state))}
     elif args.command == 'snapshot': result = snapshot_project(config, args.project, args.files, args.destination)
     elif args.command == 'report':
         cycle = cycle_data(args.cycle)
-        result = {k: cycle[k] for k in ('cycle_id', 'due', 'base_commit', 'required', 'pending', 'outstanding')}
+        result = {k: cycle[k] for k in ('cycle_id', 'base_commit', 'required', 'outstanding')}
     elif args.command == 'run': result = run(config, state, args.cycle, args.case, args.variant, args.issue)
+    elif args.command == 'validate': result = validate_cycle(config, state, args.cycle)
     else: result = record(config, state, args.cycle, read(args.decision))
     print(json.dumps(result, indent=2))
     return 1 if args.command == 'run' and result['outcome'] not in ('passed', 'assertion_failed') else 0

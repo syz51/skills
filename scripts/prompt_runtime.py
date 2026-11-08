@@ -33,7 +33,8 @@ first-party reproduction plans in fresh private copies. Copies are not an OS san
 Never blindly replay source commands or execute untrusted upstream scripts or install hooks.
 Keep raw source, logs and artifacts host-local; commit only investigation records.
 Freeze case/oracle bytes before comparisons. An existing rule does not resolve recurrence;
-record actual experiments or precise blockers and carry open/provisional issues forward.
+record actual experiments or precise blockers; file open/provisional issues as dotfiles work
+board tasks and cite them in investigation records instead of carrying them forward.
 Keep, revise, simplify, remove or restore guidance when supported. Restore through new
 forward commits, never history resets or discarded concurrent work. Failed experiments are
 learning evidence, not proof of success. Loading, compilation and proxies do not establish
@@ -47,7 +48,8 @@ For evidenced Rust library gaps, that procedure also permits bounded primary-doc
 research and locally authored library references/routing/evaluations within skills/rust.
 Do not treat dependency presence as evidence of a lesson or alter source identities or public inventory.
 The wrapper handles collection, publication and deployment; never publish, deploy, push,
-send messages or create recurring tasks yourself.
+send messages or create recurring tasks yourself. Filing and updating dotfiles board tasks
+for investigation issues is the only external write allowed.
 ''',
 }
 

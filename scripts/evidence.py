@@ -225,12 +225,19 @@ def source_input(note, turn, **extra):
     return data, source['truncated'] or any(item['truncated'] for item in later) or len(later) != len(follow_ups)
 
 
+def one_line(text):
+    """A model-written field is stored as one note line, which neither the schema nor the prompts require of the
+    model, so its line breaks become single spaces instead of failing the check; other values pass unchanged."""
+    return re.sub(r'\s*[\r\n]\s*', ' ', text).strip() if isinstance(text, str) else text
+
+
 def verify_note(config, state_root, note, turn, skill, correction_of=None, *, deadline=None, wait_for_rate_limit=True):
     data, truncated = source_input(note, turn, **({'correction_of': correction_of} if correction_of is not None else {}))
     result = model_response(config, state_root, prompt_runtime.load('verify', config), data, SCHEMA, deadline=deadline,
                             wait_for_rate_limit=wait_for_rate_limit, role='verify')
     if not isinstance(result, dict) or set(result) != {'status', 'summary'} or result['status'] not in SCHEMA['properties']['status']['enum']:
         raise ValueError('Invalid source verification result')
+    result = {**result, 'summary': one_line(result['summary'])}
     capture.validate_summary(result['summary'], skill)
     return {**result, 'inputSha256': hashlib.sha256(data.encode()).hexdigest(),
             'inputTruncated': truncated}
@@ -241,10 +248,12 @@ def correct_note(config, state_root, note, turn, skill, assessment, *, deadline=
                                   assessment={key: assessment[key] for key in ('status', 'summary')})
     if truncated:
         return None
-    candidates = validate_notes(model_response(config, state_root, prompt_runtime.load('correct', config), data,
-                                               CORRECTION_SCHEMA, deadline=deadline, wait_for_rate_limit=wait_for_rate_limit,
-                                               role='correct'),
-                                {'verified_skills': [skill]})
+    response = model_response(config, state_root, prompt_runtime.load('correct', config), data, CORRECTION_SCHEMA,
+                              deadline=deadline, wait_for_rate_limit=wait_for_rate_limit, role='correct')
+    if isinstance(response, dict) and isinstance(response.get('notes'), list):
+        response = {**response, 'notes': [{key: one_line(value) if key in FIELDS else value for key, value in item.items()}
+                                          if isinstance(item, dict) else item for item in response['notes']]}
+    candidates = validate_notes(response, {'verified_skills': [skill]})
     if len(candidates) > 1:
         raise ValueError('Too many correction candidates')
     if not candidates:
@@ -509,6 +518,10 @@ def verify(config, state_root, note_sha=None, recheck=False, now=None):
             count_outcome(counts, 'error', None)
             if isinstance(error, ExtractorFailure) and len(counts.get('extractor_diagnostics', [])) < 10:
                 counts.setdefault('extractor_diagnostics', []).append(error.diagnostics)
+            elif not isinstance(error, ExtractorFailure) and len(counts.get('check_diagnostics', [])) < 10:
+                # The pipeline's own messages are static; the note key locates the check without its text.
+                counts.setdefault('check_diagnostics', []).append(
+                    {'note': key, 'error_class': type(error).__name__, 'message': str(error)[:200]})
     if counts['rate_limited']:
         counts['rate_limit'] = capture.rate_limit_summary(limit, counts['rate_limited'], datetime.now(timezone.utc))
         if counts['rate_limit']['overdue'] and not note_sha:
