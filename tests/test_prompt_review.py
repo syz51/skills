@@ -125,8 +125,8 @@ class PromptReviewTests(unittest.TestCase):
 
     def test_training_gain_cannot_hide_heldout_failure(self):
         original = review.evaluate
-        def evaluate(config, state, root, role, text, cases, deadline):
-            values = original(config, state, root, role, text, cases, deadline)
+        def evaluate(config, state, root, role, text, cases, deadline, **kwargs):
+            values = original(config, state, root, role, text, cases, deadline, **kwargs)
             if cases == review.load_cases(root, holdouts=True) and 'REFINED' in text:
                 values[next(iter(values))] = [False, False]
             return values
@@ -272,7 +272,7 @@ class PromptReviewTests(unittest.TestCase):
         self.assertEqual(review.fallback_status(config, self.state), {'api_fallback': record})
         self.assertEqual(review.fallback_status(self.config, self.state), {})
         seen = []
-        def evaluate(config, *args):
+        def evaluate(config, *args, **kwargs):
             seen.append(config['review_backend'])
             raise RuntimeError('stop after the baseline')
         with patch.object(review, 'evaluate', side_effect=evaluate), self.assertRaises(RuntimeError):
@@ -340,10 +340,10 @@ class PromptReviewTests(unittest.TestCase):
 
     def test_interrupted_candidate_is_frozen_before_evaluation_and_retryable(self):
         evaluate = review.evaluate
-        def interrupt(config, state, root, role, text, cases, deadline):
+        def interrupt(config, state, root, role, text, cases, deadline, **kwargs):
             if 'REFINED' in text:
                 raise TimeoutError('evaluation interrupted')
-            return evaluate(config, state, root, role, text, cases, deadline)
+            return evaluate(config, state, root, role, text, cases, deadline, **kwargs)
         with patch.object(review, 'evaluate', side_effect=interrupt):
             with self.assertRaises(RuntimeError):
                 self.run_review()
@@ -433,6 +433,130 @@ class PromptReviewTests(unittest.TestCase):
         self.assertFalse(review.improves({key: [True, False]}, {key: [False, True]}, [case]))
         self.assertFalse(review.improves({key: [True, True]}, {key: [True, True]}, [case]))
 
+    def noisy_grade_review(self, flip, votes):
+        """Run a review whose batch grader fails one right-status candidate answer, at a case the baseline passed, in
+        each candidate evaluation named in `flip` ('visible', 'holdout'). Each such answer's solo grades return `votes`."""
+        holdouts = {c['rubric']: c for c in review.load_cases(self.repo, holdouts=True)}
+        candidate, flipped, solo = [False], {}, []
+        original = self.responder
+        def respond(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
+            if role is not None:
+                candidate[0] = 'REFINED' in prompt
+            if schema is not review.GRADE_SCHEMA:
+                return original(config, state, prompt, data, schema, deadline=deadline, role=role, backend=backend)
+            items = json.loads(data)['items']
+            if len(items) == 1 and items[0]['item_id'] in flipped:
+                solo.append(items[0])
+                return {'grades': [{'item_id': items[0]['item_id'], 'passed': next(flipped[items[0]['item_id']])}]}
+            kind = 'holdout' if items[0]['case']['rubric'] in holdouts else 'visible'
+            failed = None
+            if candidate[0] and kind in flip:
+                failed = next(item for item in items if 'button spacing' not in json.dumps(item))
+                flipped[failed['item_id']] = iter(votes)
+            return {'grades': [{'item_id': item['item_id'], 'passed': item is not failed} for item in items]}
+        with patch.object(review.capture, 'model_response', side_effect=respond):
+            result = review.run(self.config, self.state, due=self.due)
+        self.assertEqual(len(flipped), len(flip))
+        return result, solo, list(flipped)
+
+    def test_one_noisy_grade_with_the_right_status_does_not_fail_the_gate(self):
+        # The batch grader fails one right-status answer in the visible and in the held-out candidate evaluation, at a
+        # case the baseline passed. Under the batch grades alone the gate rejects; solo grades pass each answer 2 of
+        # 3 times, as solo grades passed the status-correct ae97cc06 answer, so the candidate is promoted.
+        result, solo, flipped = self.noisy_grade_review({'visible', 'holdout'}, [True, False, True])
+        self.assertEqual(result['outcome'], 'promoted')
+        self.assertEqual([item['item_id'] for item in solo], [i for i in flipped for _ in range(3)])
+        record = json.loads(next((self.repo / 'prompt-reviews').glob('*.json')).read_text())
+        for side in ('candidate', 'holdout_candidate', 'holdout_baseline'):
+            self.assertTrue(all(all(v) for v in record[side].values()))
+
+    def test_a_lost_pass_that_regrading_repeats_still_fails_the_gate(self):
+        for flip, reason, side in (('visible', 'no_consistent_gain', 'candidate'),
+                                   ('holdout', 'held_out_regression', 'holdout_candidate')):
+            with self.subTest(flip=flip):
+                shutil.rmtree(self.state)
+                self.state.mkdir()
+                result, solo, flipped = self.noisy_grade_review({flip}, [False, True, False])
+                self.assertEqual(result['reason'], reason)
+                self.assertEqual([item['item_id'] for item in solo], 3 * flipped)
+                self.assertEqual(sum(not passed for v in result[side].values() for passed in v), 1)
+                self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
+
+    def test_evaluate_records_right_status_answers_whose_batch_grade_failed(self):
+        cases = [c for c in review.load_cases(self.repo) if c['role'] == 'verify']
+        first = review.digest(cases[0])
+        answered, grades = {}, []
+        def respond(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
+            value = json.loads(data)
+            if schema is review.GRADE_SCHEMA:
+                grades.append(len(value['items']))
+                return {'grades': [{'item_id': item['item_id'], 'passed': False} for item in value['items']]}
+            case = next(c for c in cases if review.task_input(c) == value)
+            repeat = answered[review.digest(case)] = answered.get(review.digest(case), -1) + 1
+            status = case['expected'] if case is not cases[0] or repeat else next(
+                s for s in ('supported', 'partial', 'unsupported') if s != case['expected'])
+            return {'status': status, 'summary': 'The note matches the original turn.'}
+        disputes = {}
+        text = (self.repo / 'prompts/verify.md').read_text()
+        with patch.object(review.capture, 'model_response', side_effect=respond):
+            result = review.evaluate({'review_backend': 'cli'}, self.state, self.repo, 'verify', text, cases,
+                                     time.monotonic() + 30, disputes=disputes)
+        self.assertEqual(grades, [2 * len(cases)])  # One batch call; evaluate never regrades.
+        self.assertTrue(not any(any(v) for v in result.values()))
+        # The wrong status at the first case's first repeat is not disputed.
+        self.assertEqual(set(disputes), {(review.digest(c), r) for c in cases for r in range(2)} - {(first, 0)})
+        self.assertEqual(disputes[(first, 1)]['case']['rubric'], cases[0]['rubric'])
+
+    def test_settle_regrades_only_answers_that_decide_the_gate(self):
+        def make(critical=False):
+            cases = [{'role': 'verify', 'input': '{}', 'expected': 'supported', 'rubric': name, 'critical': critical}
+                     for name in ('a', 'b')]
+            return cases, [review.digest(c) for c in cases]
+        def run(cases, baseline, candidate, disputed, gain=True, failing=()):
+            # `disputed` names (side, case index, repeat); solo grades fail the answers named in `failing`.
+            keys = [review.digest(c) for c in cases]
+            disputes = {'baseline': {}, 'candidate': {}}
+            for side, index, repeat in disputed:
+                disputes[side][(keys[index], repeat)] = {'item_id': side + str(index) + str(repeat)}
+            regraded = []
+            def regrade(config, state, role, item, deadline):
+                regraded.append(item['item_id'])
+                return item['item_id'] not in failing
+            with patch.object(review, 'regrade', side_effect=regrade):
+                settled = review.settle({}, self.state, 'verify', cases, dict(zip(keys, baseline)),
+                                        dict(zip(keys, candidate)), disputes, time.monotonic() + 30, gain=gain)
+            return [settled[0][k] for k in keys], [settled[1][k] for k in keys], regraded
+        cases, keys = make()
+        T, F = True, False
+        # A lost pass at one position is regraded and overturned; the gain at b stands.
+        self.assertEqual(run(cases, [[T, T], [F, F]], [[T, F], [T, T]], [('candidate', 0, 1)]),
+                         ([[T, T], [F, F]], [[T, T], [T, T]], ['candidate01']))
+        # A lost pass the solo grades confirm fails the gate, so nothing else is regraded.
+        self.assertEqual(run(cases, [[T, T], [F, F]], [[T, F], [T, T]], [('candidate', 0, 1), ('baseline', 1, 0)],
+                             failing={'candidate01'}),
+                         ([[T, T], [F, F]], [[T, F], [T, T]], ['candidate01']))
+        # A gain that comes only from grades gets the same regrade on both sides, so noise makes no gain.
+        disputed = [('baseline', 1, 0), ('baseline', 1, 1), ('candidate', 1, 0), ('candidate', 1, 1)]
+        self.assertEqual(run(cases, [[T, T], [F, F]], [[T, T], [F, F]], disputed),
+                         ([[T, T], [T, F]], [[T, T], [T, T]], ['candidate10', 'candidate11', 'baseline10']))
+        baseline, candidate, _ = run(cases, [[T, T], [F, F]], [[T, T], [F, F]], disputed)
+        self.assertFalse(review.improves(dict(zip(keys, baseline)), dict(zip(keys, candidate)), cases))
+        # When the baseline's answers fail their solo grades too, the gain is real.
+        self.assertEqual(run(cases, [[T, T], [F, F]], [[T, T], [F, F]], disputed, failing={'baseline10', 'baseline11'})[:2],
+                         ([[T, T], [F, F]], [[T, T], [T, T]]))
+        # No key can become a gain, so the gate fails whatever the grades: nothing is regraded.
+        self.assertEqual(run(cases, [[T, F], [T, T]], [[T, T], [F, T]], [('candidate', 1, 0)])[2], [])
+        # A wrong status at a position the baseline passed fails the gate: nothing is regraded.
+        self.assertEqual(run(cases, [[T, T], [F, F]], [[F, T], [F, T]], [('candidate', 1, 0)])[2], [])
+        # A non-critical position the baseline failed, at a key that cannot be a gain, cannot fail the gate.
+        self.assertEqual(run(cases, [[F, T], [F, F]], [[F, T], [T, T]], [('candidate', 0, 0)])[2], [])
+        # The held-out gate has no gain: a non-critical position the baseline failed is not regraded there,
+        # and a critical case is regraded wherever the baseline stood.
+        self.assertEqual(run(cases, [[T, T], [F, F]], [[T, T], [F, T]], [('candidate', 1, 0)], gain=False)[2], [])
+        critical, _ = make(critical=True)
+        self.assertEqual(run(critical, [[T, T], [F, F]], [[T, T], [F, T]], [('candidate', 1, 0)], gain=False),
+                         ([[T, T], [F, F]], [[T, T], [T, T]], ['candidate10']))
+
     def test_extraction_and_correction_respect_each_registered_skill(self):
         templates = review.load_cases(self.repo)
         for role in ('extract', 'correct'):
@@ -477,7 +601,7 @@ class PromptReviewTests(unittest.TestCase):
 
     def test_reader_source_drift_stops_prompt_review(self):
         original = Path.read_bytes
-        for module in (review.read_guidance, review.capture.activation_trace, review.claude_cli):
+        for module in (review.read_guidance, review.capture.activation_trace, review.claude_cli, review.evidence):
             path = Path(module.__file__)
             def changed(value):
                 data = original(value)
@@ -673,12 +797,76 @@ class PromptReviewTests(unittest.TestCase):
             output = {'status': case['expected'], 'summary': summary}
             self.assertEqual(review.validate_output(case, output), output)
             self.assertTrue(review.output_passes(case, output))
-        for summary in ('First\nsecond', ''):
+        for summary in (' \n ', ''):
             output = {'status': case['expected'], 'summary': summary}
             with self.subTest(summary=summary):
                 with self.assertRaises(ValueError):
                     review.validate_output(case, output)
                 self.assertFalse(review.output_passes(case, output))
+
+    def test_line_breaks_in_answers_are_joined_as_production_joins_them(self):
+        cases = review.load_cases(self.repo)
+        verify = next(c for c in cases if c['role'] == 'verify')
+        # An Opus source check on 2026-11-08 wrote a three-paragraph summary of 896 characters.
+        paragraph = 'The note says the check ran and the original turn shows the same command and its result. ' * 3
+        summary = '\n\n'.join([paragraph.strip()] * 3)
+        self.assertGreater(len(summary), 800)
+        joined = review.validate_output(verify, {'status': verify['expected'], 'summary': summary})
+        self.assertEqual(joined, {'status': verify['expected'], 'summary': review.evidence.one_line(summary)})
+        self.assertNotIn('\n', joined['summary'])
+        self.assertTrue(review.output_passes(verify, joined))
+        correct = next(c for c in cases if c['role'] == 'correct' and c['expected'] == 'note')
+        skill = json.loads(correct['input'])['skill']
+        broken = dict(NOTE, skill=skill, evidence='First paragraph.\n\nSecond paragraph.', title='Line\r\nbroken')
+        joined = review.validate_output(correct, {'notes': [broken]})
+        self.assertEqual(joined, {'notes': [dict(broken, evidence='First paragraph. Second paragraph.', title='Line broken')]})
+        self.assertTrue(review.output_passes(correct, joined))
+        # Production validates extraction answers as written, so a line break there still fails.
+        extract = next(c for c in cases if c['role'] == 'extract')
+        skill = json.loads(extract['input'])['verified_skills'][0]
+        with self.assertRaises(ValueError):
+            review.validate_output(extract, {'notes': [dict(NOTE, skill=skill, evidence='First\nsecond')]})
+
+    def test_invalid_answer_fails_its_repeat_and_the_evaluation_continues(self):
+        cases = [*review.load_cases(self.repo), *review.load_cases(self.repo, holdouts=True)]
+        invalid = {'extract': {'notes': [dict(NOTE, skill='unknown-skill')]},
+                   'correct': {'notes': [dict(NOTE, evidence=' \n ')]},
+                   'verify': {'status': 'supported', 'summary': '\n\n'},
+                   'maintain': {'decision': 'rewrite'}}
+        for role, answer in invalid.items():
+            with self.subTest(role=role):
+                shutil.rmtree(self.state / 'prompt-evaluation-calls', ignore_errors=True)
+                selected = [c for c in cases if c['role'] == role]
+                answers, graded = [], []
+                def respond(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
+                    value = json.loads(data)
+                    if schema is review.GRADE_SCHEMA:
+                        graded.extend(value['items'])
+                        return {'grades': [{'item_id': item['item_id'], 'passed': True} for item in value['items']]}
+                    answers.append(value)
+                    if len(answers) == 1:
+                        return answer
+                    case = next(c for c in selected if review.task_input(c) == value)
+                    if role == 'maintain':
+                        return {'decision': case['expected']}
+                    if role == 'verify':
+                        return {'status': case['expected'], 'summary': 'The note matches the original turn.'}
+                    skills = value['turn']['verified_skills'] if role == 'extract' else [value['skill']]
+                    return {'notes': [] if case['expected'] == 'empty' else [dict(NOTE, skill=skills[0])]}
+                text = (self.repo / review.prompt_runtime.PROMPT_PATHS[role]).read_text()
+                with patch.object(review.capture, 'model_response', side_effect=respond):
+                    result = review.evaluate({'review_backend': 'cli'}, self.state, self.repo, role, text, selected,
+                                             time.monotonic() + 30)
+                self.assertEqual(len(answers), 2 * len(selected))
+                first = review.digest(selected[0])
+                self.assertEqual(result[first], [False, True])
+                self.assertTrue(all(all(value) for key, value in result.items() if key != first))
+                self.assertEqual(len(graded), 0 if role == 'maintain' else 2 * len(selected) - 1)
+                directory = self.state / 'prompt-evaluation-calls'
+                record = json.loads(next(directory.glob('*.invalid.json')).read_text())
+                self.assertEqual(record['failure_class'], 'ValueError')
+                self.assertTrue((directory / (record['request'] + '.response.json')).exists())
+                self.assertEqual(len(list(directory.glob('*.invalid.json'))), 1)
 
     def test_push_race_leaves_local_main_clean_and_pending(self):
         original = review.git
@@ -701,11 +889,19 @@ class PromptReviewTests(unittest.TestCase):
         self.assertFalse((self.state / 'prompt-review-state.json').exists())
 
     def test_missing_malformed_outputs_cannot_be_measured_as_gain(self):
-        with patch.object(review.capture, 'model_response', return_value=None):
-            with self.assertRaises(RuntimeError):
-                review.run(self.config, self.state, due=self.due)
+        # Each malformed answer fails its repeat, so a candidate whose answers are all malformed shows no gain.
+        original = self.responder
+        def malformed(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
+            if schema is review.capture.SCHEMA:
+                return None
+            return original(config, state, prompt, data, schema, deadline=deadline, role=role, backend=backend)
+        with patch.object(review.capture, 'model_response', side_effect=malformed):
+            result = review.run(self.config, self.state, due=self.due)
+        self.assertEqual(result['reason'], 'no_consistent_gain')
+        self.assertFalse(any(any(v) for v in [*result['baseline'].values(), *result['candidate'].values()]))
         self.assertEqual(review.git(self.repo, 'rev-parse', 'HEAD'), self.base)
-        self.assertFalse((self.state / 'prompt-review-state.json').exists())
+        directory = self.state / 'prompt-evaluation-calls'
+        self.assertEqual(len(list(directory.glob('*.invalid.json'))), 4 * len(result['baseline']))
 
     def test_semantically_unrelated_valid_notes_and_bad_grade_ids_fail_closed(self):
         original = self.responder
@@ -765,6 +961,36 @@ class PromptReviewTests(unittest.TestCase):
                     self.assertIn('- Evidence: ' + redacted, data['note'])
                     self.assertEqual(data['original_turn']['messages'][0]['text'], redacted)
                 self.assertNotIn('abc123', json.dumps(data))
+
+    def test_grader_sees_the_input_the_role_saw(self):
+        # The raw case holds fields the role never sees, such as the verified note's `skill`; a grader shown them
+        # fails correct answers that rely on their absence.
+        cases = [*review.load_cases(self.repo), *review.load_cases(self.repo, holdouts=True)]
+        for role in ('extract', 'verify', 'correct'):
+            with self.subTest(role=role):
+                role_inputs, grade_items = [], []
+                def respond(config, state, prompt, data, schema, *, deadline, role=None, cache_prefix=None, backend=None):
+                    value = json.loads(data)
+                    if schema is review.GRADE_SCHEMA:
+                        grade_items.extend(value['items'])
+                        return {'grades': [{'item_id': item['item_id'], 'passed': True} for item in value['items']]}
+                    role_inputs.append(value)
+                    if schema is review.capture.SCHEMA:
+                        return {'notes': []}
+                    return {'status': 'supported', 'summary': 'The note attributes the reported check faithfully.'}
+                selected = [c for c in cases if c['role'] == role]
+                text = (self.repo / review.prompt_runtime.PROMPT_PATHS[role]).read_text()
+                with patch.object(review.capture, 'model_response', side_effect=respond):
+                    review.evaluate({'review_backend': 'cli'}, self.state, self.repo, role, text, selected, time.monotonic() + 30)
+                self.assertEqual(len(grade_items), 2 * len(selected))
+                for case in selected:
+                    rendered = json.loads(json.dumps(review.task_input(case)))
+                    graded = [item['case'] for item in grade_items if item['case']['rubric'] == case['rubric']]
+                    self.assertEqual(graded, 2 * [{**case, 'input': rendered}])
+                    self.assertEqual(role_inputs.count(rendered), 2)
+                if role == 'verify':
+                    # The rendered note has no Skill line, so the grader cannot see the skill either.
+                    self.assertTrue(all('skill' not in json.dumps(item['case']['input']) for item in grade_items))
 
     def test_symlink_artifact_directories_rejected(self):
         shutil.rmtree(self.repo / 'prompt-evals/cases')

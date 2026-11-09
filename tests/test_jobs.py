@@ -141,6 +141,11 @@ elif not (root / 'missing-report').exists():
             'role': 'maintainer'}))
         for command in (['init', '-b', 'main'], ['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'fixture']):
             subprocess.run(['git', '-C', str(self.repo), *command], check=True, capture_output=True)
+        # Sync fast-forwards its checkout from origin at the end of each run.
+        self.origin = self.root / 'origin.git'
+        subprocess.run(['git', 'init', '--bare', '-b', 'main', str(self.origin)], check=True, capture_output=True)
+        for command in (['remote', 'add', 'origin', str(self.origin)], ['push', '-u', 'origin', 'main']):
+            subprocess.run(['git', '-C', str(self.repo), *command], check=True, capture_output=True)
         self.args = argparse.Namespace(command='weekly', config=self.config, check=False, run_now=False)
 
     def state_data(self):
@@ -609,6 +614,67 @@ elif not (root / 'missing-report').exists():
         self.assertEqual(jobs.execute(self.args), 0)
         self.assertNotIn('warnings', json.loads((self.state / 'sync-status.json').read_text()))
 
+    def push_upstream_change(self, path='scripts/new_fix.py', text='fixed = True\n'):
+        """Merge a change to origin's main from another clone, as a reviewed workflow fix would be."""
+        other = self.root / 'other'
+        if not other.exists():
+            subprocess.run(['git', 'clone', '-q', str(self.origin), str(other)], check=True, capture_output=True)
+        (other / path).parent.mkdir(parents=True, exist_ok=True)
+        (other / path).write_text(text)
+        for command in (['add', '.'], ['-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'fix'],
+                        ['push', '-q', 'origin', 'main']):
+            subprocess.run(['git', '-C', str(other), *command], check=True, capture_output=True)
+        return subprocess.check_output(['git', '-C', str(other), 'rev-parse', 'HEAD'], text=True).strip()
+
+    def test_sync_fast_forwards_its_checkout_after_deploying(self):
+        self.args.command = 'sync'
+        before = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
+        target = self.push_upstream_change()
+        real = jobs.update_checkout
+        def checked(repo, env, *rest):
+            # Every stage has run with the old scripts before the checkout moves.
+            self.assertEqual(self.trace.read_text().splitlines(), ['capture', 'evidence', 'upload', 'deploy'])
+            return real(repo, env, *rest)
+        with patch.object(jobs, 'update_checkout', side_effect=checked):
+            self.assertEqual(jobs.execute(self.args), 0)
+        status = json.loads((self.state / 'sync-status.json').read_text())
+        self.assertTrue(status['success'])
+        self.assertNotIn('warnings', status)
+        self.assertEqual({k: v for k, v in status['checkout'].items() if k != 'seconds'},
+                         {'state': 'updated', 'from': before, 'commit': target})
+        self.assertEqual((self.repo / 'scripts/new_fix.py').read_text(), 'fixed = True\n')
+        self.assertEqual(jobs.execute(self.args), 0)
+        self.assertEqual(json.loads((self.state / 'sync-status.json').read_text())['checkout']['state'], 'current')
+
+    def test_failed_sync_still_fast_forwards_its_checkout(self):
+        self.args.command = 'sync'
+        self.push_upstream_change()
+        (self.root / 'fail-deploy').touch()
+        self.assertEqual(jobs.execute(self.args), 1)
+        status = json.loads((self.state / 'sync-status.json').read_text())
+        self.assertFalse(status['success'])
+        self.assertEqual(status['checkout']['state'], 'updated')
+        self.assertTrue((self.repo / 'scripts/new_fix.py').is_file())
+
+    def test_dirty_checkout_is_reported_and_kept(self):
+        self.args.command = 'sync'
+        self.push_upstream_change()
+        (self.repo / 'maintenance-prompt.md').write_text('Local edit.')
+        self.assertEqual(jobs.execute(self.args), 0)
+        status = json.loads((self.state / 'sync-status.json').read_text())
+        self.assertTrue(status['success'])
+        self.assertEqual(status['checkout']['state'], 'dirty')
+        self.assertEqual(status['warnings'], ['Workflow checkout not updated: it has uncommitted changes to tracked files'])
+        self.assertEqual((self.repo / 'maintenance-prompt.md').read_text(), 'Local edit.')
+        self.assertFalse((self.repo / 'scripts/new_fix.py').exists())
+
+    def test_weekly_leaves_its_checkout_to_collection(self):
+        self.push_upstream_change()
+        self.args.run_now = True
+        jobs.execute(self.args)
+        self.assertNotIn('checkout', json.loads((self.state / 'weekly-status.json').read_text()))
+        self.assertFalse((self.repo / 'scripts/new_fix.py').exists())
+
     def test_sync_sequence(self):
         self.args.command = 'sync'
         self.assertEqual(jobs.execute(self.args), 0)
@@ -829,7 +895,7 @@ class LearningTransactionTests(unittest.TestCase):
         self.git_at(root, 'add', '.')
         self.git_at(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-m', 'Reviewed change')
 
-    def transaction(self, callback, gate=None, scope=None):
+    def transaction(self, callback, gate=None, scope=None, timeout=30):
         import investigations
         import sync
         config = json.loads(self.config.read_text())
@@ -838,7 +904,7 @@ class LearningTransactionTests(unittest.TestCase):
                 patch.object(sync, 'validate', return_value='validated'), \
                 patch.object(sync, 'publication_scope', side_effect=scope or (lambda *a, **k: None), create=True), \
                 (self.root / 'transaction.log').open('a') as log:
-            return jobs.review_learning_cycle(config, self.state, jobs.latest_due(datetime.now(timezone.utc)), log, dict(os.environ), 30)
+            return jobs.review_learning_cycle(config, self.state, jobs.latest_due(datetime.now(timezone.utc)), log, dict(os.environ), timeout)
 
     def accepted_review(self, cli, work, state, prompt, log, env, timeout, settings):
         self.assertEqual(Path(env['SKILL_INVESTIGATION_CONFIG']).parent, self.state.resolve())
@@ -856,6 +922,37 @@ class LearningTransactionTests(unittest.TestCase):
         self.assertEqual((self.repo / 'skills/frontend-ui/guide.md').read_text(), 'Reviewed guidance')
         self.assertFalse((self.state / 'investigations/active-attempt.json').exists())
         self.assertEqual(len(self.git_at(self.repo, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
+
+    def late_transaction(self, validation_seconds):
+        """A review that ends one second before its own budget, then validation taking the given time."""
+        budget = 3600
+        clock = [0]
+        def late_review(cli, work, state, prompt, log, env, timeout, settings):
+            self.assertEqual(timeout, budget - jobs.VALIDATION_RESERVE)
+            self.accepted_review(cli, work, state, prompt, log, env, timeout, settings)
+            clock[0] = timeout - 1
+        def gate(*args):
+            clock[0] += validation_seconds
+            return {'complete': True, 'open': 0}
+        with patch.object(jobs.time, 'monotonic', side_effect=lambda: clock[0]):
+            return self.transaction(late_review, gate=gate, timeout=budget)
+
+    def test_late_review_validated_within_the_reserve_advances_main(self):
+        result = self.late_transaction(jobs.VALIDATION_RESERVE - 60)
+        self.assertTrue(result['complete'])
+        self.assertEqual((self.repo / 'skills/frontend-ui/guide.md').read_text(), 'Reviewed guidance')
+        self.assertFalse((self.state / 'investigations/active-attempt.json').exists())
+        self.assertEqual(self.git_at(self.repo, 'status', '--porcelain'), '')
+
+    def test_validation_past_the_reserve_still_times_out(self):
+        before = self.git_at(self.repo, 'rev-parse', 'HEAD')
+        with self.assertRaisesRegex(TimeoutError, 'exceeded the job deadline'):
+            self.late_transaction(jobs.VALIDATION_RESERVE + 1)
+        self.assertEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
+        saved = json.loads((self.state / 'investigations/active-attempt.json').read_text())
+        self.assertEqual(saved['status'], 'failed')
+        self.assertEqual(saved['failure']['class'], 'TimeoutError')
+        self.assertTrue((Path(saved['work']) / 'skills/frontend-ui/guide.md').exists())
 
     def test_report_lists_open_issues_with_their_board_tasks(self):
         import investigations
@@ -1106,6 +1203,155 @@ class LearningTransactionTests(unittest.TestCase):
             self.transaction(forbidden, scope=sync.publication_scope)
         self.assertEqual(before, self.git_at(self.repo, 'rev-parse', 'HEAD'))
         self.assertEqual((self.repo / 'maintenance-prompt.md').read_text(), 'Review evidence only.')
+
+
+class CheckoutUpdateTests(unittest.TestCase):
+    """update_checkout against temporary Git repositories: an origin, the host checkout and a second clone."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.origin, self.repo, self.other = self.root / 'origin.git', self.root / 'repo', self.root / 'other'
+        self.git(self.root, 'init', '-q', '--bare', '-b', 'main', str(self.origin))
+        self.git(self.root, 'clone', '-q', str(self.origin), str(self.other))
+        self.commit(self.other, 'tracked.txt', 'one\n')
+        self.git(self.other, 'push', '-q', 'origin', 'main')
+        self.git(self.root, 'clone', '-q', str(self.origin), str(self.repo))
+        self.before = self.head(self.repo)
+
+    def git(self, root, *args):
+        return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def head(self, root):
+        return self.git(root, 'rev-parse', 'HEAD')
+
+    def commit(self, root, path, text):
+        (root / path).write_text(text)
+        self.git(root, 'add', path)
+        self.git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'change ' + path)
+        return self.head(root)
+
+    def upstream(self, path='fix.py', text='fixed = True\n'):
+        target = self.commit(self.other, path, text)
+        self.git(self.other, 'push', '-q', 'origin', 'main')
+        return target
+
+    def update(self):
+        return jobs.update_checkout(self.repo, dict(os.environ))
+
+    def test_clean_checkout_is_fast_forwarded(self):
+        target = self.upstream()
+        self.assertEqual(self.update(), {'state': 'updated', 'from': self.before, 'commit': target})
+        self.assertEqual(self.head(self.repo), target)
+        self.assertEqual(self.git(self.repo, 'status', '--porcelain'), '')
+        self.assertEqual(self.update(), {'state': 'current', 'commit': target})
+
+    def test_untracked_files_do_not_block_and_are_kept(self):
+        target = self.upstream()
+        (self.repo / '.claude').mkdir()
+        (self.repo / '.claude/note').write_text('local')
+        self.assertEqual(self.update()['state'], 'updated')
+        self.assertEqual(self.head(self.repo), target)
+        self.assertEqual((self.repo / '.claude/note').read_text(), 'local')
+
+    def test_tracked_changes_block_and_are_kept(self):
+        self.upstream()
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                (self.repo / 'tracked.txt').write_text('local edit\n')
+                if staged:
+                    self.git(self.repo, 'add', 'tracked.txt')
+                self.assertEqual(self.update(), {'state': 'dirty', 'commit': self.before})
+                self.assertEqual(self.head(self.repo), self.before)
+                self.assertEqual((self.repo / 'tracked.txt').read_text(), 'local edit\n')
+
+    def test_unpublished_commits_are_kept_without_blocking(self):
+        # Weekly collection commits imported notes here; publication pushes them later.
+        local = self.commit(self.repo, 'local.txt', 'mine\n')
+        self.assertEqual(self.update(), {'state': 'ahead', 'commit': local})
+        self.assertEqual(self.head(self.repo), local)
+
+    def test_diverged_commits_block_and_are_kept(self):
+        local = self.commit(self.repo, 'local.txt', 'mine\n')
+        self.upstream()
+        self.assertEqual(self.update(), {'state': 'diverged', 'commit': local})
+        self.assertEqual(self.head(self.repo), local)
+
+    def test_ignored_local_file_is_never_overwritten(self):
+        (self.other / '.gitignore').write_text('cache/\n')
+        self.git(self.other, 'add', '.gitignore')
+        (self.other / 'cache').mkdir()
+        (self.other / 'cache/data').write_text('upstream')
+        self.git(self.other, 'add', '-f', 'cache/data')
+        self.git(self.other, '-c', 'user.name=Test', '-c', 'user.email=test@example.test', 'commit', '-qm', 'cache')
+        self.git(self.other, 'push', '-q', 'origin', 'main')
+        (self.repo / '.git/info/exclude').write_text('cache/\n')
+        (self.repo / 'cache').mkdir()
+        (self.repo / 'cache/data').write_text('local')
+        log = io.StringIO()
+        self.assertEqual(jobs.update_checkout(self.repo, dict(os.environ), log), {'state': 'merge_failed', 'commit': self.before})
+        self.assertEqual((self.repo / 'cache/data').read_text(), 'local')
+        self.assertIn('cache/data', log.getvalue())
+
+    def test_held_synchronization_lock_defers_the_update(self):
+        self.upstream()
+        with open(self.repo / '.git/skill-sync.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.update(), {'state': 'busy'})
+        self.assertEqual(self.head(self.repo), self.before)
+        self.assertEqual(self.update()['state'], 'updated')
+
+    def test_exhausted_cycle_budget_defers_the_update(self):
+        self.upstream()
+        self.assertEqual(jobs.update_checkout(self.repo, dict(os.environ), None, time.monotonic() + 30), {'state': 'deferred'})
+        self.assertEqual(self.head(self.repo), self.before)
+
+    def test_other_branch_or_detached_head_blocks(self):
+        self.upstream()
+        self.git(self.repo, 'switch', '-q', '-c', 'experiment')
+        self.assertEqual(self.update(), {'state': 'not_on_main', 'commit': self.before})
+        self.git(self.repo, 'switch', '-q', '--detach', 'main')
+        self.assertEqual(self.update(), {'state': 'not_on_main', 'commit': self.before})
+        self.assertEqual(self.head(self.repo), self.before)
+
+    def test_untracked_file_in_the_way_blocks_and_is_kept(self):
+        self.upstream('fix.py')
+        (self.repo / 'fix.py').write_text('local draft')
+        self.assertEqual(self.update(), {'state': 'merge_failed', 'commit': self.before})
+        self.assertEqual(self.head(self.repo), self.before)
+        self.assertEqual((self.repo / 'fix.py').read_text(), 'local draft')
+
+    def test_unreachable_origin_keeps_the_checkout(self):
+        self.upstream()
+        self.git(self.repo, 'remote', 'set-url', 'origin', str(self.root / 'missing.git'))
+        self.assertEqual(self.update(), {'state': 'fetch_failed', 'commit': self.before})
+
+    def test_fetch_past_its_timeout_ends_its_process_group(self):
+        self.upstream()
+        hang = self.root / 'hang'
+        hang.write_text('#!/bin/sh\nsleep 60 &\necho $! > ' + str(self.root / 'child') + '\nwait\n')
+        hang.chmod(0o755)
+        self.git(self.repo, 'remote', 'set-url', 'origin', 'ext::' + str(hang))
+        env = dict(os.environ, GIT_ALLOW_PROTOCOL='ext')
+        started = time.monotonic()
+        with patch.object(jobs, 'CHECKOUT_MIN_SECONDS', 0):
+            self.assertEqual(jobs.update_checkout(self.repo, env, None, time.monotonic() + 3),
+                             {'state': 'fetch_failed', 'commit': self.before})
+        self.assertLess(time.monotonic() - started, 10)
+        child = int((self.root / 'child').read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail('fetch helper survived the timeout')
+        self.assertEqual(self.head(self.repo), self.before)
+
+    def test_missing_repository_is_reported(self):
+        self.assertEqual(jobs.update_checkout(self.root / 'absent', dict(os.environ)), {'state': 'failed'})
 
 
 if __name__ == '__main__':

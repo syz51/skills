@@ -13,6 +13,7 @@ import time
 
 import capture
 import claude_cli
+import evidence
 import jobs
 import prompt_runtime
 import read_guidance
@@ -206,8 +207,13 @@ def metrics(state_root):
     return result
 
 
-def model(config, state, prompt, data, schema, deadline, role=None):
-    """One evaluation call. `role` runs a production role on its own model; proposals, grades and approvals stay on MODEL."""
+class InvalidAnswer(ValueError):
+    """A role answer that production would reject too: it fails its repeat instead of the review."""
+
+
+def model(config, state, prompt, data, schema, deadline, role=None, check=None):
+    """One evaluation call. `role` runs a production role on its own model; proposals, grades and approvals stay on MODEL.
+    `check` returns the answer as production stores it, or rejects it; a rejection raises InvalidAnswer."""
     capture.bounded_timeout(900, deadline)
     backend = config.get('review_backend') or capture.model_backend(config, state)
     # Keep actual decisions for diagnosis; pass/fail summaries cannot explain
@@ -234,7 +240,16 @@ def model(config, state, prompt, data, schema, deadline, role=None):
     capture.atomic(directory / (identity + '.response.json'),
                    encoded({'request': identity, 'response': value}).decode(), exclusive=True)
     capture.bounded_timeout(900, deadline)
-    return value
+    if check is None:
+        return value
+    try:
+        return check(value)
+    except (ValueError, TypeError, KeyError) as error:
+        # Validator messages are static; the response file holds the answer itself.
+        capture.atomic(directory / (identity + '.invalid.json'),
+                       encoded({'request': identity, 'failure_class': type(error).__name__,
+                                'message': str(error)[:200]}).decode(), exclusive=True)
+        raise InvalidAnswer(str(error)) from error
 
 
 def case_turn(source, role):
@@ -246,9 +261,15 @@ def case_turn(source, role):
 
 
 def validate_output(case, output):
-    """Protocol/validator failures are not measured behavioral improvement."""
+    """Protocol/validator failures are not measured behavioral improvement. Returns the answer as production stores
+    it: source checks and corrections join line breaks in note lines with evidence.one_line before validation, as
+    production does; production validates extraction answers as written."""
     role = case['role']
     if role in ('extract', 'correct'):
+        if role == 'correct' and isinstance(output, dict) and isinstance(output.get('notes'), list):
+            output = {**output, 'notes': [{key: evidence.one_line(value) if key in capture.FIELDS else value
+                                           for key, value in item.items()} if isinstance(item, dict) else item
+                                          for item in output['notes']]}
         source = json.loads(case['input'])
         notes = capture.validate_notes(output, case_turn(source, role))
         if role == 'correct' and len(notes) > 1:
@@ -256,6 +277,7 @@ def validate_output(case, output):
     elif role == 'verify':
         if not isinstance(output, dict) or set(output) != {'status', 'summary'} or output['status'] not in ('supported', 'partial', 'unsupported'):
             raise ValueError('Malformed verification output')
+        output = {**output, 'summary': evidence.one_line(output['summary'])}
         capture.validate_summary(output['summary'])
     elif not isinstance(output, dict) or set(output) != {'decision'} or output['decision'] not in ('no_change', 'defer', 'change'):
         raise ValueError('Malformed maintenance simulation output')
@@ -308,7 +330,74 @@ def task_input(case):
     return data
 
 
-def evaluate(config, state, root, role, text, cases, deadline):
+def grade(config, state, role, items, deadline):
+    """One semantic grading call; returns each item's grade by item_id."""
+    output = model(config, state, GRADE_PROMPT + '\n' + prompt_runtime.COMMON_CONTRACT + prompt_runtime.ROLE_CONTRACTS[role],
+                   {'items': items}, GRADE_SCHEMA, deadline)
+    if not isinstance(output, dict) or set(output) != {'grades'} or not isinstance(output['grades'], list) or len(output['grades']) != len(items):
+        raise ValueError('Malformed semantic grades')
+    expected, grades = {item['item_id'] for item in items}, {}
+    for value in output['grades']:
+        if not isinstance(value, dict) or set(value) != {'item_id', 'passed'} or type(value['passed']) is not bool:
+            raise ValueError('Malformed semantic grade')
+        item_id = value['item_id']
+        if not isinstance(item_id, str) or item_id not in expected or item_id in grades:
+            raise ValueError('Semantic grade identity mismatch')
+        grades[item_id] = value['passed']
+    return grades
+
+
+def regrade(config, state, role, item, deadline):
+    """Settle a disputed batch grade by the majority of up to three solo grades of the same item.
+    The batch grader is not consistent on single answers, in both directions, so its grade gets no vote."""
+    votes = []
+    while votes.count(True) < 2 and votes.count(False) < 2:
+        votes.append(grade(config, state, role, [item], deadline)[item['item_id']])
+    return votes.count(True) == 2
+
+
+def settle(config, state, role, cases, baseline, candidate, disputes, deadline, *, gain):
+    """Regrade disputed answers (`evaluate`'s `disputes`) where the gate's verdict hangs on them, before the gate
+    compares results. `gain` is True for `improves`, which needs a gain, and False for `holdout_passes`.
+    A position is binding when any failure there fails the gate: its case is critical or the baseline passed there.
+    Binding candidate failures are regraded first. For `improves`, a key the baseline failed in every repeat is then
+    a gain only if the candidate passes there and the baseline's own disputed answers stay failed, so both sides get
+    the same chances. Nothing is regraded once the gate must fail, and regrading stops at the first gain.
+    Returns the settled baseline and candidate results."""
+    baseline = {key: list(value) for key, value in baseline.items()}
+    candidate = {key: list(value) for key, value in candidate.items()}
+    critical = {digest(case): case['critical'] for case in cases if case['role'] == role}
+    positions = [(key, repeat) for key in critical for repeat in range(2)]
+
+    def passes(results, side, key, repeat):
+        if not results[key][repeat] and (key, repeat) in disputes[side]:
+            results[key][repeat] = regrade(config, state, role, disputes[side].pop((key, repeat)), deadline)
+        return results[key][repeat]
+
+    def binding(key, repeat):
+        return critical[key] or baseline[key][repeat]
+
+    def fixed_failure(key, repeat):
+        return not candidate[key][repeat] and (key, repeat) not in disputes['candidate']
+
+    if any(fixed_failure(key, repeat) and binding(key, repeat) for key, repeat in positions):
+        return baseline, candidate
+    gains = [key for key in critical if not any(baseline[key]) and not any(fixed_failure(key, r) for r in range(2))]
+    if gain and not gains:
+        return baseline, candidate
+    for key, repeat in positions:
+        if binding(key, repeat) and not passes(candidate, 'candidate', key, repeat):
+            return baseline, candidate
+    for key in gains if gain else ():
+        if (all(passes(candidate, 'candidate', key, r) for r in range(2))
+                and not any(passes(baseline, 'baseline', key, r) for r in range(2))):
+            break
+    return baseline, candidate
+
+
+def evaluate(config, state, root, role, text, cases, deadline, disputes=None):
+    """Grades every answer in one batch call. With a `disputes` dict, it records each answer with the right status
+    whose batch grade failed, by (case key, repeat), for `settle` to regrade."""
     result, items, item_locations = {}, [], {}
     for case in cases:
         if case['role'] != role:
@@ -321,27 +410,27 @@ def evaluate(config, state, root, role, text, cases, deadline):
         key = digest(case)
         result[key] = []
         for repeat in range(2):
-            output = validate_output(case, model(config, state, prompt_runtime.render(role, text, root), data, schema, deadline,
-                                                 role=role))
+            try:
+                output = model(config, state, prompt_runtime.render(role, text, root), data, schema, deadline, role=role,
+                               check=lambda value: validate_output(case, value))
+            except InvalidAnswer:
+                # Production rejects this answer too, so the repeat fails ungraded and the evaluation goes on.
+                result[key].append(False)
+                continue
             result[key].append(output_passes(case, output))
             if role != 'maintain':
                 item_id = digest({'case': key, 'output': output, 'repeat': repeat})
-                items.append({'item_id': item_id, 'case': case, 'output': output})
+                # The grader judges against the input the role saw, not the raw case: that holds fields the role
+                # never gets, such as a verified note's skill, and the grader would fail answers that note their absence.
+                items.append({'item_id': item_id, 'case': {**case, 'input': data}, 'output': output})
                 item_locations[item_id] = (key, repeat)
     if items:
-        grades = model(config, state, GRADE_PROMPT + '\n' + prompt_runtime.COMMON_CONTRACT + prompt_runtime.ROLE_CONTRACTS[role], {'items': items}, GRADE_SCHEMA, deadline)
-        if not isinstance(grades, dict) or set(grades) != {'grades'} or not isinstance(grades['grades'], list) or len(grades['grades']) != len(items):
-            raise ValueError('Malformed semantic grades')
-        seen = set()
-        for grade in grades['grades']:
-            if not isinstance(grade, dict) or set(grade) != {'item_id', 'passed'} or type(grade['passed']) is not bool:
-                raise ValueError('Malformed semantic grade')
-            item_id = grade['item_id']
-            if not isinstance(item_id, str) or item_id not in item_locations or item_id in seen:
-                raise ValueError('Semantic grade identity mismatch')
-            seen.add(item_id)
-            key, repeat = item_locations[item_id]
-            result[key][repeat] = result[key][repeat] and grade['passed']
+        grades = grade(config, state, role, items, deadline)
+        for item in items:
+            key, repeat = item_locations[item['item_id']]
+            if result[key][repeat] and not grades[item['item_id']] and disputes is not None:
+                disputes[(key, repeat)] = item
+            result[key][repeat] = result[key][repeat] and grades[item['item_id']]
     return result
 
 
@@ -379,6 +468,7 @@ def assert_sources_current():
                                         (Path(capture.__file__), capture.SOURCE_SHA256),
                                         (Path(capture.claude_api.__file__), capture.claude_api.SOURCE_SHA256),
                                         (Path(claude_cli.__file__), claude_cli.SOURCE_SHA256),
+                                        (Path(evidence.__file__), evidence.SOURCE_SHA256),
                                         (Path(read_guidance.__file__), read_guidance.SOURCE_SHA256),
                                         (Path(capture.activation_trace.__file__), capture.activation_trace.SOURCE_SHA256),
                                         (Path(prompt_runtime.__file__), prompt_runtime.SOURCE_SHA256)):
@@ -834,7 +924,8 @@ def review(config, state, root, base, role, due, deadline):
     text = (root / prompt_runtime.PROMPT_PATHS[role]).read_text()
     base_hash = digest(text.encode())
     aggregate = metrics(state)
-    baseline = evaluate(config, state, root, role, text, cases, deadline)
+    disputes = {'baseline': {}, 'candidate': {}}
+    baseline = evaluate(config, state, root, role, text, cases, deadline, disputes=disputes['baseline'])
     result = {'outcome': 'no_change', 'commit': None, 'target': role, 'due': due,
               'baseline': baseline, 'reason': 'baseline_passed'}
     # Persist measured no-op baseline locally even without a proposer.
@@ -880,16 +971,20 @@ def review(config, state, root, base, role, due, deadline):
     if new_case:
         cases = [*cases, new_case]
         # Freeze identical snapshots before either comparison, after independent oracle acceptance.
-        baseline = evaluate(config, state, root, role, text, cases, deadline)
-    candidate_results = evaluate(config, state, root, role, candidate, cases, deadline)
+        disputes['baseline'] = {}
+        baseline = evaluate(config, state, root, role, text, cases, deadline, disputes=disputes['baseline'])
+    candidate_results = evaluate(config, state, root, role, candidate, cases, deadline, disputes=disputes['candidate'])
+    baseline, candidate_results = settle(config, state, role, cases, baseline, candidate_results, disputes, deadline, gain=True)
     result.update(baseline=baseline, candidate=candidate_results)
     if not improves(baseline, candidate_results, cases):
         finish_attempt(state, attempt, 'no_consistent_gain', baseline=baseline, candidate_results=candidate_results)
         result['reason'] = 'no_consistent_gain'
         return result
     # Candidate text is frozen before any held-out input or result is exposed.
-    held_baseline = evaluate(config, state, root, role, text, holdouts, deadline)
-    held_candidate = evaluate(config, state, root, role, candidate, holdouts, deadline)
+    held = {'baseline': {}, 'candidate': {}}
+    held_baseline = evaluate(config, state, root, role, text, holdouts, deadline, disputes=held['baseline'])
+    held_candidate = evaluate(config, state, root, role, candidate, holdouts, deadline, disputes=held['candidate'])
+    held_baseline, held_candidate = settle(config, state, role, holdouts, held_baseline, held_candidate, held, deadline, gain=False)
     result.update(holdout_baseline=held_baseline, holdout_candidate=held_candidate)
     if not holdout_passes(held_baseline, held_candidate, [c for c in holdouts if c['role'] == role]):
         finish_attempt(state, attempt, 'held_out_regression', baseline=baseline, candidate_results=candidate_results,

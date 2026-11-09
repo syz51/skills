@@ -9,11 +9,11 @@ SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 RESTRICTED_MODEL = 'claude-opus-5-5'
 REVIEW_MODEL = 'claude-opus-5-5'
 EFFORT = 'high'
-# Each production role's model, the cheapest that matched Opus on the frozen prompt evaluations (cases and
-# holdouts, graded by Opus): extraction 28/28 on Sonnet as on Opus, source checks 30/36 on Haiku as on Opus,
-# and corrections only on Opus (20/20). Prompt review's proposals, grading and approvals, and the maintainer
-# review, stay on the Opus models above.
-ROLE_MODELS = {'extract': 'claude-sonnet-5-5', 'verify': 'claude-haiku-5-5', 'correct': RESTRICTED_MODEL}
+# Each production role's model, on Haiku or Opus only, the cheaper one that matched Opus on the frozen prompt
+# evaluations (cases and holdouts, graded by Opus): extraction 56/56 on Haiku over four rounds on the CLI backend
+# (2026-11-08) against Opus's 28/28, source checks 30/36 on Haiku as on Opus, and corrections only on Opus
+# (20/20). Prompt review's proposals, grading and approvals, and the maintainer review, stay on the Opus models above.
+ROLE_MODELS = {'extract': 'claude-haiku-5-5', 'verify': 'claude-haiku-5-5', 'correct': RESTRICTED_MODEL}
 # --json-schema answers through this synthetic tool; a restricted session may expose nothing else.
 STRUCTURED_TOOL = 'StructuredOutput'
 DEFAULT_CLI = Path.home() / '.local/bin/claude'

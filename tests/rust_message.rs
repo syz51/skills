@@ -562,9 +562,16 @@ fn billing_falls_back_to_the_login_and_sticks_until_the_key_changes() {
     };
     let since = parse("since");
     assert!(since >= started - chrono::TimeDelta::seconds(1));
-    let retry = parse("retry_at") - since;
+    // An exhausted balance waits for local midnight on the 2nd of a month, at most a month away.
+    use chrono::{Datelike, Timelike};
+    let retry = parse("retry_at");
+    let local = retry.with_timezone(&chrono::Local);
+    assert_eq!(
+        (local.day(), local.hour(), local.minute(), local.second()),
+        (2, 0, 0, 0)
+    );
     assert!(
-        (retry - chrono::TimeDelta::days(1)).num_seconds().abs() <= 2,
+        retry > since && retry - since <= chrono::TimeDelta::days(32),
         "{retry}"
     );
 
@@ -615,7 +622,16 @@ fn authentication_falls_back_but_other_api_errors_do_not() {
     .to_string();
     fs::write(root.path().join("api"), rejected).unwrap();
     generate_message(DIFF, None, &options).unwrap();
-    assert_eq!(fallback(&root).unwrap()["reason"], "authentication");
+    let record = fallback(&root).unwrap();
+    assert_eq!(record["reason"], "authentication");
+    let parse = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(record[field].as_str().unwrap()).unwrap()
+    };
+    let retry = parse("retry_at") - parse("since");
+    assert!(
+        (retry - chrono::TimeDelta::days(1)).num_seconds().abs() <= 2,
+        "{retry}"
+    );
 
     let other = TempDir::new().unwrap();
     let options = keyed_options(&other);
@@ -663,18 +679,41 @@ fn billing_errors_are_classified() {
         generate(&payment, 1),
         Err(GenerationError::Billing)
     ));
-    // A successful result that quotes the words is not a billing error.
-    let quoted = [
-        init(json!(["StructuredOutput"]), json!([])),
-        json!({"type": "result", "subtype": "success", "is_error": false,
-               "result": "Explain the credit balance check", "structured_output": subject()})
-        .to_string(),
-    ]
-    .join("\n");
+    let spend_limit = json!({"type": "result", "subtype": "success", "is_error": true,
+                             "result": "API Error: 400 You have reached your specified API usage limits. \
+                                        You will regain access on 2026-12-01 at 00:00 UTC.",
+                             "api_error_status": 400})
+    .to_string();
     assert!(matches!(
-        generate(&quoted, 1),
-        Err(GenerationError::Backend(_))
+        generate(&spend_limit, 1),
+        Err(GenerationError::Billing)
     ));
+    let workspace_limit = json!({"type": "result", "subtype": "success", "is_error": true,
+                                 "result": "API Error: 400 You have reached your specified workspace API \
+                                            usage limits.",
+                                 "api_error_status": 400})
+    .to_string();
+    assert!(matches!(
+        generate(&workspace_limit, 1),
+        Err(GenerationError::Billing)
+    ));
+    // A successful result that quotes the words is not a billing error.
+    for words in [
+        "Explain the credit balance check",
+        "Explain the specified API usage limits check",
+    ] {
+        let quoted = [
+            init(json!(["StructuredOutput"]), json!([])),
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                   "result": words, "structured_output": subject()})
+            .to_string(),
+        ]
+        .join("\n");
+        assert!(matches!(
+            generate(&quoted, 1),
+            Err(GenerationError::Backend(_))
+        ));
+    }
 }
 
 #[test]

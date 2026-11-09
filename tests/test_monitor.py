@@ -141,12 +141,13 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn('client-host:capture:backlog', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
 
     def test_subscription_fallback_alerts_until_capture_reports_the_api_again(self):
-        fallback = {'reason': 'billing', 'since': NOW.isoformat(), 'retry_at': (NOW + timedelta(days=1)).isoformat(), 'key': '1-2-3'}
+        fallback = {'reason': 'authentication', 'since': NOW.isoformat(), 'retry_at': (NOW + timedelta(days=1)).isoformat(),
+                    'key': '1-2-3'}
         self.remote['jobs']['capture'] = {'loaded': True, 'running': False, 'last_exit': 0}
         self.remote['capture'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat(), 'api_fallback': fallback}
         first = monitor.evaluate(self.local, self.remote, self.previous, NOW)
         self.assertEqual(first['problems']['maintainer-host:capture:fallback'],
-                         'maintainer-host: running on subscription fallback; the Claude API is unavailable (billing)')
+                         'maintainer-host: running on subscription fallback; the Claude API is unavailable (authentication)')
         self.assertEqual(monitor.problem_job('maintainer-host:capture:fallback'), ('maintainer-host', 'capture'))
         # A running capture has not yet shown the API back.
         self.remote['capture'] = {'phase': 'running', 'success': None, 'started_at': NOW.isoformat(),
@@ -154,6 +155,58 @@ class MonitorTests(unittest.TestCase):
         self.assertIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
         self.remote['capture'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat()}
         self.assertNotIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
+
+    def test_an_exhausted_monthly_balance_raises_no_alert(self):
+        billing = {'reason': 'billing', 'since': NOW.isoformat(), 'retry_at': (NOW + timedelta(days=20)).isoformat(),
+                   'key': '1-2-3'}
+        self.remote['jobs']['capture'] = {'loaded': True, 'running': False, 'last_exit': 0}
+        self.remote['capture'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat(), 'api_fallback': billing}
+        self.assertNotIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, self.previous, NOW)['problems'])
+        # A rejected key that turns into an exhausted balance clears its alert.
+        self.remote['capture']['api_fallback'] = {**billing, 'reason': 'authentication'}
+        first = monitor.evaluate(self.local, self.remote, self.previous, NOW)
+        self.assertIn('maintainer-host:capture:fallback', first['problems'])
+        self.remote['capture']['api_fallback'] = billing
+        self.assertNotIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
+        # A billing fallback older than a month outlasted its recharge and alerts.
+        self.remote['capture']['api_fallback'] = {**billing, 'since': (NOW - timedelta(days=33)).isoformat()}
+        stale = monitor.evaluate(self.local, self.remote, self.previous, NOW)
+        self.assertEqual(stale['problems']['maintainer-host:capture:fallback'],
+                         'maintainer-host: running on subscription fallback; the Claude API is unavailable (billing)')
+        # A malformed record neither alerts nor stops an open alert's recovery check.
+        self.remote['capture']['api_fallback'] = 'billing'
+        self.assertNotIn('maintainer-host:capture:fallback', monitor.evaluate(self.local, self.remote, stale, NOW)['problems'])
+
+    def test_blocked_workflow_checkout_alerts_until_a_finished_sync_updates_it(self):
+        for state in ('current', 'updated', 'ahead', 'fetch_failed', 'busy', 'deferred'):
+            with self.subTest(state=state):
+                self.local['sync']['checkout'] = {'state': state, 'commit': 'abc'}
+                self.assertFalse(monitor.evaluate(self.local, self.remote, self.previous, NOW)['problems'])
+        expected = {'dirty': 'has uncommitted changes to tracked files', 'diverged': 'and origin/main have both moved on',
+                    'not_on_main': 'is not on main', 'merge_failed': 'could not be fast-forwarded',
+                    'failed': 'could not be inspected'}
+        for state, reason in expected.items():
+            with self.subTest(state=state):
+                self.remote['sync']['checkout'] = {'state': state}
+                result = monitor.evaluate(self.local, self.remote, self.previous, NOW)
+                self.assertEqual(result['problems'], {'maintainer-host:sync:checkout':
+                    'maintainer-host: workflow checkout ' + reason + '; sync no longer updates its scripts'})
+        self.assertEqual(monitor.problem_job('maintainer-host:sync:checkout'), ('maintainer-host', 'sync'))
+        first = monitor.evaluate(self.local, self.remote, self.previous, NOW)
+        # A running sync has no checkout result yet, so it cannot prove recovery.
+        self.remote['sync'] = {'phase': 'running', 'success': None, 'started_at': NOW.isoformat(),
+                               'last_success_finished_at': NOW.isoformat()}
+        self.assertIn('maintainer-host:sync:checkout', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
+        # Neither a failed fetch, a run that stopped before the step nor a malformed result shows the block is gone.
+        for checkout in ({'state': 'fetch_failed'}, None, 'current', {'state': ['current']}):
+            with self.subTest(checkout=checkout):
+                self.remote['sync'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat()}
+                if checkout is not None:
+                    self.remote['sync']['checkout'] = checkout
+                self.assertIn('maintainer-host:sync:checkout', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
+        self.remote['sync'] = {'phase': 'finished', 'success': True, 'finished_at': NOW.isoformat(),
+                               'checkout': {'state': 'updated', 'from': 'abc', 'commit': 'def'}}
+        self.assertNotIn('maintainer-host:sync:checkout', monitor.evaluate(self.local, self.remote, first, NOW)['problems'])
 
     def test_hourly_sync_is_healthy_and_clears_stale_alert(self):
         self.remote['sync']['finished_at'] = (NOW - timedelta(hours=1)).isoformat()

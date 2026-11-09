@@ -32,6 +32,11 @@ class ClaudeCliTests(unittest.TestCase):
             self.assertIn(flag, command)
         self.assertNotIn('--permission-mode', command)
 
+    def test_role_models_use_only_haiku_and_opus(self):
+        self.assertEqual(cli.ROLE_MODELS, {'extract': 'claude-haiku-5-5', 'verify': 'claude-haiku-5-5',
+                                           'correct': 'claude-opus-5-5'})
+        self.assertEqual({cli.RESTRICTED_MODEL, cli.REVIEW_MODEL}, {'claude-opus-5-5'})
+
     def test_review_command_keeps_user_configuration_without_prompts(self):
         command = cli.review_command('/bin/claude', '/p/sandbox.json')
         self.assertEqual(command[command.index('--permission-mode') + 1], 'bypassPermissions')

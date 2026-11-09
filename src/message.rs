@@ -1,11 +1,12 @@
 //! Generate commit text using only a supplied public diff, through an isolated,
 //! tool-less Claude Code CLI call with schema-constrained output. With an API key file the call
-//! is billed to that key; an exhausted balance or rejected key falls back to the signed-in login.
+//! is billed to that key; an exhausted balance, a reached spend limit or a rejected key falls back
+//! to the signed-in login.
 use crate::{
     CommitMessage, Result,
     config::{Config, expand},
 };
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, Local, SecondsFormat, TimeDelta, TimeZone, Utc};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
     sys::signal::{Signal, killpg},
@@ -38,6 +39,10 @@ pub const MAX_DIFF_BYTES: usize = 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Maximum bytes accepted from each of the CLI's stdout and stderr.
 pub const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Lowercase phrases of an error result that is about money: an exhausted prepaid balance, or a
+/// reached organization or workspace spend limit ("specified [workspace] API usage limits").
+/// `scripts/claude_api.py` keeps the same list.
+const BILLING_TEXTS: [&str; 2] = ["credit balance", "api usage limits"];
 const SUBJECT_MIN: usize = 12;
 const SUBJECT_MAX: usize = 120;
 const BODY_MAX: usize = 12_000;
@@ -181,7 +186,7 @@ pub enum GenerationError {
     Timeout,
     Cancelled,
     Authentication,
-    /// The API key's balance cannot pay for the call.
+    /// The API key's balance cannot pay for the call, or the Console spend limit is reached.
     Billing,
     Backend(String),
     InvalidMessage,
@@ -198,7 +203,9 @@ impl std::fmt::Display for GenerationError {
             Self::Authentication => f.write_str(
                 "Claude Code authentication unavailable; sign in with the claude CLI and retry",
             ),
-            Self::Billing => f.write_str("Claude API credit balance is too low"),
+            Self::Billing => {
+                f.write_str("Claude API credit balance is too low or its spend limit is reached")
+            }
             Self::Backend(detail) => {
                 write!(f, "restricted Claude Code generation failed: {detail}")
             }
@@ -358,8 +365,8 @@ enum Auth {
 }
 
 /// The API key to use and its file's fingerprint, or None for the login: no key file is configured,
-/// or the shared fallback record says the API was unavailable for this key file and its daily retry
-/// is not yet due.
+/// or the shared fallback record says the API was unavailable for this key file and its retry
+/// time has not come.
 fn api_auth(
     o: &Options,
     now: DateTime<Utc>,
@@ -425,19 +432,63 @@ fn read_fallback(path: &Path) -> Option<Fallback> {
     })
 }
 
-/// Record that the API is unavailable; later calls use the login until a day passes or the key
-/// file changes. The first failure's time is kept while the record continues.
+/// The API balance recharges on the 1st of each month; an exhausted balance waits for local
+/// midnight on this day.
+const API_BALANCE_DAY: u32 = 2;
+
+/// When an API failure at `now` tries the API again, as `api_retry_at` in `scripts/capture.py`
+/// computes it. An exhausted balance waits for the next midnight in `tz` on day `API_BALANCE_DAY`
+/// of a month. A rejected key, or a failure at or after the previous record's retry time, as when
+/// the balance has not come back by then, retries after a day.
+fn retry_at<Tz: TimeZone>(
+    reason: &str,
+    now: DateTime<Utc>,
+    previous_retry: Option<DateTime<Utc>>,
+    tz: &Tz,
+) -> DateTime<Utc> {
+    if reason != "billing" || previous_retry.is_some_and(|retry| retry <= now) {
+        return now + TimeDelta::days(1);
+    }
+    let local = now.with_timezone(tz);
+    let (year, month) = if local.day() < API_BALANCE_DAY {
+        (local.year(), local.month())
+    } else if local.month() == 12 {
+        (local.year() + 1, 1)
+    } else {
+        (local.year(), local.month() + 1)
+    };
+    // A midnight that a clock change skips becomes 01:00, the instant Python's datetime gives for
+    // it under a one-hour gap.
+    [0, 1]
+        .into_iter()
+        .find_map(|hour| {
+            tz.with_ymd_and_hms(year, month, API_BALANCE_DAY, hour, 0, 0)
+                .earliest()
+        })
+        .map_or(now + TimeDelta::days(1), |reset| reset.with_timezone(&Utc))
+}
+
+/// Record that the API is unavailable; later calls use the login until the retry time (see
+/// `retry_at`) or until the key file changes. The first failure's time is kept while the record
+/// continues.
 fn record_fallback(o: &Options, reason: &str, now: DateTime<Utc>) -> io::Result<()> {
     let (Some(path), Some(file)) = (&o.api_fallback_file, &o.api_key_file) else {
         return Ok(());
     };
-    let since = read_fallback(path)
+    let previous = read_fallback(path);
+    let retry = retry_at(
+        reason,
+        now,
+        previous.as_ref().map(|record| record.retry_at),
+        &Local,
+    );
+    let since = previous
         .map(|record| record.since)
         .unwrap_or_else(|| now.to_rfc3339_opts(SecondsFormat::Secs, false));
     let record = serde_json::json!({
         "reason": reason,
         "since": since,
-        "retry_at": (now + TimeDelta::days(1)).to_rfc3339_opts(SecondsFormat::Secs, false),
+        "retry_at": retry.to_rfc3339_opts(SecondsFormat::Secs, false),
         "key": key_fingerprint(&fs::symlink_metadata(file)?),
     });
     let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
@@ -626,8 +677,11 @@ fn parse_stream(out: &[u8], exit_ok: bool) -> std::result::Result<CommitMessage,
         let status = result.api_error_status.as_ref().and_then(Value::as_u64);
         errors.push(result.result.as_deref().unwrap_or_default().to_lowercase());
         let text = errors.join("\n");
-        // Only an error result can report a balance; a successful answer may quote the words.
-        if result.is_error && (status == Some(402) || text.contains("credit balance")) {
+        // Only an error result can report a balance or a reached spend limit; a successful answer may
+        // quote the words.
+        if result.is_error
+            && (status == Some(402) || BILLING_TEXTS.iter().any(|s| text.contains(s)))
+        {
             return Err(GenerationError::Billing);
         }
         if matches!(status, Some(401 | 403))
@@ -1129,5 +1183,46 @@ mod tests {
             generate_message(DIFF, None, &cancelled),
             Err(GenerationError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn billing_retries_at_the_next_midnight_on_the_second() {
+        let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        let at = |text: &str| {
+            DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        for (now, retry) in [
+            ("2026-11-08T05:00:00+09:00", "2026-12-02T00:00:00+09:00"),
+            ("2026-12-15T12:00:00+09:00", "2027-01-02T00:00:00+09:00"),
+            ("2027-01-01T23:59:59+09:00", "2027-01-02T00:00:00+09:00"),
+            ("2027-01-02T00:00:00+09:00", "2027-02-02T00:00:00+09:00"),
+            // Still the 1st in UTC, already the 2nd in Tokyo.
+            ("2027-01-01T16:00:00+00:00", "2027-02-02T00:00:00+09:00"),
+        ] {
+            assert_eq!(
+                retry_at("billing", at(now), None, &tokyo),
+                at(retry),
+                "{now}"
+            );
+        }
+        let now = at("2026-11-08T05:00:00+09:00");
+        assert_eq!(
+            retry_at("authentication", now, None, &tokyo),
+            now + TimeDelta::days(1)
+        );
+        // A repeat failure while the record still waits keeps the monthly reset.
+        let pending = Some(at("2026-12-02T00:00:00+09:00"));
+        assert_eq!(
+            retry_at("billing", now, pending, &tokyo),
+            at("2026-12-02T00:00:00+09:00")
+        );
+        // A failure at the reset itself, before the balance is back, retries after a day.
+        let reset = at("2026-12-02T00:00:05+09:00");
+        assert_eq!(
+            retry_at("billing", reset, pending, &tokyo),
+            reset + TimeDelta::days(1)
+        );
     }
 }

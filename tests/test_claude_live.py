@@ -42,8 +42,12 @@ def projects_dir():
     return Path(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude').expanduser() / 'projects'
 
 
-def project_names():
-    folder = projects_dir()
+def default_temp_dir():
+    """Claude Code's temp folder when CLAUDE_CODE_TMPDIR is unset: /tmp/claude-<uid>."""
+    return Path('/tmp') / f'claude-{os.getuid()}'
+
+
+def folder_names(folder):
     return {entry.name for entry in folder.iterdir()} if folder.is_dir() else set()
 
 
@@ -93,14 +97,22 @@ class ClaudeLiveTests(unittest.TestCase):
         self.cli = cli
         self.root = Path(tempfile.mkdtemp(prefix='claude-live-'))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        self.before = project_names()
-        # A session under the temporary root would leave a project folder named after it.
-        self.addCleanup(self.assert_no_transcripts)
+        # Claude Code makes a folder named after each session's cwd in its temp folder and never removes it.
+        # Every child env derives from os.environ, so this keeps those folders inside the root.
+        temp = self.root / 'claude-tmp'
+        temp.mkdir()
+        environment = patch.dict(os.environ, {'CLAUDE_CODE_TMPDIR': str(temp)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.before = {folder: folder_names(folder) for folder in (projects_dir(), default_temp_dir())}
+        # A session under the temporary root would leave a folder named after it in either place.
+        self.addCleanup(self.assert_no_session_folders)
 
-    def assert_no_transcripts(self):
-        names = {sanitized(self.root.name)}
-        created = [name for name in project_names() - self.before if any(part in name for part in names)]
-        self.assertEqual(created, [], 'a Claude Code session persisted state under ' + str(projects_dir()))
+    def assert_no_session_folders(self):
+        marker = sanitized(self.root.name)
+        for folder, before in self.before.items():
+            created = [name for name in folder_names(folder) - before if marker in name]
+            self.assertEqual(created, [], 'a Claude Code session left folders in ' + str(folder))
 
     def cheap(self, function):
         """Pin a small model: production builders bind high effort, and model_response passes each role's model."""

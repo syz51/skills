@@ -25,14 +25,19 @@ FOLLOWUP_SCOPE = 'original-turn and subsequent same-chat messages; artifacts and
 
 SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['status', 'summary'], 'properties': {
     'status': {'type': 'string', 'enum': ['supported', 'partial', 'unsupported']},
-    'summary': {'type': 'string', 'minLength': 1, 'maxLength': 1000}}}
+    # Answers crowded the hard limit and sometimes passed it, so the model is asked for less than it allows.
+    'summary': {'type': 'string', 'minLength': 1, 'maxLength': capture.MAX_FIELD,
+                'description': 'Aim for 700 characters or fewer.'}}}
 PROMPT = prompt_runtime.load('verify', root=prompt_runtime.DEFAULT_ROOT)
 CORRECTION_SCHEMA = {**NOTE_SCHEMA, 'properties': {'notes': {**NOTE_SCHEMA['properties']['notes'], 'maxItems': 1}}}
 CORRECTION_PROMPT = prompt_runtime.load('correct', root=prompt_runtime.DEFAULT_ROOT)
 # A note whose source check settles nothing new (its source is missing or ambiguous, the check failed, or the
 # assessment stays unresolved) waits 1, 2, 4, 8 and 16 hours, then a day, before its next scheduled attempt.
 BACKOFF = 'evidence-backoff.json'
-BACKOFF_REASONS = ('unavailable', 'ambiguous', 'error', 'unresolved')
+BACKOFF_REASONS = ('unavailable', 'ambiguous', 'error', 'unresolved', 'too_long')
+# A too-long answer is a failed check that waits once before it errs, so a note too long on every run alternates
+# between the two; counting them as one outcome keeps its waits growing.
+BACKOFF_FAMILY = {'too_long': 'error'}
 MAX_BACKOFF = timedelta(hours=24)
 # Evidence starts after capture, whose budget is 15 minutes, so its hourly start drifts; an entry due within this
 # slack of a run is retried rather than skipped.
@@ -81,7 +86,7 @@ def validate_receipt(value, note_sha=None, host=None, skill=None):
     scope = FOLLOWUP_SCOPE if value.get('followUps') else ORIGINAL_SCOPE
     if value['status'] not in SCHEMA['properties']['status']['enum'] or value['scope'] != scope:
         raise ValueError('Invalid source verification receipt')
-    if not isinstance(value['summary'], str) or not 0 < len(value['summary']) <= 1000 or '\n' in value['summary']:
+    if not isinstance(value['summary'], str) or not 0 < len(value['summary']) <= capture.MAX_FIELD or '\n' in value['summary']:
         raise ValueError('Invalid source verification receipt')
     if value['schema_version'] >= 3:
         if value['status'] == 'supported' and (value['schema_version'] == 3 or value['correction'] is not None):
@@ -95,7 +100,7 @@ def validate_receipt(value, note_sha=None, host=None, skill=None):
             for key in ('inputSha256', 'generationInputSha256'):
                 if not isinstance(correction[key], str) or not re.fullmatch(r'[a-f0-9]{64}', correction[key]):
                     raise ValueError('Invalid correction fingerprint')
-            if (not isinstance(correction['summary'], str) or not 0 < len(correction['summary']) <= 1000 or
+            if (not isinstance(correction['summary'], str) or not 0 < len(correction['summary']) <= capture.MAX_FIELD or
                     '\n' in correction['summary']):
                 raise ValueError('Invalid correction summary')
             validate_notes({'notes': [correction['note']]}, {'verified_skills': [value['skill']]})
@@ -324,7 +329,8 @@ def load_backoff(path, checker_sha, now):
 
 def stepped_backoff(entry, checker_sha, reason, now):
     """The next retry after an attempt that settled nothing; a different outcome than last time starts over."""
-    attempts = entry['attempts'] + 1 if entry and entry['reason'] == reason else 1
+    family = BACKOFF_FAMILY.get(reason, reason)
+    attempts = entry['attempts'] + 1 if entry and BACKOFF_FAMILY.get(entry['reason'], entry['reason']) == family else 1
     delay = min(MAX_BACKOFF, timedelta(hours=2 ** min(attempts - 1, 5)))
     return {'checker': checker_sha, 'reason': reason, 'attempts': attempts, 'retry_at': now + delay - BACKOFF_SLACK}
 
@@ -338,6 +344,10 @@ def count_outcome(counts, reason, previous):
     """Count a note whose check settled nothing new, whether it ran now or is waiting for its retry."""
     if reason == 'error':
         counts['errors'] += 1
+        counts['pending'] += 1
+        return
+    if reason == 'too_long':
+        counts['too_long'] += 1
         counts['pending'] += 1
         return
     if reason in ('unavailable', 'ambiguous'):
@@ -358,7 +368,7 @@ def verify(config, state_root, note_sha=None, recheck=False, now=None):
     found = False
     counts = {'notes': 0, 'current': 0, 'checked': 0, 'pending': 0, 'unavailable': 0, 'errors': 0,
               'supported': 0, 'partial': 0, 'unsupported': 0, 'corrected': 0, 'unresolved': 0,
-              'recovered': 0, 'ambiguous': 0, 'rate_limited': 0, 'rate_limit': None}
+              'recovered': 0, 'ambiguous': 0, 'rate_limited': 0, 'rate_limit': None, 'too_long': 0}
     checker_sha = checker_fingerprint(config)
     # A requested check runs at once and updates only its own note's schedule.
     backoff_path = Path(state_root) / BACKOFF
@@ -514,6 +524,13 @@ def verify(config, state_root, note_sha=None, recheck=False, now=None):
             # A requested check that could not run is a failure of that request.
             counts['errors'] += int(bool(note_sha))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            # One answer still too long after the helper's follow-up is the model's variance (reruns of such notes
+            # passed), so the note waits for the next run. Too long again in a row, or on a requested check, errs.
+            if (isinstance(error, capture.FieldTooLong) and not note_sha and
+                    not (key in backoff and backoff[key]['reason'] == 'too_long')):
+                settled('too_long')
+                count_outcome(counts, 'too_long', None)
+                continue
             settled('error')
             count_outcome(counts, 'error', None)
             if isinstance(error, ExtractorFailure) and len(counts.get('extractor_diagnostics', [])) < 10:

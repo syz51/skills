@@ -13,10 +13,12 @@ import subprocess
 import sys
 import tempfile
 
-from jobs import latest_due, save
+from jobs import CHECKOUT_BLOCKED, CHECKOUT_CLEAR, CHECKOUT_REASONS, latest_due, save
 
 ROOT = Path.home() / '.local/share/codex-skills'
 SYNC_STALE_AFTER = timedelta(minutes=90)
+# An exhausted balance recharges monthly; a billing fallback older than a month outlasted its reset.
+BILLING_FALLBACK_GRACE = timedelta(days=32)
 
 
 def read_object(path):
@@ -79,6 +81,25 @@ def probe(root):
     return result
 
 
+def alerting_fallback(status, now):
+    """The status's subscription fallback when it needs attention: a rejected key, or an exhausted balance that its
+    monthly recharge did not restore. A billing fallback within a month waits for that recharge."""
+    fallback = status.get('api_fallback')
+    if not isinstance(fallback, dict):
+        return None
+    if fallback.get('reason') == 'billing' and now - stamp(fallback['since']) <= BILLING_FALLBACK_GRACE:
+        return None
+    return fallback
+
+
+def checkout_state(status):
+    """The workflow checkout result of a finished sync, or None."""
+    checkout = status.get('checkout')
+    if status.get('phase') != 'finished' or not isinstance(checkout, dict) or not isinstance(checkout.get('state'), str):
+        return None
+    return checkout['state']
+
+
 def health(snapshot, now, grace=False):
     host = snapshot['host_id']
     problems = {}
@@ -113,6 +134,10 @@ def health(snapshot, now, grace=False):
             failure = status['finished_at']
         if failure and (not success or stamp(failure) > stamp(success)):
             problems[key + ':failure'] = host + ': ' + command + ' failed; no successful retry yet'
+        checkout = checkout_state(status)
+        if command == 'sync' and checkout in CHECKOUT_BLOCKED:
+            problems[key + ':checkout'] = (host + ': workflow checkout ' + CHECKOUT_REASONS[checkout]
+                                           + '; sync no longer updates its scripts')
         if status.get('phase') == 'running':
             if not grace and now - stamp(status['started_at']) > timedelta(minutes=95):
                 problems[key + ':stuck'] = host + ': ' + command + ' has not finished within 95 minutes'
@@ -124,8 +149,8 @@ def health(snapshot, now, grace=False):
             oldest = counts.get('oldest_pending_at')
             if counts.get('pending', 0) and oldest and now - stamp(oldest) > timedelta(hours=24):
                 problems[key + ':backlog'] = host + ': completed skill work has waited over 24 hours for feedback capture'
-            fallback = status.get('api_fallback')
-            if isinstance(fallback, dict):
+            fallback = alerting_fallback(status, now)
+            if fallback:
                 problems[key + ':fallback'] = (host + ': running on subscription fallback; the Claude API is unavailable ('
                                                + str(fallback.get('reason')) + ')')
     if 'weekly' in snapshot['jobs'] and not grace and not active_weekly:
@@ -176,8 +201,11 @@ def recovered(key, snapshot, now, observed):
         return bool(status.get('success') is True and isinstance(counts, dict)
                     and (counts.get('pending') == 0 or (counts.get('oldest_pending_at')
                          and now - stamp(counts['oldest_pending_at']) <= timedelta(hours=24))))
+    if kind == 'checkout':
+        # A failed fetch or a run that stopped before the step cannot show the block is gone.
+        return checkout_state(status) in CHECKOUT_CLEAR
     if kind == 'fallback':
-        return status.get('phase') == 'finished' and not status.get('api_fallback')
+        return status.get('phase') == 'finished' and not alerting_fallback(status, now)
     if kind == 'overdue':
         completed = (snapshot.get('weekly_state') or {}).get('completed_due')
         return bool(completed and stamp(completed) >= latest_due(now))

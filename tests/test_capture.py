@@ -907,6 +907,8 @@ class CaptureTests(unittest.TestCase):
 
     def test_static_failure_diagnostics_never_echo_source_text(self):
         cases = [(ValueError('Invalid capture note field'), 'model schema rejected'),
+                 (ValueError('Empty capture note field'), 'model field empty'),
+                 (ValueError('Capture note field too long'), 'model field too long'),
                  (ValueError('Invalid capture note scope'), 'model scope rejected'),
                  (RuntimeError('Capture model attempted tool execution'), 'model tool event rejected'),
                  (capture.subprocess.TimeoutExpired('private command', 240), 'extractor timeout'),
@@ -1139,6 +1141,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(status['api_fallback'], record)
             self.assertTrue(status['warning'].startswith(
                 'Running on subscription fallback: the Claude API is unavailable (authentication)'))
+            self.assertIn('; replace the API key, or at once when the key file changes.', status['warning'])
             if not code:
                 self.assertEqual(json.loads(log.call_args.args[0])['warning'], status['warning'])
         capture.api_fallback_path(self.state).unlink()

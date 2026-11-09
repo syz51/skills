@@ -48,10 +48,14 @@ RATE_LIMIT_CONTINUES = timedelta(hours=2)
 # CLI paths whose --help advertised every isolation control in this process.
 VERIFIED_CLIS = set()
 FIELDS = ('title', 'task', 'observation', 'evidence', 'cause', 'proposal')
+MAX_FIELD = 1000
+# Static rejections for a model-written field, kept apart so diagnostics and callers can tell them apart.
+EMPTY_FIELD = 'Empty capture note field'
+LONG_FIELD = 'Capture note field too long'
 SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['notes'], 'properties': {
     'notes': {'type': 'array', 'maxItems': 3, 'items': {'type': 'object', 'additionalProperties': False,
         'required': ['skill', *FIELDS], 'properties': {'skill': {'type': 'string', 'enum': list(SKILLS)},
-            **{key: {'type': 'string', 'maxLength': 1000} for key in FIELDS}}}}}}
+            **{key: {'type': 'string', 'maxLength': MAX_FIELD} for key in FIELDS}}}}}}
 PROMPT = prompt_runtime.load('extract', root=prompt_runtime.DEFAULT_ROOT)
 # Title prefix of a frontend-ui note recording a visual pattern the user rejected as a default; the rest of
 # the title is the generic pattern. The maintainer proposes source-checked ones for the user's list.
@@ -69,6 +73,10 @@ class ExtractorFailure(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.diagnostics = diagnostics
+
+
+class FieldTooLong(ValueError):
+    """A model-written note field longer than MAX_FIELD; its message is the static LONG_FIELD."""
 
 
 class RateLimited(ExtractorFailure):
@@ -119,6 +127,8 @@ def record_rate_limit(state_root, facts, now, api=False):
 
 API_FALLBACK_CLASSES = ('billing', 'authentication')
 API_RETRY = timedelta(days=1)
+# The API balance recharges on the 1st of each month; an exhausted balance waits for host-local midnight on the 2nd.
+API_BALANCE_DAY = 2
 
 
 def api_fallback_path(state_root):
@@ -154,7 +164,7 @@ def read_api_fallback(state_root):
 
 def active_api_fallback(config, state_root, now=None):
     """The fallback record in effect, or None. In effect, calls go straight to the subscription: the API failed for
-    the configured key file and its daily retry is not due."""
+    the configured key file and its retry time has not come."""
     if not config.get('api_key_file'):
         return None
     record = read_api_fallback(state_root)
@@ -169,10 +179,24 @@ def clear_api_fallback(config, state_root):
         api_fallback_path(state_root).unlink(missing_ok=True)
 
 
+def api_retry_at(reason, now, previous_retry=None, tz=None):
+    """When an API failure at `now` tries the API again. An exhausted balance waits for the next midnight on day
+    API_BALANCE_DAY of a month in `tz` (default None: the host's local time zone, since a naive datetime converts as
+    local time). A rejected key, or a failure at or after the previous record's retry time, as when the balance has
+    not come back by then, retries after a day. The Rust publisher computes the same."""
+    if reason != 'billing' or (previous_retry and previous_retry <= now):
+        return now + API_RETRY
+    local = now.astimezone(tz)
+    year, month = ((local.year, local.month) if local.day < API_BALANCE_DAY
+                   else (local.year + local.month // 12, local.month % 12 + 1))
+    return datetime(year, month, API_BALANCE_DAY, tzinfo=tz).astimezone(timezone.utc)
+
+
 def record_api_fallback(config, state_root, reason, now):
     previous = read_api_fallback(state_root)
     value = {'reason': reason, 'since': previous['since'] if previous else now.isoformat(timespec='seconds'),
-             'retry_at': (now + API_RETRY).isoformat(timespec='seconds'), 'key': key_fingerprint(config) or ''}
+             'retry_at': api_retry_at(reason, now, previous and timestamp(previous['retry_at'])).isoformat(timespec='seconds'),
+             'key': key_fingerprint(config) or ''}
     atomic(api_fallback_path(state_root), json.dumps(value, indent=2) + '\n')
     return value
 
@@ -188,9 +212,11 @@ def report_api_fallback(status, config, state_root):
     if not record:
         return
     status['api_fallback'] = record
+    action = ('the API is tried again at ' + record['retry_at'] if record['reason'] == 'billing'
+              else 'replace the API key') + ', or at once when the key file changes'
     status['warning'] = ' '.join(filter(None, (
         f"Running on subscription fallback: the Claude API is unavailable ({record['reason']}) since {record['since']}; "
-        'top up or replace the API key.', status.get('warning'))))
+        f'{action}.', status.get('warning'))))
 
 
 def rate_limit_summary(limit, count, now):
@@ -1403,8 +1429,12 @@ def validate_notes(value, turn):
     for note in value['notes']:
         if not isinstance(note, dict) or set(note) != {'skill', *FIELDS} or note['skill'] not in turn['verified_skills']:
             raise ValueError('Invalid capture note scope')
-        if any(not isinstance(note[k], str) or not note[k].strip() or len(note[k]) > 1000 or '\n' in note[k] for k in FIELDS):
+        if any(not isinstance(note[k], str) or '\n' in note[k] for k in FIELDS):
             raise ValueError('Invalid capture note field')
+        if any(not note[k].strip() for k in FIELDS):
+            raise ValueError(EMPTY_FIELD)
+        if any(len(note[k]) > MAX_FIELD for k in FIELDS):
+            raise FieldTooLong(LONG_FIELD)
     return value['notes']
 
 
@@ -1515,9 +1545,9 @@ def usable(output):
 def model_response(config, state_root, prompt, data, response_schema, *, deadline=None, wait_for_rate_limit=True,
                    role=None, cache_prefix=None, backend=None):
     """Run one restricted call on the role's model: through the Claude API when the configuration names a key
-    file, otherwise through the Claude Code CLI. An exhausted API balance or a rejected key falls back to the
-    CLI's signed-in subscription and records it, so later calls start there until a day passes or the key file
-    changes. Until a recorded usage limit's reset, raise RateLimited without calling, unless the caller asked
+    file, otherwise through the Claude Code CLI. An exhausted API balance, a reached spend limit or a rejected key
+    falls back to the CLI's signed-in subscription and records it, so later calls start there until its retry time
+    (api_retry_at) or until the key file changes. Until a recorded usage limit's reset, raise RateLimited without calling, unless the caller asked
     for an immediate retry. A caller comparing answers passes `backend` to keep every call on one backend; a call
     that cannot run there fails instead of moving."""
     call = dict(deadline=deadline, wait_for_rate_limit=wait_for_rate_limit, role=role, cache_prefix=cache_prefix)
@@ -1648,6 +1678,8 @@ def failure_reason(error):
     reasons = {
         'Invalid capture output': 'model schema rejected',
         'Invalid capture note field': 'model schema rejected',
+        EMPTY_FIELD: 'model field empty',
+        LONG_FIELD: 'model field too long',
         'Invalid capture note scope': 'model scope rejected',
         'Invalid capture transaction': 'invalid capture state',
         'Invalid rate limit state': 'invalid rate limit state',

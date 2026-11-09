@@ -464,14 +464,73 @@ class EvidenceTests(unittest.TestCase):
 
     def test_rejected_check_reports_its_static_error_without_note_text(self):
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
-                patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': 'x' * 1001}):
+                patch.object(evidence, 'model_response', return_value={'status': 'supported', 'summary': ' \n '}):
             counts = evidence.verify(self.config, self.root)
         digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
         self.assertEqual((counts['checked'], counts['errors']), (0, 1))
         self.assertEqual(counts['check_diagnostics'], [{'note': 'frontend-ui/' + digest, 'error_class': 'ValueError',
-                                                        'message': 'Invalid capture note field'}])
+                                                        'message': 'Empty capture note field'}])
         self.assertNotIn('extractor_diagnostics', counts)
         self.assertEqual(list(self.feedback.rglob('*.json')), [])
+
+    def test_a_first_too_long_answer_waits_for_the_next_run_and_a_repeat_is_an_error(self):
+        digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        too_long = {'status': 'partial', 'summary': 'x' * 1001}
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', return_value=too_long) as model:
+            first = evidence.verify(self.config, self.root, now=hours(0))
+            second = evidence.verify(self.config, self.root, now=hours(1))
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual((first['checked'], first['errors'], first['pending'], first['too_long']), (0, 0, 1, 1))
+        self.assertNotIn('check_diagnostics', first)
+        self.assertEqual((second['errors'], second['pending'], second['too_long']), (1, 1, 0))
+        self.assertEqual(second['check_diagnostics'], [{'note': 'frontend-ui/' + digest, 'error_class': 'FieldTooLong',
+                                                        'message': 'Capture note field too long'}])
+        self.assertEqual(list(self.feedback.rglob('*.json')), [])
+        # A check the user requested reports the failure at once.
+        self.root.joinpath(evidence.BACKOFF).unlink()
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', return_value=too_long):
+            requested = evidence.verify(self.config, self.root, note_sha=digest, now=hours(2))
+        self.assertEqual((requested['errors'], requested['too_long']), (1, 0))
+
+    def test_a_note_waiting_after_a_too_long_answer_is_pending_not_an_error(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', return_value={'status': 'partial', 'summary': 'x' * 1001}) as model:
+            evidence.verify(self.config, self.root, now=hours(0))
+            # A run before the retry time, such as a manual rerun, counts the waiting note without checking it.
+            waiting = evidence.verify(self.config, self.root, now=hours(0.2))
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual((waiting['errors'], waiting['pending'], waiting['too_long']), (0, 1, 1))
+
+    def test_a_too_long_answer_after_an_other_failure_is_still_a_first(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=[
+                    OSError('local failure'), {'status': 'partial', 'summary': 'x' * 1001}]):
+            failed = evidence.verify(self.config, self.root, now=hours(0))
+            too_long = evidence.verify(self.config, self.root, now=hours(1))
+        self.assertEqual(failed['errors'], 1)
+        self.assertEqual((too_long['errors'], too_long['too_long']), (0, 1))
+
+    def test_a_too_long_correction_field_waits_like_a_too_long_summary(self):
+        responses = [{'status': 'partial', 'summary': 'The outcome is not established.'},
+                     {'notes': [{**self.correction, 'evidence': 'x' * 1001}]}]
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=responses):
+            counts = evidence.verify(self.config, self.root, now=hours(0))
+        self.assertEqual((counts['checked'], counts['errors'], counts['too_long']), (0, 0, 1))
+        self.assertEqual(list(self.feedback.rglob('*.json')), [])
+
+    def test_a_too_long_answer_that_passes_on_the_next_run_is_stored(self):
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', side_effect=[
+                    {'status': 'supported', 'summary': 'x' * 1001},
+                    {'status': 'supported', 'summary': 'The note matches the reported correction.'}]):
+            first = evidence.verify(self.config, self.root, now=hours(0))
+            second = evidence.verify(self.config, self.root, now=hours(1))
+        self.assertEqual((first['errors'], first['too_long']), (0, 1))
+        self.assertEqual((second['checked'], second['errors'], second['supported']), (1, 0, 1))
+        self.assertEqual(len(list(self.feedback.rglob('*.json'))), 1)
 
     def test_unverified_correction_is_not_published_or_retried_hourly(self):
         responses = [{'status': 'unsupported', 'summary': 'The observation misstates the reported result.'},
@@ -604,7 +663,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(value['supersedes'], hashlib.sha256(data).hexdigest())
 
     def test_correction_failures_preserve_history_and_fail_the_job(self):
-        unsafe = {'notes': [{**self.correction, 'evidence': 'x' * 1001}]}
+        unsafe = {'notes': [{**self.correction, 'evidence': ' '}]}
         # A rejected correction is not retried; the job fails without a receipt.
         for cycle, failures in enumerate(([RuntimeError('Service unavailable')], [unsafe])):
             with self.subTest(failures=failures), patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(
@@ -745,6 +804,8 @@ class EvidenceTests(unittest.TestCase):
         status = json.loads((self.root / 'evidence-status.json').read_text())
         self.assertEqual(status['api_fallback'], record)
         self.assertTrue(status['warning'].startswith('Running on subscription fallback'))
+        self.assertIn('; the API is tried again at ' + record['retry_at'] + ', or at once when the key file changes.',
+                      status['warning'])
 
     def test_a_requested_check_runs_despite_a_recorded_limit_and_fails_when_rejected(self):
         now = datetime.now(timezone.utc)
@@ -932,6 +993,35 @@ class BackoffTests(unittest.TestCase):
             self.assertEqual((counts['errors'], counts['pending'], counts['checked']), (1, 1, 0))
         [entry] = self.schedule().values()
         self.assertEqual((entry['reason'], entry['attempts']), ('error', 2))
+
+    def test_a_note_too_long_on_every_run_waits_longer_each_time(self):
+        # The first too-long answer waits, the repeat errs, the next after that error waits again: one outcome.
+        outcomes = []
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', return_value={'status': 'partial', 'summary': 'x' * 1001}) as model:
+            at = 0.0
+            for _ in range(5):
+                counts = evidence.verify(self.config, self.root, now=hours(at))
+                [entry] = self.schedule().values()
+                due = evidence.timestamp(entry['retry_at'])
+                wait = (due - hours(at) + evidence.BACKOFF_SLACK) / timedelta(hours=1)
+                outcomes.append((counts['too_long'], counts['errors'], entry['reason'], entry['attempts'], wait))
+                at = (due - START) / timedelta(hours=1)
+        self.assertEqual(model.call_count, 5)
+        self.assertEqual(outcomes, [(1, 0, 'too_long', 1, 1), (0, 1, 'error', 2, 2), (1, 0, 'too_long', 3, 4),
+                                    (0, 1, 'error', 4, 8), (1, 0, 'too_long', 5, 16)])
+
+    def test_a_first_too_long_answer_after_an_other_outcome_waits_once_and_starts_over(self):
+        with patch.object(evidence, 'completed_turns', return_value=[]):
+            for at in (0, 1):
+                evidence.verify(self.config, self.root, now=hours(at))
+        self.assertEqual(next(iter(self.schedule().values()))['attempts'], 2)
+        with patch.object(evidence, 'completed_turns', return_value=[self.turn]), \
+                patch.object(evidence, 'model_response', return_value={'status': 'partial', 'summary': 'x' * 1001}):
+            counts = evidence.verify(self.config, self.root, now=hours(3))
+        self.assertEqual((counts['errors'], counts['pending'], counts['too_long']), (0, 1, 1))
+        [entry] = self.schedule().values()
+        self.assertEqual((entry['reason'], entry['attempts']), ('too_long', 1))
 
     def test_a_new_outcome_starts_the_waits_over_and_a_settled_note_leaves_the_schedule(self):
         with patch.object(evidence, 'completed_turns', return_value=[]):

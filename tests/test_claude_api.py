@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import io
 import json
 from pathlib import Path
@@ -49,7 +50,7 @@ class APITimeoutError(APIConnectionError):
 SDK = SimpleNamespace(**{cls.__name__: cls for cls in (APIStatusError, RateLimitError, AuthenticationError,
                                                         PermissionDeniedError, BadRequestError, APIConnectionError,
                                                         APITimeoutError)})
-REQUEST = {'model': 'claude-sonnet-5-5', 'effort': 'high', 'max_tokens': 16000, 'timeout': 200,
+REQUEST = {'model': 'claude-opus-5-5', 'effort': 'high', 'max_tokens': 16000, 'timeout': 200,
            'prompt': 'Fixed prompt', 'data': '{"private": "source"}',
            'schema': {'type': 'object', 'additionalProperties': False, 'required': ['notes'],
                       'properties': {'notes': {'type': 'array', 'maxItems': 3,
@@ -57,7 +58,7 @@ REQUEST = {'model': 'claude-sonnet-5-5', 'effort': 'high', 'max_tokens': 16000, 
 
 
 def response(text, stop='end_turn'):
-    return SimpleNamespace(model='claude-sonnet-5-5', stop_reason=stop, content=[
+    return SimpleNamespace(model='claude-opus-5-5', stop_reason=stop, content=[
         SimpleNamespace(type='thinking'), SimpleNamespace(type='text', text=text)],
         usage=SimpleNamespace(input_tokens=1200, output_tokens=300, cache_read_input_tokens=None))
 
@@ -90,14 +91,14 @@ class ClaudeApiTests(unittest.TestCase):
     def test_call_sends_fixed_prompt_as_system_and_data_as_the_only_message(self):
         client = Client(response('{"notes": []}'))
         result = claude_api.call(REQUEST, client, SDK)
-        self.assertEqual(result, {'model': 'claude-sonnet-5-5', 'stop_reason': 'end_turn', 'type': 'result',
+        self.assertEqual(result, {'model': 'claude-opus-5-5', 'stop_reason': 'end_turn', 'type': 'result',
                                   'structured_output': {'notes': []},
                                   'usage': {'input_tokens': 1200, 'output_tokens': 300, 'cache_read_input_tokens': 0,
                                             'cache_creation_input_tokens': 0}})
         [sent] = client.calls
         # The fixed prompt carries a cache breakpoint; data without a cache prefix carries none.
         self.assertEqual((sent['model'], sent['system'], sent['messages']),
-                         ('claude-sonnet-5-5', [{'type': 'text', 'text': 'Fixed prompt', 'cache_control': {'type': 'ephemeral'}}],
+                         ('claude-opus-5-5', [{'type': 'text', 'text': 'Fixed prompt', 'cache_control': {'type': 'ephemeral'}}],
                           [{'role': 'user', 'content': [{'type': 'text', 'text': '{"private": "source"}'}]}]))
         self.assertEqual(sent['output_config']['effort'], 'high')
         self.assertEqual(sent['output_config']['format']['schema'], claude_api.api_schema(REQUEST['schema']))
@@ -132,6 +133,10 @@ class ClaudeApiTests(unittest.TestCase):
                 (AuthenticationError('private key text', 401), {'category': 'authentication', 'status': 401}),
                 (PermissionDeniedError('private', 403), {'category': 'authentication', 'status': 403}),
                 (BadRequestError('Your credit balance is too low; private', 400), {'category': 'billing', 'status': 400}),
+                (BadRequestError('You have reached your specified API usage limits. You will regain access on '
+                                 '2026-12-01 at 00:00 UTC. private', 400), {'category': 'billing', 'status': 400}),
+                (BadRequestError('You have reached your specified workspace API usage limits. private', 400),
+                 {'category': 'billing', 'status': 400}),
                 (BadRequestError('private schema text', 400), {'category': 'invalid request', 'status': 400}),
                 (APIStatusError('private billing_error', 402), {'category': 'billing', 'status': 402}),
                 (APIStatusError('private overloaded', 529), {'category': 'connection', 'status': 529}),
@@ -157,10 +162,12 @@ class ClaudeApiTests(unittest.TestCase):
         self.assertEqual(result['usage']['input_tokens'], 2400)
         first, second = client.calls
         self.assertEqual(len(first['messages']), 1)
-        # The first reply goes back unchanged, then a note naming only the path and the limit.
+        # The first reply goes back unchanged, then a note naming only the path, the limit and the length.
         self.assertIs(second['messages'][1]['content'], long_answer.content)
         self.assertEqual(second['messages'][2]['content'], 'That JSON breaks these limits: $.notes[0] must be at most '
-                         '1000 characters. Return the complete JSON again within them, changing nothing else.')
+                         '1000 characters but has 1001. Return the complete JSON again: rewrite only those fields to '
+                         'meet their limits, shortening any text that is too long to well below its limit, and keep '
+                         'every other field unchanged.')
         self.assertEqual(claude_api.violations(REQUEST['schema'], {'notes': ['a', 'b', 'c', '']}),
                          ['$.notes must have at most 3 items', '$.notes[3] must be at least 1 characters'])
         # A second answer that still breaks a limit is returned; the pipeline's validation rejects it.
@@ -185,7 +192,8 @@ class ClaudeApiTests(unittest.TestCase):
         schema = {'type': 'object', 'properties': {'new_case': {'anyOf': [case, {'type': 'null'}]},
                                                    'maximum': {'type': 'string', 'maxLength': 2}}}
         self.assertEqual(claude_api.violations(schema, {'new_case': {'input': 'long'}, 'maximum': 'abc'}),
-                         ['$.new_case.input must be at most 3 characters', '$.maximum must be at most 2 characters'])
+                         ['$.new_case.input must be at most 3 characters but has 4',
+                          '$.maximum must be at most 2 characters but has 3'])
         self.assertEqual(claude_api.violations(schema, {'new_case': None, 'maximum': 'ab'}), [])
         self.assertEqual(claude_api.api_schema(schema)['properties']['maximum'],
                          {'type': 'string', 'description': 'At most 2 characters.'})
@@ -264,7 +272,7 @@ class ApiBackendTests(unittest.TestCase):
     def test_api_backend_runs_the_role_model_and_logs_only_usage(self):
         answer = {'type': 'result', 'structured_output': {'status': 'supported', 'summary': 'ok'}, 'stop_reason': 'end_turn',
                   'usage': {'input_tokens': 900, 'output_tokens': 120}}
-        with patch.dict(claude_cli.ROLE_MODELS, {'verify': 'claude-sonnet-5-5'}), \
+        with patch.dict(claude_cli.ROLE_MODELS, {'verify': 'claude-opus-5-5'}), \
                 patch.object(capture, 'run_extractor', return_value=self.completed(answer)) as run, \
                 patch.object(capture, 'verify_cli') as verified, patch.object(capture.sys, 'stderr', io.StringIO()) as log:
             output = capture.model_response(self.config, self.state, 'Fixed prompt', '{"source": 1}', {'type': 'object'},
@@ -273,10 +281,10 @@ class ApiBackendTests(unittest.TestCase):
         verified.assert_not_called()
         sent = json.loads(run.call_args.kwargs['input'])
         self.assertEqual((sent['model'], sent['prompt'], sent['data'], sent['effort']),
-                         ('claude-sonnet-5-5', 'Fixed prompt', '{"source": 1}', claude_cli.EFFORT))
+                         ('claude-opus-5-5', 'Fixed prompt', '{"source": 1}', claude_cli.EFFORT))
         self.assertLess(sent['timeout'], capture.MODEL_TIMEOUT)
         self.assertNotIn('sk-ant-secret', json.dumps(run.call_args.kwargs['env']))
-        self.assertEqual(json.loads(log.getvalue()), {'event': 'model_call', 'role': 'verify', 'model': 'claude-sonnet-5-5',
+        self.assertEqual(json.loads(log.getvalue()), {'event': 'model_call', 'role': 'verify', 'model': 'claude-opus-5-5',
                                                       'usage': {'input_tokens': 900, 'output_tokens': 120}})
 
     def test_api_rate_limit_defers_to_the_announced_reset_and_connections_retry_once(self):
@@ -323,7 +331,8 @@ def cli_answer(output):
 
 
 class ApiFallbackTests(unittest.TestCase):
-    """An exhausted API balance or rejected key falls back to the CLI's subscription and stays there."""
+    """An exhausted API balance, a reached spend limit or a rejected key falls back to the CLI's subscription and
+    stays there."""
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -365,7 +374,7 @@ class ApiFallbackTests(unittest.TestCase):
         self.assertEqual((record['reason'], record['key']), ('billing', f'{stat.st_ino}-{stat.st_size}-{stat.st_mtime_ns}'))
         since = capture.timestamp(record['since'])
         self.assertLessEqual(abs((since - started).total_seconds()), 2)
-        self.assertEqual(capture.timestamp(record['retry_at']) - since, capture.API_RETRY)
+        self.assertEqual(capture.timestamp(record['retry_at']), capture.api_retry_at('billing', since))
         self.assertIn({'event': 'api_fallback', 'reason': 'billing', 'retry_at': record['retry_at']}, log)
         self.assertEqual(capture.model_backend(self.config, self.state), 'cli')
 
@@ -495,11 +504,45 @@ class ApiFallbackTests(unittest.TestCase):
         self.assertEqual(pinned('cli'), {'from': 'cli'})
         self.assertEqual(self.calls, ['api', 'cli'])
 
+    def test_billing_retries_at_the_next_midnight_on_the_second(self):
+        tokyo = timezone(capture.timedelta(hours=9))
+        at = datetime.fromisoformat
+        # The same cases as the Rust publisher's retry_at test.
+        for now, retry in (('2026-11-08T05:00:00+09:00', '2026-12-02T00:00:00+09:00'),
+                           ('2026-12-15T12:00:00+09:00', '2027-01-02T00:00:00+09:00'),
+                           ('2027-01-01T23:59:59+09:00', '2027-01-02T00:00:00+09:00'),
+                           ('2027-01-02T00:00:00+09:00', '2027-02-02T00:00:00+09:00'),
+                           ('2027-01-01T16:00:00+00:00', '2027-02-02T00:00:00+09:00')):
+            with self.subTest(now=now):
+                self.assertEqual(capture.api_retry_at('billing', at(now), tz=tokyo), at(retry))
+                self.assertEqual(capture.api_retry_at('billing', at(now), tz=tokyo).tzinfo, timezone.utc)
+        now = at('2026-11-08T05:00:00+09:00')
+        self.assertEqual(capture.api_retry_at('authentication', now, tz=tokyo), now + capture.API_RETRY)
+        # A repeat failure while the record still waits keeps the monthly reset.
+        pending = at('2026-12-02T00:00:00+09:00')
+        self.assertEqual(capture.api_retry_at('billing', now, pending, tz=tokyo), pending)
+        # A failure at the reset itself, before the balance is back, retries after a day.
+        reset = at('2026-12-02T00:00:05+09:00')
+        self.assertEqual(capture.api_retry_at('billing', reset, pending, tz=tokyo), reset + capture.API_RETRY)
+        # A midnight that a clock change skips resolves to the instant after the gap, as in the Rust publisher.
+        santiago = capture.api_retry_at('billing', at('2029-08-15T12:00:00+00:00'), tz=ZoneInfo('America/Santiago'))
+        self.assertEqual(santiago, at('2029-09-02T04:00:00+00:00'))
+        # Without a zone, the reset is midnight on the 2nd in the host's local time.
+        local = capture.api_retry_at('billing', now).astimezone()
+        self.assertEqual((local.day, local.hour, local.minute, local.second), (2, 0, 0, 0))
+        self.assertTrue(now < local <= now + capture.timedelta(days=32))
+
     def test_record_matches_the_rust_publisher_format(self):
         now = datetime(2026, 11, 6, 3, 4, 5, 678000, tzinfo=timezone.utc)
         record = capture.record_api_fallback(self.config, self.state, 'billing', now)
         self.assertEqual(json.loads(capture.api_fallback_path(self.state).read_text()), record)
-        self.assertEqual((record['since'], record['retry_at']), ('2026-11-06T03:04:05+00:00', '2026-11-07T03:04:05+00:00'))
+        self.assertEqual((record['since'], record['retry_at']),
+                         ('2026-11-06T03:04:05+00:00', capture.api_retry_at('billing', now).isoformat(timespec='seconds')))
+        self.assertRegex(record['retry_at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:00\+00:00$')
+        # A failure after the record's retry time, before the balance is back, keeps `since` and waits a day.
+        later = datetime(2026, 12, 3, 1, 2, 3, tzinfo=timezone.utc)
+        again = capture.record_api_fallback(self.config, self.state, 'billing', later)
+        self.assertEqual((again['since'], again['retry_at']), ('2026-11-06T03:04:05+00:00', '2026-12-04T01:02:03+00:00'))
         # The publisher writes the same shape; Python honors it.
         rust = dict(record, since='2026-11-06T03:04:05+00:00',
                     retry_at=(datetime.now(timezone.utc) + capture.timedelta(hours=1)).isoformat(timespec='seconds'))

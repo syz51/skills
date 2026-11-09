@@ -17,6 +17,104 @@ from zoneinfo import ZoneInfo
 import claude_cli
 
 TOKYO = ZoneInfo('Asia/Tokyo')
+# Seconds kept out of the investigation review's budget for the validation that follows it,
+# so a review that uses its whole budget still leaves time to validate and accept its commits.
+VALIDATION_RESERVE = 600
+
+
+# Why a sync left its workflow checkout where it was. The reasons are static, so no Git output reaches
+# status, warnings or alerts.
+CHECKOUT_REASONS = {
+    'ahead': 'holds commits that origin/main does not have yet',
+    'fetch_failed': 'could not fetch origin',
+    'busy': 'was in use by another Git synchronization',
+    'deferred': 'had no time left in the cycle',
+    'not_on_main': 'is not on main',
+    'dirty': 'has uncommitted changes to tracked files',
+    'diverged': 'and origin/main have both moved on',
+    'merge_failed': 'could not be fast-forwarded',
+    'failed': 'could not be inspected',
+}
+# States that need a person, since sync never overwrites local work; the monitor alerts on them.
+CHECKOUT_BLOCKED = frozenset({'not_on_main', 'dirty', 'diverged', 'merge_failed', 'failed'})
+# States that show the checkout is not blocked, so they end a checkout alert. An unpublished weekly
+# collection or review commit leaves the maintainer's checkout ahead until publication pushes it.
+CHECKOUT_CLEAR = frozenset({'updated', 'current', 'ahead'})
+# The least cycle time left for the update to start; less defers it to the next run.
+CHECKOUT_MIN_SECONDS = 60
+
+
+def update_checkout(repo, env, log=None, deadline=None):
+    """Fast-forward the workflow checkout to origin/main, so the next run uses merged workflow fixes.
+
+    Sync runs this last, under the cycle lock, so no run mixes old and new scripts. It also takes the
+    Git synchronization lock that sync.py holds. Untracked files are ignored, and ignored files are
+    never overwritten; another branch, tracked changes or local commits leave the checkout unchanged."""
+    env = dict(env, GIT_TERMINAL_PROMPT='0')
+    deadline = time.monotonic() + 3600 if deadline is None else deadline
+
+    def git(*args, timeout=30):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(['git', args[0]], 0)
+        # A new session, so a timeout also ends the transport helpers a fetch starts.
+        with subprocess.Popen(['git', '-C', str(repo), *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, env=env, start_new_session=True) as process:
+            try:
+                out, err = process.communicate(timeout=min(timeout, remaining))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                process.communicate()
+                raise
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, ['git', args[0]], out, err)
+        return out.decode(errors='replace').strip()
+
+    if deadline - time.monotonic() < CHECKOUT_MIN_SECONDS:
+        return {'state': 'deferred'}
+    try:
+        common = Path(git('rev-parse', '--git-common-dir'))
+        lock = (common if common.is_absolute() else repo / common).joinpath('skill-sync.lock').open('a')
+    except (OSError, subprocess.SubprocessError):
+        return {'state': 'failed'}
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {'state': 'busy'}
+        try:
+            before = git('rev-parse', 'HEAD')
+            if git('branch', '--show-current') != 'main':
+                return {'state': 'not_on_main', 'commit': before}
+            if git('status', '--porcelain', '--untracked-files=no'):
+                return {'state': 'dirty', 'commit': before}
+        except (OSError, subprocess.SubprocessError):
+            return {'state': 'failed'}
+        try:
+            # Remote output can contain credential-bearing URLs; it is captured and never relayed.
+            git('fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main', timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            return {'state': 'fetch_failed', 'commit': before}
+        try:
+            target = git('rev-parse', 'refs/remotes/origin/main^{commit}')
+            ahead = git('rev-list', '--count', target + '..HEAD') != '0'
+            behind = git('rev-list', '--count', 'HEAD..' + target) != '0'
+            if ahead:
+                return {'state': 'diverged' if behind else 'ahead', 'commit': before}
+            if not behind:
+                return {'state': 'current', 'commit': before}
+            git('merge', '--ff-only', '--no-overwrite-ignore', '--quiet', target, timeout=60)
+        except subprocess.CalledProcessError as error:
+            if log is not None and error.stderr:
+                # Local merge output names the paths in the way; it stays in the host's own log.
+                log.write('Workflow checkout fast-forward failed:\n' + error.stderr.decode(errors='replace'))
+            return {'state': 'merge_failed', 'commit': before}
+        except (OSError, subprocess.SubprocessError):
+            return {'state': 'merge_failed', 'commit': before}
+        return {'state': 'updated', 'from': before, 'commit': target}
 
 
 def latest_due(now):
@@ -286,7 +384,7 @@ def review_learning_cycle(config, state_root, due, log, env, timeout):
                    + '. Reassess its evidence; do not blindly cherry-pick or reset from it.\n')
     try:
         review(claude_cli.cli_path(config), work, folder, prompt, log, execution_env,
-               timeout=max(1, timeout - (time.monotonic() - began)), settings=settings)
+               timeout=max(1, timeout - VALIDATION_RESERVE - (time.monotonic() - began)), settings=settings)
         summary = investigations.validate_cycle(scoped, state_root, cycle)
         _, heads = investigations.inventory(work)
         outstanding = sorted((v for v in heads.values() if v['state'] in investigations.OPEN_STATES),
@@ -566,6 +664,16 @@ def execute(args, now=None):
                     errors.append('Weekly maintenance requires a clean main checkout' if
                                   isinstance(error, RuntimeError) and str(error) == 'Weekly maintenance requires a clean main checkout'
                                   else 'Maintenance cycle failed')
+            if args.command == 'sync':
+                # Last, so this run used one version of the scripts throughout; the next run uses the update.
+                # A failed run updates too, since a merged fix may be what it needs.
+                started = time.monotonic()
+                status['checkout'] = dict(update_checkout(repo, env, log, began + 5400),
+                                          seconds=round(time.monotonic() - started, 1))
+                checkout = status['checkout']['state']
+                log.write('Workflow checkout: ' + checkout + '\n')
+                if checkout in CHECKOUT_REASONS:
+                    warnings.append('Workflow checkout not updated: it ' + CHECKOUT_REASONS[checkout])
             if errors:
                 status['error'] = '; '.join(errors)
             if warnings:

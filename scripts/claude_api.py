@@ -22,6 +22,10 @@ SDK_VERSION = '1.17.0'
 # Dependencies of the pinned SDK resolve as of this date, so a later release cannot enter the key's process.
 RESOLVED_AS_OF = '2026-10-21T00:00:00Z'
 MAX_TOKENS = 16000
+# Lowercase phrases of the API's 400 refusals that are about money: an exhausted prepaid balance, or a reached
+# organization or workspace spend limit ("You have reached your specified [workspace] API usage limits").
+# src/message.rs keeps the same list.
+BILLING_TEXTS = ('credit balance', 'api usage limits')
 CATEGORIES = ('rate limit', 'authentication', 'billing', 'invalid request', 'timeout', 'connection', 'refusal',
               'output limit', 'invalid output')
 # Structured outputs reject these constraints, so they are restated in the field's description for the model;
@@ -70,10 +74,11 @@ def reset_time(headers, now):
 
 
 def violations(schema, value, path='$'):
-    """The stripped length and count limits a structured answer breaks, as static paths and limits."""
+    """The stripped length and count limits a structured answer breaks, as static paths and limits, with the
+    length of a string that is too long."""
     found = []
     if isinstance(value, str) and isinstance(schema.get('maxLength'), int) and len(value) > schema['maxLength']:
-        found.append(f"{path} must be at most {schema['maxLength']} characters")
+        found.append(f"{path} must be at most {schema['maxLength']} characters but has {len(value)}")
     if isinstance(value, str) and isinstance(schema.get('minLength'), int) and len(value) < schema['minLength']:
         found.append(f"{path} must be at least {schema['minLength']} characters")
     if isinstance(value, list):
@@ -113,7 +118,8 @@ def call(request, client, anthropic):
     """Return the result object for one request; `anthropic` is the SDK module, `client` its client.
 
     An answer that breaks a limit structured outputs cannot enforce gets one corrective follow-up naming only
-    the field paths and limits. The reply is sent back unchanged, so the conversation stays append-only.
+    the field paths and limits, and the length of a string that is too long. The reply is sent back unchanged, so
+    the conversation stays append-only.
     """
     end = time.monotonic() + request['timeout']
     # The fixed prompt is the same for every call of a role, so it is cached; a breakpoint costs nothing when the
@@ -133,8 +139,10 @@ def call(request, client, anthropic):
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as error:
             return {'type': 'error', 'category': 'authentication', 'status': error.status_code}
         except anthropic.BadRequestError as error:
-            # An exhausted credit balance is a billing problem, not a malformed request.
-            billing = 'credit balance' in str(error).lower()
+            # An exhausted credit balance or a reached Console spend limit is a billing problem, not a malformed
+            # request; both arrive as a 400.
+            message = str(error).lower()
+            billing = any(text in message for text in BILLING_TEXTS)
             return {'type': 'error', 'category': 'billing' if billing else 'invalid request', 'status': error.status_code}
         except anthropic.APITimeoutError:
             return {'type': 'error', 'category': 'timeout', 'status': None}
@@ -159,9 +167,12 @@ def call(request, client, anthropic):
         # A correction needs time of its own; otherwise the caller's validation decides.
         if not broken or end - time.monotonic() < 30:
             return {**result, 'type': 'result', 'structured_output': output}
+        # The named fields must change to fit, so the follow-up asks to rewrite them rather than to change nothing.
         messages += [{'role': 'assistant', 'content': response.content},
                      {'role': 'user', 'content': 'That JSON breaks these limits: ' + '; '.join(broken)
-                      + '. Return the complete JSON again within them, changing nothing else.'}]
+                      + '. Return the complete JSON again: rewrite only those fields to meet their limits, '
+                      'shortening any text that is too long to well below its limit, and keep every other '
+                      'field unchanged.'}]
     # A second answer that still breaks a limit fails the caller's validation as before.
     return {**result, 'type': 'result', 'structured_output': output}
 
