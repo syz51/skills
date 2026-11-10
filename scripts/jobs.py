@@ -20,6 +20,11 @@ TOKYO = ZoneInfo('Asia/Tokyo')
 # Seconds kept out of the investigation review's budget for the validation that follows it,
 # so a review that uses its whole budget still leaves time to validate and accept its commits.
 VALIDATION_RESERVE = 600
+# How long a sync waits for the cycle lock, and how often it tries. The daily public export holds it
+# for about ten minutes; a weekly run holds it far longer, and the sync then skips its hour. The poll
+# matches the exporter's 50 ms, so a sync waiting with it is not always second to take a released lock.
+SYNC_LOCK_WAIT = 900
+SYNC_LOCK_POLL = 0.05
 
 
 # Why a sync left its workflow checkout where it was. The reasons are static, so no Git output reaches
@@ -134,6 +139,52 @@ def save(path, data):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(data, indent=2) + '\n')
     os.replace(temporary, path)
+
+
+def save_status(path, status):
+    """Write a status file under its own lock, which a skipped sync takes to annotate it."""
+    with path.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        save(path, status)
+
+
+def try_lock(file):
+    try:
+        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def skip_sync(state_root, waited):
+    """Log a sync that gave up on the cycle lock and record it in sync-status.json.
+
+    The skip goes beside the last run's result, which stays as it was; a running status belongs to the sync
+    that holds the cycle lock and is left alone. A failure here is reported, not raised: main() would record
+    it as a failed sync over that result.
+    """
+    at = datetime.now(timezone.utc).isoformat()
+    line = 'Sync skipped at ' + at + ': cycle lock busy for ' + str(round(waited)) + ' seconds.'
+    path = state_root / 'sync-status.json'
+    try:
+        with path.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            status = json.loads(path.read_text())
+            if not isinstance(status, dict):
+                raise ValueError(path.name + ' does not hold a JSON object')
+            if status.get('phase') != 'running':
+                status['skipped'] = {'at': at, 'reason': 'cycle_lock_busy'}
+                save(path, status)
+    except (OSError, ValueError) as error:
+        line += ' Status not updated: ' + str(error)
+    print(line)
+    try:
+        with (state_root / 'sync.log').open('a') as log:
+            log.write(line + '\n')
+    except OSError as error:
+        print('Could not write sync.log: ' + str(error))
+        return 1
+    return 0
 
 
 def new_status(path, command, now):
@@ -526,10 +577,23 @@ def execute(args, now=None):
                           'next_due': (due + timedelta(days=7)).isoformat()}, indent=2))
         return 0
     with (state_root / 'cycle.lock').open('a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0
+        # Weekly checks again within the hour. A sync waits out short holders, such as the daily public
+        # export, so a skipped hour does not raise the monitor's stale alert; it logs a longer hold.
+        start = time.monotonic()
+        waiting = False
+        while not try_lock(lock):
+            if args.command != 'sync':
+                return 0
+            waited = time.monotonic() - start
+            if waited >= SYNC_LOCK_WAIT:
+                return skip_sync(state_root, waited)
+            if not waiting:
+                print('Another job holds the cycle lock; waiting up to ' + str(SYNC_LOCK_WAIT) + ' seconds.', flush=True)
+                waiting = True
+            time.sleep(SYNC_LOCK_POLL)
+        if waiting:
+            # The run starts now; its status must not count the wait against the monitor's budget.
+            now = datetime.now(timezone.utc)
         state = json.loads(state_path.read_text()) if state_path.exists() else {'setup_started_at': now.isoformat()}
         if args.command == 'weekly':
             save(state_path, state)
@@ -543,7 +607,7 @@ def execute(args, now=None):
                    '--host-id', config['host_id']]
         status_path = state_root / (args.command + '-status.json')
         status = new_status(status_path, args.command, now)
-        save(status_path, status)
+        save_status(status_path, status)
         began = time.monotonic()
         with (state_root / (args.command + '.log')).open('a') as log:
             def step(name):
@@ -681,7 +745,7 @@ def execute(args, now=None):
             status['finished_at'] = datetime.now(timezone.utc).isoformat()
             status['phase'] = 'finished'
             status['last_success_finished_at' if status['success'] else 'last_failure_finished_at'] = status['finished_at']
-            save(status_path, status)
+            save_status(status_path, status)
         return 0 if status['success'] else 1
 
 
@@ -705,7 +769,7 @@ def main():
                 status = new_status(path, args.command, now)
                 status.update(phase='finished', success=False, error=str(error),
                               finished_at=now.isoformat(), last_failure_finished_at=now.isoformat())
-                save(path, status)
+                save_status(path, status)
             except OSError:
                 pass
         return 1

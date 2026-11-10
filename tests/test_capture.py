@@ -98,6 +98,13 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual((result['eligible'], result['processed'], result['pending'], result['errors']), (1, 1, 0, 0))
         model.assert_called_once()
 
+    def test_cycle_stops_at_turn_cap_and_leaves_the_rest_pending(self):
+        self.rollout(self.transcript('turn1') + self.transcript('turn2') + self.transcript('turn3'))
+        with patch.object(capture, 'MAX_TURNS', 2), patch.object(capture, 'extract', return_value=[]) as model:
+            result = capture.capture(self.config, self.state)
+        self.assertEqual((result['eligible'], result['processed'], result['pending'], result['errors']), (3, 2, 1, 0))
+        self.assertEqual(model.call_count, 2)
+
     def test_archived_deferred_turn_retries_and_recovers(self):
         source = self.rollout()
         now = datetime(2026, 10, 10, 2, tzinfo=timezone.utc)

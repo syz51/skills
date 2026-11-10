@@ -36,7 +36,9 @@ MAX_RECORD_BYTES = 8_000_000
 INLINE_BASE64 = re.compile(rb'"(?:data:[\w.+-]+\\?/[\w.+-]+;base64,)?(?:[A-Za-z0-9+]|\\?/){4096,}={0,2}"')
 MAX_INPUT = 48000
 MAX_OUTPUT = 12000
-MAX_TURNS = 20
+# Board coordinator sessions add a turn for every wake, up to about 140 eligible turns in a busy hour, so one
+# hourly cycle must take more than that; CYCLE_TIMEOUT is the usual bound.
+MAX_TURNS = 200
 MODEL_TIMEOUT = 240
 CYCLE_TIMEOUT = 900
 # A Claude usage limit defers model calls to its reset, or to the next hourly cycle when no reset is

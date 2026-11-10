@@ -227,6 +227,7 @@ export default defineConfig({
 
 | Option | Type | Description |
 |--------|------|-------------|
+| `entry` | `string \| string[]` | Globs filtering which entries emit declarations; non-entry files never do (reviewed source: package `0.23.7` with `rolldown-plugin-dts` `^0.30.0`) |
 | `sourcemap` | `boolean` | Generate declaration source maps |
 | `compilerOptions` | `object` | Override TypeScript compiler options |
 | `tsc.vue` | `boolean` | Enable Vue type generation under `dts.tsc` (requires vue-tsc) |

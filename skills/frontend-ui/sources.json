@@ -919,9 +919,9 @@
       "local": "references/frameworks/nuxt",
       "path": "skills/nuxt",
       "repository": "https://github.com/antfu/skills.git",
-      "reviewedAt": "2026-10-26T00:09:33.021244+00:00",
-      "revision": "8886fe2d385d3644cbb47e46ae9cb1cf09307d3b",
-      "tree": "2c8e2b122a4b45edbdac04a334800c1d16da5c12"
+      "reviewedAt": "2026-11-09T17:14:52.297479+00:00",
+      "revision": "f63e9ec7bc85f67364b6596c2d29da87e83ce445",
+      "tree": "0a24776ba2d1b4e6c892e5cf8b8a313a837d9f89"
     },
     {
       "id": "nitro",
@@ -946,9 +946,9 @@
       "local": "references/frameworks/vite",
       "path": "skills/vite",
       "repository": "https://github.com/antfu/skills.git",
-      "reviewedAt": "2026-10-19T00:09:41.114920+00:00",
-      "revision": "feb0f3aba6566426f12230e7fc7a10d97c1293bb",
-      "tree": "9007774626884249324c5acce3537355a51e937d"
+      "reviewedAt": "2026-11-09T17:15:07.400476+00:00",
+      "revision": "f63e9ec7bc85f67364b6596c2d29da87e83ce445",
+      "tree": "f2d5f1becc102792babc2d4cc986ab2194c1d654"
     },
     {
       "id": "vitepress",
@@ -973,9 +973,9 @@
       "local": "references/frameworks/slidev",
       "path": "skills/slidev",
       "repository": "https://github.com/slidevjs/slidev.git",
-      "reviewedAt": "2026-10-19T00:10:34.283951+00:00",
-      "revision": "73053ab2b9653ed475960301b56e1ce4439d9c75",
-      "tree": "27df218b1e8ce7f639326a2e41048ae8c2c6418a"
+      "reviewedAt": "2026-11-09T17:13:58.021717+00:00",
+      "revision": "437f139ccd4c8482a193b217922e7800a5b3baec",
+      "tree": "02ea78e57bd4214a30bda5215e409ef6f7f25e45"
     },
     {
       "id": "turborepo",
@@ -991,9 +991,9 @@
       "local": "references/frameworks/tsdown",
       "path": "skills/tsdown",
       "repository": "https://github.com/rolldown/tsdown.git",
-      "reviewedAt": "2026-11-04T00:10:53.339246+00:00",
-      "revision": "915473256a2f43c941649850aa10712709782973",
-      "tree": "48a8348553d3559498b480d6f767b257af780f70"
+      "reviewedAt": "2026-11-09T17:13:24.348316+00:00",
+      "revision": "0ff51f003a49f909ecaefe457c27575a89e9b76e",
+      "tree": "7642ba169809ddc4ed8a4d7947827666fcdc1fb6"
     }
   ],
   "upstreamReviewNote": "Framework entries are snapshots of the upstream folder under `local`: SKILL.md is adapted as guide.md, and GENERATION.md, SYNC.md, README.md and LICENSE.md are not mirrored. Apply reference changes with `git apply --directory=skills/frontend-ui/<local> --exclude='*/SKILL.md' --exclude='*/GENERATION.md' --exclude='*/SYNC.md' --exclude='*/README.md' --exclude='*/LICENSE.md' --include='*.md' <patch>`, adding `--reject` when hunks conflict with `localEdits`; merge rejected hunks into their own files and SKILL.md changes into guide.md by hand, then delete any .rej or .orig files. Design entries (local \".\") were consolidated into SKILL.md and references/*.md; treat their changes as ideas to evaluate rather than files to copy.",

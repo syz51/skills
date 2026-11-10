@@ -40,6 +40,36 @@ class RepositoryContentTests(unittest.TestCase):
                 files = public_export.snapshot(config, tree)
         self.assertEqual(len(files), len(config['files']))
 
+    # Keyed to the private checkout, not to the workflow files, so a deleted workflow still fails here.
+    @unittest.skipUnless((ROOT / 'public/export.json').is_file(),
+                         'needs the private secret-scan workflows, which the public export leaves out')
+    def test_circleci_secret_scan_runs_the_actions_command(self):
+        """The CircleCI fallback mirrors the Actions "Scan history" job, whose status the merge guard matches by name."""
+        step = 'name: Scan all branches with pinned gitleaks'
+
+        def script(text, marker):
+            """The literal block after `marker`, the first one below the scan step."""
+            lines = text.splitlines()
+            named = next(i for i, line in enumerate(lines) if line.strip().removeprefix('- ') == step)
+            start = next(i for i in range(named, len(lines)) if lines[i].strip() == marker) + 1
+            indent = len(lines[start]) - len(lines[start].lstrip())
+            block = []
+            for line in lines[start:]:
+                if line.strip() and len(line) - len(line.lstrip()) < indent:
+                    break
+                block.append(line[indent:])
+            return '\n'.join(block).strip()
+        actions = (ROOT / '.github/workflows/secrets.yml').read_text()
+        circleci = (ROOT / '.circleci/config.yml').read_text()
+        self.assertIn('\n  gitleaks:\n    name: Scan history\n', actions)
+        self.assertIn('\n      - scan-history:\n          name: Scan history\n', circleci)
+        # Both clones need every branch for --log-opts="--all".
+        self.assertIn('fetch-depth: 0\n', actions)
+        self.assertIn('- checkout:\n          method: full\n', circleci)
+        command = script(actions, 'run: |')
+        self.assertIn('/gitleaks" git ', command)
+        self.assertEqual(script(circleci, 'command: |'), command)
+
     def test_skill_references_resolve_inside_each_skill(self):
         sync.validate(ROOT)
 

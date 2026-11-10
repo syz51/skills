@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -800,15 +801,91 @@ if (root / 'fail-frontend').exists(): sys.exit(1)
         self.assertNotIn('review', status['stages'])
         self.assertNotIn('completed_due', self.state_data())
 
-    def test_busy_cycle_skips_without_work(self):
+    def busy_sync(self, wait=0.2):
+        """Run a sync while the test holds the cycle lock; returns its printed output."""
         self.args.command = 'sync'
+        output = io.StringIO()
+        with (self.state / 'cycle.lock').open('a') as lock, contextlib.redirect_stdout(output), \
+                patch.object(jobs, 'SYNC_LOCK_WAIT', wait):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            began = time.monotonic()
+            self.assertEqual(jobs.execute(self.args), 0)
+            self.assertGreaterEqual(time.monotonic() - began, wait)
+        return output.getvalue()
+
+    def test_busy_cycle_skips_without_work(self):
         path = self.state / 'sync-status.json'
         path.write_text('previous status')
-        with (self.state / 'cycle.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.assertEqual(jobs.execute(self.args), 0)
+        output = self.busy_sync()
         self.assertFalse(self.trace.exists())
         self.assertEqual(path.read_text(), 'previous status')
+        log = (self.state / 'sync.log').read_text()
+        self.assertRegex(log, r'^Sync skipped at \S+: cycle lock busy for \d+ seconds\. Status not updated: .+\n$')
+        self.assertIn('waiting up to 0.2 seconds', output)
+        self.assertIn(log, output)
+
+    def test_busy_cycle_records_the_skip_beside_the_last_result(self):
+        path = self.state / 'sync-status.json'
+        previous = {'command': 'sync', 'started_at': '2026-11-10T00:20:27+00:00', 'phase': 'finished', 'success': True,
+                    'finished_at': '2026-11-10T00:22:40+00:00', 'last_success_finished_at': '2026-11-09T23:20:00+00:00'}
+        path.write_text(json.dumps(previous))
+        self.busy_sync()
+        status = json.loads(path.read_text())
+        self.assertEqual(status.pop('skipped')['reason'], 'cycle_lock_busy')
+        self.assertEqual(status, previous)
+        self.assertRegex((self.state / 'sync.log').read_text(), r'^Sync skipped at \S+: cycle lock busy for \d+ seconds\.\n$')
+        # A running status belongs to the sync holding the lock.
+        running = dict(previous, phase='running', success=None)
+        path.write_text(json.dumps(running))
+        self.busy_sync()
+        self.assertEqual(json.loads(path.read_text()), running)
+
+    def test_skip_waits_for_a_status_write_in_progress(self):
+        path = self.state / 'sync-status.json'
+        path.write_text(json.dumps({'phase': 'finished', 'success': True}))
+        status_lock = (self.state / 'sync-status.lock').open('a')
+        self.addCleanup(status_lock.close)
+        fcntl.flock(status_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def write_running():
+            # The cycle lock holder starts its run; the skip must read this status, not the one before it.
+            path.write_text(json.dumps({'phase': 'running', 'success': None}))
+            fcntl.flock(status_lock, fcntl.LOCK_UN)
+        release = threading.Timer(0.3, write_running)
+        release.start()
+        self.addCleanup(release.cancel)
+        self.busy_sync(wait=0.05)
+        self.assertEqual(json.loads(path.read_text()), {'phase': 'running', 'success': None})
+
+    def test_busy_cycle_skips_weekly_at_once(self):
+        with (self.state / 'cycle.lock').open('a') as lock, patch.object(jobs, 'SYNC_LOCK_WAIT', 60):
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            began = time.monotonic()
+            self.assertEqual(jobs.execute(self.args), 0)
+            self.assertLess(time.monotonic() - began, 5)
+        self.assertFalse(self.trace.exists())
+        self.assertFalse((self.state / 'weekly.log').exists())
+
+    def test_sync_waits_for_a_briefly_held_cycle_lock(self):
+        self.args.command = 'sync'
+        lock = (self.state / 'cycle.lock').open('a')
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        release = threading.Timer(0.3, lambda: fcntl.flock(lock, fcntl.LOCK_UN))
+        release.start()
+        self.addCleanup(release.cancel)
+        held_from = datetime.now(timezone.utc)
+        began = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(jobs, 'SYNC_LOCK_WAIT', 10), \
+                patch.object(jobs, 'update_checkout', return_value={'state': 'current'}):
+            self.assertEqual(jobs.execute(self.args), 0)
+        self.assertGreaterEqual(time.monotonic() - began, 0.3)
+        self.assertEqual(self.trace.read_text().splitlines()[0], 'capture')
+        status = json.loads((self.state / 'sync-status.json').read_text())
+        self.assertTrue(status['success'])
+        # The run's start is after the wait, so the monitor's budget does not count it.
+        self.assertGreaterEqual(datetime.fromisoformat(status['started_at']), held_from + jobs.timedelta(seconds=0.3))
+        self.assertNotIn('skipped', (self.state / 'sync.log').read_text())
 
     def test_timeout_kills_descendant_when_group_leader_exits_on_term(self):
         leader_file = self.root / 'leader.pid'

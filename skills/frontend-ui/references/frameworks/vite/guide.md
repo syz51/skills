@@ -2,7 +2,7 @@ Shared frontend/UI policy: [frontend-ui](../../../SKILL.md) and [framework bound
 
 # Vite
 
-> Reference snapshot: Vite 8.3.1, generated at 2026-09-25. Vite 8 uses the Rolldown bundler and Oxc transformer. Apply version-specific changes only within the requested project scope.
+> Reference snapshot: Vite 8.3.5, generated at 2026-11-05. Vite 8 uses the Rolldown bundler and Oxc transformer. Apply version-specific changes only within the requested project scope.
 
 Vite is a next-generation frontend build tool with fast dev server (native ESM + HMR) and optimized production builds.
 
