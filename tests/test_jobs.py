@@ -756,6 +756,26 @@ if (root / 'fail-frontend').exists(): sys.exit(1)
         status = json.loads(raw)
         self.assertEqual(status['error'], 'Feedback capture failed; Source feedback verification failed; Feedback upload failed')
 
+    def test_timed_out_stage_records_its_cause_without_details(self):
+        self.args.command = 'sync'
+        with patch.object(jobs, 'run', side_effect=jobs.CommandTimedOut('Command timed out: private-token-in-path')):
+            self.assertEqual(jobs.execute(self.args), 1)
+        raw = (self.state / 'sync-status.json').read_text()
+        self.assertNotIn('private-token-in-path', raw)
+        stages = outcomes(json.loads(raw)['stages'])
+        self.assertEqual(stages['capture'], {'success': False, 'error': 'Feedback capture failed', 'cause': 'timeout'})
+        self.assertEqual(stages['upload'], {'success': False, 'error': 'Feedback upload failed', 'cause': 'timeout'})
+        log = (self.state / 'sync.log').read_text()
+        self.assertRegex(log, r'(?m)^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00 Stage capture ended in timeout after [0-9.]+ seconds\.$')
+        self.assertNotIn('private-token-in-path', log)
+
+    def test_failed_stage_logs_a_dated_failure(self):
+        self.args.command = 'sync'
+        (self.root / 'fail-capture').touch()
+        self.assertEqual(jobs.execute(self.args), 1)
+        self.assertRegex((self.state / 'sync.log').read_text(),
+                         r'(?m)^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00 Stage capture ended in failure after [0-9.]+ seconds\.$')
+
     def test_weekly_capture_failure_preserves_due_and_buffer(self):
         self.initialize()
         (self.root / 'fail-capture').touch()

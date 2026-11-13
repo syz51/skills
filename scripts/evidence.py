@@ -583,4 +583,5 @@ def main():
 
 
 if __name__ == '__main__':
+    capture.dump_stacks_on_term()
     raise SystemExit(main())

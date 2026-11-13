@@ -5,6 +5,8 @@ import json
 import io
 import os
 from pathlib import Path
+import signal
+import subprocess
 import tempfile
 import sys
 import time
@@ -1667,6 +1669,21 @@ class ClaudeCliCaptureTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'exposed tools'):
                 capture.model_response(self.config, self.state, 'private prompt', '{}', capture.SCHEMA)
         self.assertEqual([call['argv'][0] for call in self.calls()], ['--help', '--print'])
+
+
+class StallDiagnosticsTests(unittest.TestCase):
+    def test_sigterm_dumps_the_stalled_stack_then_terminates(self):
+        scripts = Path(__file__).parents[1] / 'scripts'
+        child = ('import sys, time; sys.path.insert(0, sys.argv[1]); import capture; capture.dump_stacks_on_term()\n'
+                 'def stalled_scan():\n    print("ready", flush=True); time.sleep(60)\n'
+                 'stalled_scan()\n')
+        with subprocess.Popen([sys.executable, '-c', child, str(scripts)], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as process:
+            self.assertEqual(process.stdout.readline(), 'ready\n')
+            process.send_signal(signal.SIGTERM)
+            _, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, -signal.SIGTERM)
+        self.assertIn('stalled_scan', stderr)
 
 
 if __name__ == '__main__':

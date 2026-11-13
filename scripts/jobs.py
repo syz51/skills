@@ -203,6 +203,10 @@ def new_status(path, command, now):
     return status
 
 
+class CommandTimedOut(RuntimeError):
+    """A command ran past its timeout, and its process group was killed."""
+
+
 def run(command, log, env, stdin=None, timeout=5400, cwd=None, stdout=None):
     with subprocess.Popen(command, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                           stdout=log if stdout is None else stdout, stderr=log, env=env, cwd=cwd,
@@ -226,7 +230,7 @@ def run(command, log, env, stdin=None, timeout=5400, cwd=None, stdout=None):
             except (ProcessLookupError, PermissionError):
                 pass
             process.wait()
-            raise RuntimeError('Command timed out: ' + Path(command[0]).name)
+            raise CommandTimedOut('Command timed out: ' + Path(command[0]).name)
         if process.returncode:
             raise RuntimeError('Command failed: ' + Path(command[0]).name)
 
@@ -626,9 +630,16 @@ def execute(args, now=None):
                     if action() is False:
                         message = backlog_message
                         raise RuntimeError(message)
-                except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
-                    status['stages'][name] = {'success': False, 'error': message,
-                                              'seconds': round(time.monotonic() - started, 1)}
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
+                    seconds = round(time.monotonic() - started, 1)
+                    status['stages'][name] = {'success': False, 'error': message, 'seconds': seconds}
+                    # A fixed word, never the exception's text, which can hold private paths: it tells a stage
+                    # that stalled until its timeout apart from one that failed. The log line dates the failure.
+                    cause = 'timeout' if isinstance(error, CommandTimedOut) else 'failure'
+                    if cause == 'timeout':
+                        status['stages'][name]['cause'] = cause
+                    print(datetime.now(timezone.utc).isoformat(timespec='seconds') + ' Stage ' + name + ' ended in '
+                          + cause + ' after ' + str(seconds) + ' seconds.', file=log, flush=True)
                     errors.append(message)
                     if not defer:
                         raise RuntimeError(message) from None

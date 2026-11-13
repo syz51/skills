@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import argparse
 import prompt_runtime
 import ast
+import faulthandler
 import fcntl
 import hashlib
 import json
@@ -1665,6 +1666,12 @@ def cli_version(config):
     return version if re.fullmatch(r'[0-9][0-9A-Za-z._+-]* \(Claude Code\)', version) else 'unknown'
 
 
+def dump_stacks_on_term():
+    """On the job runner's SIGTERM at a stage timeout, write every thread's stack to stderr, which is the job log,
+    then terminate as before. A stage that stalled then shows where it waited."""
+    faulthandler.register(signal.SIGTERM, all_threads=True, chain=True)
+
+
 def failure_reason(error):
     """Only static labels leave the private extractor boundary."""
     if isinstance(error, ExtractorFailure):
@@ -1909,4 +1916,5 @@ def main():
 
 
 if __name__ == '__main__':
+    dump_stacks_on_term()
     raise SystemExit(main())
