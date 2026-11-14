@@ -576,6 +576,35 @@ elif not (root / 'missing-report').exists():
         self.assertEqual([command[2] for command in sync_commands], ['upload', 'deploy'])
         self.assertTrue(all('--validator' not in command for command in sync_commands))
 
+    def test_sync_steps_get_the_install_root_and_feedback_folder_that_capture_uses(self):
+        self.args.command = 'sync'
+        config = json.loads(self.config.read_text())
+        config['install_root'] = str(self.root / 'install')
+        self.config.write_text(json.dumps(config))
+        commands = []
+        def recorded(command, *args, **kwargs):
+            commands.append(command)
+            stage = Path(command[1]).stem
+            if stage in ('capture', 'evidence'):
+                (self.state / (stage + '-status.json')).write_text(json.dumps({
+                    'finished_at': datetime.now(timezone.utc).isoformat(),
+                    'success': True, 'counts': {'pending': 0}}))
+        with patch.object(jobs, 'run', side_effect=recorded):
+            self.assertEqual(jobs.execute(self.args), 0)
+        sync_commands = [command for command in commands if command[1].endswith('/sync.py')]
+        self.assertEqual(len(sync_commands), 2)
+        for command in sync_commands:
+            self.assertEqual(command[command.index('--install-root') + 1], str(self.root / 'install'))
+            self.assertEqual(command[command.index('--feedback-dir') + 1], str(self.root / 'install/skill-feedback'))
+
+    def test_a_configuration_under_the_old_install_root_stops_the_job(self):
+        old = self.root / 'codex-skills'
+        old.mkdir()
+        (old / 'config.json').write_text(self.config.read_text())
+        self.args.config = old / 'config.json'
+        with self.assertRaisesRegex(ValueError, 'still uses the codex-skills install root'):
+            jobs.execute(self.args)
+
     def test_dirty_or_non_main_checkout_blocks_review_and_publication(self):
         self.initialize()
         tuesday = datetime(2026, 10, 13, 3, tzinfo=timezone.utc)

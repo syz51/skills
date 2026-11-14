@@ -15,6 +15,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 import claude_cli
+import prompt_runtime
 
 TOKYO = ZoneInfo('Asia/Tokyo')
 # Seconds kept out of the investigation review's budget for the validation that follows it,
@@ -554,6 +555,9 @@ def execute(args, now=None):
     now = now or datetime.now(timezone.utc)
     config_path = args.config.expanduser().resolve()
     state_root = config_path.parent
+    if state_root.name == 'codex-skills':
+        # The checkout fast-forwards itself, so the renamed code can reach a host before its state moves.
+        raise ValueError('This host still uses the codex-skills install root; move it as the README describes')
     config = json.loads(config_path.read_text())
     # Configurations written for the Codex runtime may still carry codex_path and validator_path; they are unused.
     required = ('repo_path', 'host_id', 'python_path', 'uv_path', 'role')
@@ -608,7 +612,8 @@ def execute(args, now=None):
                                       + ['/usr/bin', '/bin', '/usr/sbin', '/sbin', env.get('PATH', '')])
         # sync.py validates skills with the repository's own scripts/validate_skill.py.
         command = [config['python_path'], str(repo / 'scripts/sync.py'), '--repo', str(repo),
-                   '--host-id', config['host_id']]
+                   '--host-id', config['host_id'], '--install-root', str(prompt_runtime.install_root(config)),
+                   '--feedback-dir', str(prompt_runtime.feedback_root(config))]
         status_path = state_root / (args.command + '-status.json')
         status = new_status(status_path, args.command, now)
         save_status(status_path, status)
@@ -763,7 +768,7 @@ def execute(args, now=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('sync', 'weekly'))
-    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/codex-skills/config.json')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/agent-skills/config.json')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--run-now', action='store_true')
     args = parser.parse_args()

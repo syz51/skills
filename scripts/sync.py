@@ -827,13 +827,15 @@ def deploy(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('upload', 'collect', 'publish', 'deploy', 'verify'))
-    parser.add_argument('--repo', type=Path, default=Path.home() / '.local/share/codex-skills/repository')
+    parser.add_argument('--repo', type=Path, default=Path.home() / '.local/share/agent-skills/repository')
     parser.add_argument('--host-id', choices=HOSTS, default='client-host')
-    parser.add_argument('--feedback-dir', type=Path, default=codex_home() / 'skill-feedback')
-    parser.add_argument('--install-root', type=Path, default=Path.home() / '.local/share/codex-skills')
+    parser.add_argument('--feedback-dir', type=Path, default=None)
+    parser.add_argument('--install-root', type=Path, default=Path.home() / '.local/share/agent-skills')
     parser.add_argument('--validator', type=Path, default=VALIDATOR)
     parser.add_argument('--bootstrap', action='store_true', help='Allow initial skill population without prior reviews')
     args = parser.parse_args()
+    if args.feedback_dir is None:
+        args.feedback_dir = args.install_root / 'skill-feedback'
     try:
         if args.command == 'verify':
             # A read-only check of one tree, which deploy runs while it holds the lock below.

@@ -1,5 +1,5 @@
+use agent_skills::{Result, config::Config, daily, export, message};
 use clap::{Args, Parser, Subcommand};
-use codex_skills::{Result, config::Config, daily, export, message};
 use std::{path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
@@ -47,7 +47,7 @@ fn execute(command: Command) -> Result<serde_json::Value> {
 }
 
 fn main() -> ExitCode {
-    if codex_skills::cancellation::install().is_err() {
+    if agent_skills::cancellation::install().is_err() {
         eprintln!("Could not initialize publication cancellation.");
         return ExitCode::FAILURE;
     }

@@ -84,13 +84,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked --target "$TARGET"
-          binary="target/$TARGET/release/codex-skills"
+          binary="target/$TARGET/release/agent-skills"
           "$binary" --help
-          test "$("$binary" --version)" = "codex-skills ${RELEASE_TAG#v}"
+          test "$("$binary" --version)" = "agent-skills ${RELEASE_TAG#v}"
           mkdir -p "$RUNNER_TEMP/package" "$RUNNER_TEMP/dist"
           python3 scripts/bundle_rust_licenses.py --target "$TARGET" --output "$RUNNER_TEMP/package/THIRD_PARTY_LICENSES.txt"
           cp "$binary" LICENSE README.md "$RUNNER_TEMP/package/"
-          tar -czf "$RUNNER_TEMP/dist/codex-skills-$RELEASE_TAG-$TARGET.tar.gz" -C "$RUNNER_TEMP/package" codex-skills LICENSE README.md THIRD_PARTY_LICENSES.txt
+          tar -czf "$RUNNER_TEMP/dist/agent-skills-$RELEASE_TAG-$TARGET.tar.gz" -C "$RUNNER_TEMP/package" agent-skills LICENSE README.md THIRD_PARTY_LICENSES.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.target }}
@@ -129,5 +129,5 @@ jobs:
             echo 'Release already exists; refusing to replace published assets.' >&2
             exit 1
           fi
-          gh release create "$RELEASE_TAG" --verify-tag --title "codex-skills $RELEASE_TAG" \
+          gh release create "$RELEASE_TAG" --verify-tag --title "agent-skills $RELEASE_TAG" \
             --notes-file "$GITHUB_WORKSPACE/CHANGELOG.md" *.tar.gz SHA256SUMS

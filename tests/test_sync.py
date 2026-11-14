@@ -769,15 +769,13 @@ raise SystemExit(subprocess.run([python, *args[script:]]).returncode)
         with self.assertRaisesRegex(sync.SyncError, 'symlink'):
             sync.publish(self.args)
 
-    def test_upload_default_follows_migrated_codex_home(self):
+    def test_upload_default_reads_feedback_under_the_install_root(self):
         home = self.root / 'home'
-        canonical = home / '.config/codex'
-        notes = canonical / 'skill-feedback/frontend-ui/notes'
+        notes = home / '.local/share/agent-skills/skill-feedback/frontend-ui/notes'
         notes.mkdir(parents=True)
-        (home / '.codex').symlink_to(canonical)
         note = notes / 'migration.md'
         note.write_text('Migration feedback')
-        with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'CODEX_HOME': ''}), patch.object(sys, 'argv', ['sync.py', 'upload', '--repo', str(self.repo)]):
+        with patch.object(Path, 'home', return_value=home),patch.object(sys, 'argv', ['sync.py', 'upload', '--repo', str(self.repo)]):
             self.assertEqual(sync.main(), 0)
         sync.git(self.repo, 'fetch', 'origin')
         self.assertEqual(sync.git(self.repo, 'show', 'origin/inbox/client-host:feedback/frontend-ui/notes/client-host/migration.md'), note.read_bytes())
@@ -1308,22 +1306,22 @@ class PruneTests(unittest.TestCase):
         bin_dir = self.root / 'public-export/bin'
         names = self.builds(bin_dir, 8, 'x')
         for name in names:
-            (bin_dir / name / 'codex-skills').write_text('binary')
-        (bin_dir / 'current').symlink_to(names[0] + '/codex-skills')
+            (bin_dir / name / 'agent-skills').write_text('binary')
+        (bin_dir / 'current').symlink_to(names[0] + '/agent-skills')
         agents = self.home / 'Library/LaunchAgents'
         agents.mkdir(parents=True)
         def job(path, binary):
             with path.open('wb') as stream:
-                sync.plistlib.dump({'Label': 'fixture', 'ProgramArguments': [str(bin_dir / binary / 'codex-skills'), 'daily']}, stream)
+                sync.plistlib.dump({'Label': 'fixture', 'ProgramArguments': [str(bin_dir / binary / 'agent-skills'), 'daily']}, stream)
         job(agents / 'org.example.skills.public-export.plist', names[1])
         job(self.root / 'public-export/job.plist.bak-20261105T000000Z', names[2])
         job(agents / 'com.example.other.plist', names[4])
         # A build named inside a shell command or reached through a PATH list is in use too.
         with (agents / 'org.example.skills.shell.plist').open('wb') as stream:
             sync.plistlib.dump({'Label': 'shell', 'ProgramArguments': ['/bin/sh', '-c', 'exec "$HOME/x/bin/' + names[5]
-                                + '/codex-skills" daily'], 'EnvironmentVariables': {
+                                + '/agent-skills" daily'], 'EnvironmentVariables': {
                                 'PATH': str(bin_dir / names[6]) + ':/usr/bin', 'MODE': '~nosuchuser-x'}}, stream)
-        self.open = [bin_dir / names[3] / 'codex-skills']
+        self.open = [bin_dir / names[3] / 'agent-skills']
         with patch.object(sync, 'KEEP_EXPORT_BUILDS', 1), patch('sys.stdout'):
             sync.prune(self.root, None, self.home)
         self.assertEqual(self.remaining(bin_dir), sorted([*(names[i] for i in (0, 1, 2, 3, 5, 6, 7)), 'current']))

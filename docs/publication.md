@@ -7,11 +7,11 @@ This repository receives a curated export from the author's private maintenance 
 The local publication job checks daily at 10:17 Asia/Tokyo, with a catch-up check at login. It publishes only when the selected content changes. A manual publication uses the same checks:
 
 ```sh
-codex-skills plan --config ~/.local/share/codex-skills/public-export/config.json
-codex-skills publish --config ~/.local/share/codex-skills/public-export/config.json
+agent-skills plan --config ~/.local/share/agent-skills/public-export/config.json
+agent-skills publish --config ~/.local/share/agent-skills/public-export/config.json
 ```
 
-The Rust executable also provides `codex-skills daily --config <path>` for the local scheduler. The installed executable is `~/.local/bin/codex-skills`. The former Python exporter and daily wrapper are retained as regression references; production publication uses the Rust binary.
+The Rust executable also provides `agent-skills daily --config <path>` for the local scheduler. The installed executable is `~/.local/bin/agent-skills`. The former Python exporter and daily wrapper are retained as regression references; production publication uses the Rust binary.
 
 The configuration and publication state stay private. The `plan` command reports selected paths without publishing. Installing the skills does not install this job. The local computer must be awake and online for publication; a missed or failed run is retried by the routine rather than treated as a successful publication.
 

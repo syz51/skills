@@ -188,7 +188,7 @@ def check(root, skill, entry, directory, patches):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument('--cache', type=Path, default=Path.home() / '.cache/codex-skills/upstream')
+    parser.add_argument('--cache', type=Path, default=Path.home() / '.cache/agent-skills/upstream')
     parser.add_argument('--skill', action='append', choices=SKILLS)
     args = parser.parse_args()
     root = args.repo.resolve()

@@ -87,7 +87,7 @@ def scan(path, content):
     # rejected. A lowercase users segment is also a common web route, so its case variants
     # count only where a home path would start: not after a path segment, and followed by a
     # name rather than a route parameter.
-    private = re.compile('/Us' + 'ers/|(?i:' + '|'.join(map(re.escape, ('roy' + '-mac', 'sunmacbook' + '-air', 'syz51/' + 'codex-skills')))
+    private = re.compile('/Us' + 'ers/|(?i:' + '|'.join(map(re.escape, ('roy' + '-mac', 'sunmacbook' + '-air', 'syz51/' + 'agent-skills', 'syz51/' + 'codex-skills', 'com.' + 'syz51.')))
                          + r'|(?<![\w.-])/us' + r'ers/[a-z_])')
     rules = {'private identifier': bool(private.search(text)),
              'credential': bool(re.search(r'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|sk-(?:proj-)?[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16})\b', text))}
@@ -308,18 +308,18 @@ def execute(config, publish=False):
 
 def rust_cli(arguments):
     """Preserve the old command entrypoint while Rust owns live publication."""
-    selected = os.environ.get('CODEX_SKILLS_BIN')
+    selected = os.environ.get('AGENT_SKILLS_BIN')
     if selected is None:
-        managed = Path.home() / '.local/share/codex-skills/public-export/bin/current'
-        selected = str(managed) if managed.exists() or managed.is_symlink() else '~/.local/bin/codex-skills'
+        managed = Path.home() / '.local/share/agent-skills/public-export/bin/current'
+        selected = str(managed) if managed.exists() or managed.is_symlink() else '~/.local/bin/agent-skills'
     binary = Path(selected).expanduser()
     if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
-        print('Install codex-skills or set CODEX_SKILLS_BIN to its absolute executable path.', file=sys.stderr)
+        print('Install agent-skills or set AGENT_SKILLS_BIN to its absolute executable path.', file=sys.stderr)
         return 1
     try:
         os.execv(str(binary), [str(binary), *arguments])
     except OSError:
-        print('Could not start the configured codex-skills executable.', file=sys.stderr)
+        print('Could not start the configured agent-skills executable.', file=sys.stderr)
         return 1
 
 

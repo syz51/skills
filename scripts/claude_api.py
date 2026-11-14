@@ -198,7 +198,7 @@ def environment(config):
     passed = ('HOME', 'TMPDIR', 'XDG_CACHE_HOME', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE')
     env = {name: value for name, value in os.environ.items()
            if name.startswith('UV_') or name in passed or name.lower() in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')}
-    return {**env, 'PATH': os.pathsep.join(['/usr/bin', '/bin']), 'CODEX_SKILLS_API_KEY_FILE': str(key.resolve())}
+    return {**env, 'PATH': os.pathsep.join(['/usr/bin', '/bin']), 'AGENT_SKILLS_API_KEY_FILE': str(key.resolve())}
 
 
 def request(model, effort, prompt, data, schema, timeout, cache_prefix=None):
@@ -230,7 +230,7 @@ def outcome(stdout):
 
 def main():
     request = json.loads(sys.stdin.read())
-    key = Path(os.environ['CODEX_SKILLS_API_KEY_FILE']).read_text().strip()
+    key = Path(os.environ['AGENT_SKILLS_API_KEY_FILE']).read_text().strip()
     import anthropic  # Provided by `uv run --with`; the pipeline's own modules never import it.
     client = anthropic.Anthropic(api_key=key, timeout=request['timeout'], max_retries=0)
     result = call(request, client, anthropic)

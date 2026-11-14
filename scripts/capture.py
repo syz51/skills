@@ -1716,8 +1716,8 @@ def capture(config, state_root, *, now=None, retry_now=False):
     state_root.mkdir(parents=True, exist_ok=True)
     sessions = Path(config.get('sessions_root', codex_home() / 'sessions'))
     archived = Path(config.get('archived_sessions_root', codex_home() / 'archived_sessions'))
-    feedback = Path(config.get('feedback_dir', codex_home() / 'skill-feedback'))
-    install = Path(config.get('install_root', Path.home() / '.local/share/codex-skills'))
+    feedback = prompt_runtime.feedback_root(config)
+    install = prompt_runtime.install_root(config)
     safe_path(feedback)
     state_path = state_root / 'capture-state.json'
     safe_path(state_path)
@@ -1866,7 +1866,7 @@ def capture(config, state_root, *, now=None, retry_now=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/codex-skills/config.json')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/agent-skills/config.json')
     parser.add_argument('--retry-now', action='store_true',
                         help='Retry deferred evidence now, retaining all validation and cycle limits')
     args = parser.parse_args()

@@ -1,5 +1,5 @@
+use agent_skills::{config::Config, daily};
 use chrono::{TimeZone, Utc};
-use codex_skills::{config::Config, daily};
 use serde_json::{Value, json};
 use std::{cell::Cell, fs};
 use tempfile::TempDir;
@@ -95,7 +95,7 @@ fn overlapping_job_never_calls_publication() {
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
     let original = b"active status";
     fs::write(root.path().join("daily-status.json"), original).unwrap();
-    let _lock = codex_skills::export::acquire(&[root.path().join("job.lock")]).unwrap();
+    let _lock = agent_skills::export::acquire(&[root.path().join("job.lock")]).unwrap();
     assert!(daily::run_with(&config, now, || panic!("overlapping job must not run")).is_err());
     assert!(!root.path().join("daily-state.json").exists());
     assert_eq!(
@@ -109,7 +109,7 @@ fn export_lock_defers_real_publication_without_completing_deadline() {
     let root = TempDir::new().unwrap();
     let mut config = config(&root);
     config.cycle_lock = Some(root.path().join("cycle.lock"));
-    let lock = codex_skills::export::acquire(&[root.path().join("export.lock")]).unwrap();
+    let lock = agent_skills::export::acquire(&[root.path().join("export.lock")]).unwrap();
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
     // No Git repository or candidate exists: reaching source inspection would fail.
     let result = daily::run(&config, now, &|_, _| panic!("must not generate while busy")).unwrap();
@@ -143,16 +143,16 @@ fn lock_io_failure_is_not_a_deferral() {
     let mut config = config(&root);
     // A missing parent yields a real open error rather than lock contention.
     config.cycle_lock = Some(root.path().join("missing/cycle.lock"));
-    let error = match codex_skills::export::acquire(&[config.cycle_lock.clone().unwrap()]) {
+    let error = match agent_skills::export::acquire(&[config.cycle_lock.clone().unwrap()]) {
         Err(error) => error,
         Ok(_) => panic!("missing parent must fail"),
     };
-    assert!(!error.is::<codex_skills::export::LockBusy>());
+    assert!(!error.is::<agent_skills::export::LockBusy>());
     assert!(error.is::<std::io::Error>());
     let now = Utc.with_ymd_and_hms(2026, 10, 28, 2, 0, 0).unwrap();
     assert!(daily::run(&config, now, &|_, _| panic!("must not generate")).is_err());
     // Failure to acquire cycle.lock releases the already acquired export.lock.
-    assert!(codex_skills::export::acquire(&[root.path().join("export.lock")]).is_ok());
+    assert!(agent_skills::export::acquire(&[root.path().join("export.lock")]).is_ok());
     let status: Value =
         serde_json::from_slice(&fs::read(root.path().join("daily-status.json")).unwrap()).unwrap();
     assert_eq!(status["success"], false);
@@ -163,7 +163,7 @@ fn lock_io_failure_is_not_a_deferral() {
 #[test]
 fn cli_help_and_invalid_config_have_expected_exit_codes() {
     use std::process::Command;
-    let binary = env!("CARGO_BIN_EXE_codex-skills");
+    let binary = env!("CARGO_BIN_EXE_agent-skills");
     let help = Command::new(binary).arg("--help").output().unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("daily"));
@@ -192,17 +192,17 @@ fn termination_cancels_a_running_git_process() {
     let fake = root.path().join("git");
     fs::write(
         &fake,
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$CODEX_SKILLS_TEST_PID\"\nexec sleep 30\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$AGENT_SKILLS_TEST_PID\"\nexec sleep 30\n",
     )
     .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let pidfile = root.path().join("child.pid");
     let path = root.path().join("config.json");
     fs::write(&path, serde_json::to_vec(&json!({"schema_version":1,"source_repo":root.path(),"state_dir":root.path().join("state"),"target_url":"https://github.com/example/skills.git","author_name":"Test","author_email":"test@example.invalid","files":[{"source":"skills/test.md","target":"skills/test.md"}]})).unwrap()).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codex-skills"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-skills"))
         .args(["plan", "--config"])
         .arg(path)
-        .env("CODEX_SKILLS_TEST_PID", &pidfile)
+        .env("AGENT_SKILLS_TEST_PID", &pidfile)
         .env(
             "PATH",
             format!(

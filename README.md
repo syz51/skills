@@ -31,12 +31,12 @@ Installing skill files does not configure background jobs or start transcript ca
 
 ## Install the publisher
 
-The `codex-skills` Rust binary publishes the curated public export and runs its daily deadline check. Download a native archive and `SHA256SUMS` from [Releases](https://github.com/syz51/skills/releases), verify the archive against the checksum file, and install the executable into a directory on `PATH`, such as `~/.local/bin`.
+The `agent-skills` Rust binary publishes the curated public export and runs its daily deadline check. Download a native archive and `SHA256SUMS` from [Releases](https://github.com/syz51/skills/releases), verify the archive against the checksum file, and install the executable into a directory on `PATH`, such as `~/.local/bin`.
 
-With Rust installed, build the tagged source instead:
+The binary was named `codex-skills` up to release v0.1.0, and that release's archives keep the old name. With Rust installed, build the current source instead:
 
 ```sh
-cargo install --git https://github.com/syz51/skills --tag v0.1.0 --locked codex-skills
+cargo install --git https://github.com/syz51/skills --locked agent-skills
 ```
 
 The publisher requires Git, Python for candidate validation, an authenticated Claude Code CLI for message generation, and a deliberately configured private export inventory. Installing it does not configure jobs or enable transcript capture. See [Public publication](docs/publication.md) for its boundaries.

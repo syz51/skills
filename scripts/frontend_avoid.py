@@ -23,7 +23,7 @@ import capture
 import evidence
 
 BRANCH_PREFIX = 'skill-feedback/frontend-avoid-'
-NOTES_MARKER = '<!-- codex-skills rejected-default notes -->'
+NOTES_MARKER = '<!-- codex-skills rejected-default notes -->'  # kept: earlier proposal pull requests carry it
 SECTION = '## Patterns'
 TITLE = 'Add rejected frontend defaults from skill feedback'
 COMMIT = 'Add rejected frontend defaults from skill feedback'
@@ -33,7 +33,7 @@ MAX_PATTERN = 200
 # which rules out addresses, paths, domains, file names and mentions.
 PLAIN = re.compile(r"[\w ,'&()+%\-，、（）·]+")
 # Host identifiers and the private repository; propose() adds the local login, host and repository owner.
-PRIVATE = ('client-host', 'maintainer-host', 'codex-skills', 'skill-feedback')
+PRIVATE = ('client-host', 'maintainer-host', 'agent-skills', 'codex-skills', 'skill-feedback')
 
 
 def normalize(pattern):
@@ -258,7 +258,7 @@ def propose(config, state_root, now=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n', 1)[0])
-    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/codex-skills/config.json')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/agent-skills/config.json')
     args = parser.parse_args()
     config_path = args.config.expanduser().resolve()
     status = {'started_at': datetime.now(timezone.utc).isoformat(), 'success': False}

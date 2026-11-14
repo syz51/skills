@@ -237,7 +237,10 @@ pub fn scan(path: &str, data: &[u8]) -> Result<()> {
     let hosts = [
         ["roy", "-mac"].concat(),
         ["sunmacbook", "-air"].concat(),
+        ["syz51/", "agent-skills"].concat(),
         ["syz51/", "codex-skills"].concat(),
+        // A launchd label that the host's replacements did not cover.
+        ["com.", "syz51."].concat(),
     ]
     .map(|marker| regex::escape(&marker))
     .join("|");
@@ -1327,18 +1330,20 @@ mod tests {
     }
     /// Private identifiers and credentials the scanner rejects, built so this file passes it.
     /// Case variants are included: replacements match exactly, so these stay unreplaced.
-    fn private_samples() -> [String; 12] {
+    fn private_samples() -> [String; 14] {
         [
             ["-----BEGIN ENCRYPTED ", "PRIVATE KEY-----"].concat(),
             ["-----BEGIN PGP ", "PRIVATE KEY BLOCK-----"].concat(),
             ["/Us", "ers/alice/x"].concat(),
             ["roy", "-mac"].concat(),
-            ["syz51/", "codex-skills"].concat(),
+            ["syz51/", "agent-skills"].concat(),
             format!("ghp_{}", "a".repeat(36)),
             ["-----BEGIN ", "PRIVATE KEY-----"].concat(),
             ["Roy", "-Mac"].concat(),
             ["SunMacBook", "-Air"].concat(),
-            ["SYZ51/", "Codex-Skills"].concat(),
+            ["SYZ51/", "Agent-Skills"].concat(),
+            ["syz51/", "codex-skills"].concat(),
+            ["com.", "syz51.agent-skills.sync"].concat(),
             ["/us", "ers/alice"].concat(),
             ["(/US", "ERS/alice/x)"].concat(),
         ]

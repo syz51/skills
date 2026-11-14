@@ -291,7 +291,7 @@ pub fn generate_message(
                 }) {
                     match fs::remove_file(path) {
                         Err(e) if e.kind() != io::ErrorKind::NotFound => eprintln!(
-                            "codex-skills: could not clear the Claude API fallback record: {e}"
+                            "agent-skills: could not clear the Claude API fallback record: {e}"
                         ),
                         _ => {}
                     }
@@ -305,10 +305,10 @@ pub fn generate_message(
                     "authentication"
                 };
                 eprintln!(
-                    "codex-skills: Claude API unavailable ({reason}); generating with the Claude Code login"
+                    "agent-skills: Claude API unavailable ({reason}); generating with the Claude Code login"
                 );
                 if let Err(e) = record_fallback(options, reason, Utc::now()) {
-                    eprintln!("codex-skills: could not record the Claude API fallback: {e}");
+                    eprintln!("agent-skills: could not record the Claude API fallback: {e}");
                 }
                 generate(&Auth::Login)?
             }

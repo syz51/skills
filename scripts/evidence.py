@@ -360,7 +360,7 @@ def count_outcome(counts, reason, previous):
 def verify(config, state_root, note_sha=None, recheck=False, now=None):
     deadline = time.monotonic() + CYCLE_TIMEOUT
     now = now or datetime.now(timezone.utc)
-    feedback = Path(config.get('feedback_dir', codex_home() / 'skill-feedback'))
+    feedback = prompt_runtime.feedback_root(config)
     safe_path(feedback)
     targets = []
     recovery_notes = {}
@@ -549,7 +549,7 @@ def verify(config, state_root, note_sha=None, recheck=False, now=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/codex-skills/config.json')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.local/share/agent-skills/config.json')
     parser.add_argument('--note-sha', help='Verify a particular local note, including a case requested by the reviewer')
     parser.add_argument('--recheck', action='store_true', help='Append a new assessment of --note-sha, preserving prior receipts')
     parser.add_argument('--report', type=Path, help='Read-only effective assessments for a local or collected feedback directory')

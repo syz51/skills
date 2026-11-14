@@ -1,4 +1,4 @@
-use codex_skills::message::{Effort, GenerationError, Options, generate_message};
+use agent_skills::message::{Effort, GenerationError, Options, generate_message};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -83,7 +83,7 @@ fn result(structured: Value) -> String {
 fn subject() -> Value {
     json!({"subject": "Reject oversized public diffs early", "body": ""})
 }
-fn generate(output: &str, code: i32) -> Result<codex_skills::CommitMessage, GenerationError> {
+fn generate(output: &str, code: i32) -> Result<agent_skills::CommitMessage, GenerationError> {
     let root = TempDir::new().unwrap();
     generate_message(
         DIFF,
@@ -462,7 +462,7 @@ fn live_generator_returns_a_validated_message() {
     let before = claude_projects();
     let message = generate_message(DIFF, None, &options(cli, Duration::from_secs(180))).unwrap();
     assert!(!message.subject.is_empty());
-    codex_skills::message::validate(&message).unwrap();
+    agent_skills::message::validate(&message).unwrap();
 
     // The generator runs in a fresh directory under the temporary root; no session there may persist.
     let temp = std::env::temp_dir();
@@ -770,9 +770,9 @@ fn live_generator_bills_a_configured_api_key() {
         eprintln!("skipped: set RUN_CLAUDE_LIVE=1 to call the real Claude Code CLI");
         return;
     }
-    let Some(key) = std::env::var_os("CODEX_SKILLS_LIVE_API_KEY_FILE").map(PathBuf::from) else {
+    let Some(key) = std::env::var_os("AGENT_SKILLS_LIVE_API_KEY_FILE").map(PathBuf::from) else {
         eprintln!(
-            "skipped: set CODEX_SKILLS_LIVE_API_KEY_FILE to a Claude API key file to check API billing"
+            "skipped: set AGENT_SKILLS_LIVE_API_KEY_FILE to a Claude API key file to check API billing"
         );
         return;
     };
@@ -797,7 +797,7 @@ fn live_generator_bills_a_configured_api_key() {
         ..options(wrapper, Duration::from_secs(180))
     };
     let message = generate_message(DIFF, None, &options).unwrap();
-    codex_skills::message::validate(&message).unwrap();
+    agent_skills::message::validate(&message).unwrap();
     let events: Vec<Value> = fs::read_to_string(&stream)
         .unwrap()
         .lines()

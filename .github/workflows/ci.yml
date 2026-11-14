@@ -110,5 +110,5 @@ jobs:
       - name: Verify standalone binary
         run: |
           cargo build --release --locked
-          target/release/codex-skills --help
-          test "$(target/release/codex-skills --version)" = "codex-skills 0.1.0"
+          target/release/agent-skills --help
+          test "$(target/release/agent-skills --version)" = "agent-skills 0.1.0"

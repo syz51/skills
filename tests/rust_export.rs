@@ -1,4 +1,4 @@
-use codex_skills::{
+use agent_skills::{
     CommitMessage,
     config::{Config, relative},
     export::{Files, Imported, git, imported, manifest, prepare, scan, snapshot, validate_message},

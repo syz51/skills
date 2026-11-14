@@ -49,7 +49,7 @@ def request(command):
         words = words[3:]
     if len(words) not in (3, 5) or Path(words[0]).name not in ('python', 'python3'):
         raise ValueError('Not a guidance reader command')
-    if words[1] != 'scripts/read_guidance.py' and not words[1].endswith('/codex-skills/repository/scripts/read_guidance.py'):
+    if words[1] != 'scripts/read_guidance.py' and not words[1].endswith(('/agent-skills/repository/scripts/read_guidance.py', '/codex-skills/repository/scripts/read_guidance.py')):
         raise ValueError('Not the shared guidance reader')
     start = 0
     if len(words) == 5:

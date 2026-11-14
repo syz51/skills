@@ -4,6 +4,15 @@ import json
 from pathlib import Path
 import stat
 
+
+def install_root(config):
+    return Path(config.get('install_root', Path.home() / '.local/share/agent-skills')).expanduser()
+
+
+def feedback_root(config):
+    """The folder of notes, verifications and reviews. Capture, evidence and sync must use the same one."""
+    return Path(config.get('feedback_dir', install_root(config) / 'skill-feedback')).expanduser()
+
 SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATHS = {role: f'prompts/{role}.md' for role in ('extract', 'verify', 'correct', 'maintain')}
@@ -125,7 +134,7 @@ def load(role, config=None, root=None):
     source = (Path(root) if root is not None else Path(config.get('repo_path', DEFAULT_ROOT))).expanduser()
     selected = source
     if root is None:
-        current = Path(config.get('install_root', Path.home() / '.local/share/codex-skills')).expanduser() / 'current'
+        current = install_root(config) / 'current'
         manifest = current / 'manifest.json'
         if current.exists() or current.is_symlink():
             if manifest.is_symlink() or not manifest.is_file():

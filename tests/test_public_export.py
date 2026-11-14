@@ -15,7 +15,7 @@ class NativeEntrypointTests(unittest.TestCase):
     def test_managed_binary_and_explicit_override_precede_legacy_install(self):
         with tempfile.TemporaryDirectory() as folder:
             home = Path(folder)
-            managed = home / '.local/share/codex-skills/public-export/bin/current'
+            managed = home / '.local/share/agent-skills/public-export/bin/current'
             managed.parent.mkdir(parents=True)
             version = managed.with_name('versioned')
             version.write_text('fixture')
@@ -24,7 +24,7 @@ class NativeEntrypointTests(unittest.TestCase):
             override = home / 'override'
             override.write_text('fixture')
             override.chmod(0o755)
-            for environment, expected in (({}, managed), ({'CODEX_SKILLS_BIN': str(override)}, override)):
+            for environment, expected in (({}, managed), ({'AGENT_SKILLS_BIN': str(override)}, override)):
                 with self.subTest(environment=environment), patch.object(export.Path, 'home', return_value=home), \
                         patch.dict(export.os.environ, environment, clear=True), \
                         patch.object(export.os, 'execv', side_effect=RuntimeError('exec selected')) as execute:
@@ -122,7 +122,7 @@ class ExportTests(unittest.TestCase):
     def test_private_scanner(self):
         for text in ('/Us' + 'ers/alice/file', 'roy' + '-mac', 'sunmacbook' + '-air', 'ghp_' + 'a' * 36, '-----BEGIN ' + 'PRIVATE KEY-----',
                      # Markers match in any case; replacements do not, so these stay unreplaced.
-                     '-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----', '-----BEGIN ENCRYPTED ' + 'PRIVATE KEY-----', '-----BEGIN DSA ' + 'PRIVATE KEY-----', 'Roy' + '-Mac', 'SunMacBook' + '-Air', 'SYZ51/' + 'Codex-Skills', '/us' + 'ers/alice', '(/US' + 'ERS/alice/x)'):
+                     '-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----', '-----BEGIN ENCRYPTED ' + 'PRIVATE KEY-----', '-----BEGIN DSA ' + 'PRIVATE KEY-----', 'Roy' + '-Mac', 'SunMacBook' + '-Air', 'SYZ51/' + 'Agent-Skills', '/us' + 'ers/alice', '(/US' + 'ERS/alice/x)'):
             with self.subTest(text_length=len(text)), self.assertRaises(export.ExportError):
                 export.scan('test.md', text.encode())
         export.scan('test.md', b'Use FAKE_TOKEN in examples.')
@@ -147,7 +147,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(json.loads(files['sources.json']), {'items': [{'license': 'MIT'}]})
         # A local path, a hostname no replacement covers, the private repository slug,
         # a token or a private key fails the snapshot.
-        for private in ('/Us' + 'ers/alice/file', 'roy' + '-mac', 'syz51/' + 'codex-skills', 'ghp_' + 'a' * 36,
+        for private in ('/Us' + 'ers/alice/file', 'roy' + '-mac', 'syz51/' + 'agent-skills', 'syz51/' + 'codex-skills', 'com.' + 'syz51.agent-skills.sync', 'ghp_' + 'a' * 36,
                         '-----BEGIN ' + 'PRIVATE KEY-----'):
             (self.source / 'skills/guide.md').write_text('See ' + private + '\n')
             self.commit()

@@ -15,7 +15,7 @@ import tempfile
 
 from jobs import CHECKOUT_BLOCKED, CHECKOUT_CLEAR, CHECKOUT_REASONS, latest_due, save
 
-ROOT = Path.home() / '.local/share/codex-skills'
+ROOT = Path.home() / '.local/share/agent-skills'
 SYNC_STALE_AFTER = timedelta(minutes=90)
 # An exhausted balance recharges monthly; a billing fallback older than a month outlasted its reset.
 BILLING_FALLBACK_GRACE = timedelta(days=32)
@@ -334,7 +334,7 @@ def open_job_log(config, root, host, job):
 
 def notify(config, title, message, report, route=None, failure=False):
     notifier = config.get('notifier_path', str(Path.home() / 'Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier'))
-    group = 'codex-skills-health' + ('-' + '-'.join(route) if route else '')
+    group = 'agent-skills-health' + ('-' + '-'.join(route) if route else '')
     command = [notifier, '-title', title, '-message', message,
                '-group', group, '-sound', 'default']
     if failure:
@@ -407,7 +407,7 @@ def inspect(config, root, previous, now):
     lines.insert(-1, 'Remote reconnection grace until: ' + state['remote_grace_until'])
     lines += list(state['problems'].values()) or ['No detected problems.']
     lines += ['', 'Local logs: ' + str(root),
-              'Remote logs: maintainer-host:~/.local/share/codex-skills/',
+              'Remote logs: maintainer-host:~/.local/share/agent-skills/',
               'Details: ' + str(root / 'health.json'),
               'If this report is older than 75 minutes while this Mac is awake, the monitor itself needs checking.']
     (root / 'health.txt').write_text('\n'.join(lines) + '\n')

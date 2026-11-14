@@ -543,7 +543,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_maintenance_turn_with_an_absolute_pipeline_path_is_excluded(self):
         # Turn messages stay raw for local filters; redacted, this path would be a placeholder.
-        path = '/Us' + 'ers/alice/.local/share/codex-skills/repository/scripts/capture.py'
+        path = '/Us' + 'ers/alice/.local/share/agent-skills/repository/scripts/capture.py'
         self.rollout(self.transcript(user='Fix ' + path + ' retries'))
         self.assertEqual(self.scan(), [])
         self.assertEqual(len(capture.completed_turns(self.sessions.glob('*.jsonl'), capture.timestamp(capture.SINCE),
@@ -674,7 +674,7 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(path.name.startswith('2026-10-13T010203-0000'))
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    def test_capture_uses_migrated_home_without_allowing_feedback_symlinks(self):
+    def test_capture_uses_migrated_home_and_install_root_feedback_without_symlinks(self):
         home = self.root / 'home'
         canonical = home / '.config/codex'
         (canonical / 'sessions').mkdir(parents=True)
@@ -683,10 +683,10 @@ class CaptureTests(unittest.TestCase):
         config = {key: value for key, value in self.config.items() if key not in ('sessions_root', 'feedback_dir')}
         with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'CODEX_HOME': '', 'CLAUDE_CONFIG_DIR': ''}), patch.object(capture, 'extract', return_value=[self.lesson]):
             self.assertEqual(capture.capture(config, self.state)['notes'], 1)
-            self.assertEqual(len(list((canonical / 'skill-feedback').rglob('*.md'))), 1)
+            self.assertEqual(len(list((self.root / 'install/skill-feedback').rglob('*.md'))), 1)
             external = self.root / 'external'
             external.mkdir()
-            folder = canonical / 'skill-feedback/content-research-writer'
+            folder = self.root / 'install/skill-feedback/content-research-writer'
             folder.mkdir()
             (folder / 'notes').symlink_to(external)
             with self.assertRaisesRegex(ValueError, 'symlink'):

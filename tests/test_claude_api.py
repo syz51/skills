@@ -233,7 +233,7 @@ class ClaudeApiTests(unittest.TestCase):
             uv.write_text('')
             with patch.dict(claude_api.os.environ, {'ANTHROPIC_API_KEY': 'parent', 'UV_CACHE_DIR': '/cache', 'HOME': folder}):
                 env = claude_api.environment({'api_key_file': str(key)})
-            self.assertEqual(env['CODEX_SKILLS_API_KEY_FILE'], str(key.resolve()))
+            self.assertEqual(env['AGENT_SKILLS_API_KEY_FILE'], str(key.resolve()))
             self.assertEqual((env['UV_CACHE_DIR'], env['HOME']), ('/cache', folder))
             self.assertNotIn('ANTHROPIC_API_KEY', env)
             self.assertNotIn('sk-ant-secret', json.dumps(env))
@@ -251,7 +251,7 @@ class ClaudeApiTests(unittest.TestCase):
             with patch.dict(claude_api.os.environ, {'HTTPS_PROXY': 'http://proxy:8080', 'SSL_CERT_FILE': '/ca.pem'}):
                 env = claude_api.environment({'api_key_file': str(key)})
             self.assertEqual((env['HTTPS_PROXY'], env['SSL_CERT_FILE']), ('http://proxy:8080', '/ca.pem'))
-            self.assertTrue(Path(env['CODEX_SKILLS_API_KEY_FILE']).is_absolute())
+            self.assertTrue(Path(env['AGENT_SKILLS_API_KEY_FILE']).is_absolute())
             with self.assertRaisesRegex(ValueError, 'uv'):
                 claude_api.command({'uv_path': str(Path(folder) / 'absent')})
 

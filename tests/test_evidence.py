@@ -419,19 +419,19 @@ class EvidenceTests(unittest.TestCase):
     def test_source_checks_follow_the_migrated_codex_home(self):
         home = self.root / 'home'
         canonical = home / '.config/codex'
-        notes = canonical / 'skill-feedback/frontend-ui/notes'
+        notes = home / '.local/share/agent-skills/skill-feedback/frontend-ui/notes'
         notes.mkdir(parents=True)
         (home / '.codex').symlink_to(canonical)
         (notes / self.path.name).write_bytes(self.path.read_bytes())
         for name in ('sessions', 'archived_sessions'):
-            (canonical / name).mkdir()
+            (canonical / name).mkdir(parents=True)
             (canonical / name / 'source.jsonl').write_text('{}\n')
         config = {'host_id': 'client-host'}
         result = {'status': 'supported', 'summary': 'Attribution is supported; execution remains unverified.'}
         with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'CODEX_HOME': '', 'CLAUDE_CONFIG_DIR': ''}), patch.object(evidence, 'completed_turns', return_value=[self.turn]) as scanner, patch.object(evidence, 'model_response', return_value=result):
             self.assertEqual(evidence.verify(config, self.root)['checked'], 1)
         self.assertEqual(set(scanner.call_args.args[0]), {canonical.resolve() / name / 'source.jsonl' for name in ('sessions', 'archived_sessions')})
-        self.assertEqual(len(list((canonical / 'skill-feedback/frontend-ui/verifications').glob('*.json'))), 1)
+        self.assertEqual(len(list((home / '.local/share/agent-skills/skill-feedback/frontend-ui/verifications').glob('*.json'))), 1)
 
     def test_unsupported_feedback_is_preserved_and_invalid_summary_is_rejected(self):
         with patch.object(evidence, 'completed_turns', return_value=[self.turn]), patch.object(evidence, 'model_response',
