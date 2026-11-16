@@ -184,7 +184,7 @@ Top-level `vite` options are shared. Use `$client` and `$server` to target a sin
 export default defineNuxtConfig({
   vite: {
     $client: {
-      build: { rollupOptions: { output: { manualChunks: { analytics: ['analytics-package'] } } } },
+      build: { sourcemap: true },
     },
     $server: {
       build: { sourcemap: 'inline' },
@@ -223,6 +223,7 @@ export default defineNuxtConfig({
     // Default options for core composables/components
     defaults: {
       nuxtLink: { prefetch: true, prefetchOn: { visibility: true } },
+      // Opt back into nested reactivity; Nuxt 4 uses shallow data by default
       useAsyncData: { deep: true },
       useState: { resetOnClear: true },
     },

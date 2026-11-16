@@ -919,9 +919,9 @@
       "local": "references/frameworks/nuxt",
       "path": "skills/nuxt",
       "repository": "https://github.com/antfu/skills.git",
-      "reviewedAt": "2026-11-09T17:14:52.297479+00:00",
-      "revision": "f63e9ec7bc85f67364b6596c2d29da87e83ce445",
-      "tree": "0a24776ba2d1b4e6c892e5cf8b8a313a837d9f89"
+      "reviewedAt": "2026-11-16T00:10:33.000000+00:00",
+      "revision": "d524ed287eef22757297827ce42e3cad88abd20c",
+      "tree": "0a40aa880ede10a3247e432eceff383eb64cad5c"
     },
     {
       "id": "nitro",
