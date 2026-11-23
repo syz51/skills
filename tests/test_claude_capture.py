@@ -340,7 +340,8 @@ class ClaudeCaptureTests(unittest.TestCase):
         (sessions / 'rollout.jsonl').write_text(''.join(json.dumps(record) + '\n' for record in codex))
         config = {'sessions_root': str(sessions), 'archived_sessions_root': str(self.root / 'archive'),
                   'feedback_dir': str(feedback), 'install_root': str(self.root / 'install'),
-                  'claude_path': '/bin/false', 'claude_projects_root': str(self.projects)}
+                  'claude_path': '/bin/false', 'claude_projects_root': str(self.projects),
+                  'antigravity_providers_root': str(self.root / 'antigravity')}
         def lessons(config, state_root, turn, existing, *, deadline=None, wait_for_rate_limit=True):
             return [{'skill': turn['verified_skills'][0], **{field: 'Verified useful check' for field in capture.FIELDS}}]
         with patch.object(capture, 'extract', side_effect=lessons) as extract:
@@ -367,7 +368,8 @@ class ClaudeCaptureTests(unittest.TestCase):
         os.utime(source, (settled, settled))
         config = {'host_id': 'client-host', 'feedback_dir': str(feedback), 'sessions_root': str(self.root / 'sessions'),
                   'install_root': str(self.root / 'install'),
-                  'archived_sessions_root': str(self.root / 'archive'), 'claude_projects_root': str(self.projects)}
+                  'archived_sessions_root': str(self.root / 'archive'), 'claude_projects_root': str(self.projects),
+                  'antigravity_providers_root': str(self.root / 'antigravity')}
         assessment = {'status': 'supported', 'summary': 'Attribution is supported; outcomes remain reported.'}
         with patch.object(evidence, 'model_response', return_value=assessment):
             counts = evidence.verify(config, self.root)

@@ -42,7 +42,8 @@ class EvidenceTests(unittest.TestCase):
         self.config = {'feedback_dir': str(self.feedback), 'sessions_root': str(self.root / 'sessions'),
                        'install_root': str(self.root / 'install'),
                        'archived_sessions_root': str(self.root / 'archive'), 'host_id': 'client-host',
-                       'claude_projects_root': str(self.root / 'claude-projects')}
+                       'claude_projects_root': str(self.root / 'claude-projects'),
+                       'antigravity_providers_root': str(self.root / 'antigravity')}
         self.path = self.feedback / 'frontend-ui/notes/note.md'
         self.path.parent.mkdir(parents=True)
         self.path.write_text('# Status correction\n- Thread: session1\n- Turn: turn1\n- Capture evidence: ' + 'a' * 64 +
@@ -1054,10 +1055,11 @@ class BackoffTests(unittest.TestCase):
 
     def test_nothing_due_reads_no_transcript(self):
         with patch.object(evidence, 'completed_turns', return_value=[]) as codex_scan, \
-                patch.object(evidence, 'claude_turns', return_value=[]) as claude_scan:
+                patch.object(evidence, 'claude_turns', return_value=[]) as claude_scan, \
+                patch.object(evidence, 'antigravity_turns', return_value=[]) as agy_scan:
             evidence.verify(self.config, self.root, now=hours(0))
             evidence.verify(self.config, self.root, now=hours(0.4))
-        self.assertEqual((codex_scan.call_count, claude_scan.call_count), (1, 1))
+        self.assertEqual((codex_scan.call_count, claude_scan.call_count, agy_scan.call_count), (1, 1, 1))
 
 
 class IncrementalSourceScanTests(unittest.TestCase):
@@ -1092,7 +1094,8 @@ class IncrementalSourceScanTests(unittest.TestCase):
     def test_a_note_without_its_turn_reads_every_transcript_in_full(self):
         self.path.write_text('# Historical review\n- Observation: Observed: a report was made.\n')
         with patch.object(evidence, 'completed_turns', return_value=[]) as scanner, \
-                patch.object(evidence, 'claude_turns', return_value=[]):
+                patch.object(evidence, 'claude_turns', return_value=[]), \
+                patch.object(evidence, 'antigravity_turns', return_value=[]):
             evidence.verify(self.config, self.root, now=hours(0))
         self.assertIsNone(scanner.call_args.kwargs['cache'])
         self.assertTrue(scanner.call_args.kwargs['source_notes'])

@@ -856,18 +856,18 @@
       "local": ".",
       "path": "skills/antfu-design",
       "repository": "https://github.com/antfu/design.git",
-      "reviewedAt": "2026-10-29T09:12:57.149627+00:00",
-      "revision": "2df66b0830c6e51f0087caeee6ee3de401172199",
-      "tree": "4634b2b2d87e4beb87149e926435cfce1499786d"
+      "reviewedAt": "2026-11-23T00:16:00+00:00",
+      "revision": "0d63ec35198a15d1fd801433e6b799af24fec300",
+      "tree": "8425012f4f5486721f2a39cc3e7de399a24ae8c6"
     },
     {
       "id": "web-design-guidelines",
       "local": ".",
       "path": "skills/web-design-guidelines",
       "repository": "https://github.com/vercel-labs/agent-skills.git",
-      "reviewedAt": "2026-10-08T08:49:15.254464+00:00",
-      "revision": "ba46938889d4e58635362fb8f618e1178ac3ec46",
-      "tree": "3116f3e62dbd02b44a598b1aa690d2a8938e8f89"
+      "reviewedAt": "2026-11-23T00:18:00+00:00",
+      "revision": "5a37a6329fbad3666c3207392a6a7c0110e92efb",
+      "tree": "8ff770c9b25b9fdb5a97503fc98d86b723813031"
     },
     {
       "id": "vue",

@@ -24,7 +24,8 @@ class RecoveryTests(unittest.TestCase):
         self.config = {'host_id': 'client-host', 'sessions_root': str(self.sessions),
             'install_root': str(self.root / 'install'),
             'archived_sessions_root': str(self.root / 'archive'), 'feedback_dir': str(self.feedback),
-            'claude_projects_root': str(self.root / 'claude-projects')}
+            'claude_projects_root': str(self.root / 'claude-projects'),
+            'antigravity_providers_root': str(self.root / 'antigravity')}
         self.path = self.feedback / 'frontend-ui/notes/20261008T091722Z-manual-deadbeef.md'
         self.path.parent.mkdir(parents=True)
         self.note = ('# Keep reports qualified\n- Recorded: 2026-10-08T09:17:22+00:00\n'

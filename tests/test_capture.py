@@ -56,7 +56,8 @@ class CaptureTests(unittest.TestCase):
         self.config = {'sessions_root': str(self.sessions), 'archived_sessions_root': str(self.archive),
                        'feedback_dir': str(self.feedback),
                        'install_root': str(self.root / 'install'), 'claude_path': '/bin/false',
-                       'claude_projects_root': str(self.root / 'claude-projects')}
+                       'claude_projects_root': str(self.root / 'claude-projects'),
+                       'antigravity_providers_root': str(self.root / 'antigravity')}
         self.lesson = {'skill': 'frontend-ui', **{field: 'Verified useful check' for field in capture.FIELDS}}
         verified = patch.object(capture, 'verify_cli')
         verified.start()

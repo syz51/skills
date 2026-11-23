@@ -29,6 +29,7 @@ class SkillLifecycleTests(unittest.TestCase):
         config = {'sessions_root': str(sessions),
                   'archived_sessions_root': str(root / 'archive'),
                   'claude_projects_root': str(root / 'claude'),
+                  'antigravity_providers_root': str(root / 'antigravity'),
                   'feedback_dir': str(root / 'local-feedback'),
                   'install_root': str(root / 'installed'), 'host_id': 'client-host'}
         folder = root / 'source/skills' / skill

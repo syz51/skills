@@ -14,7 +14,7 @@ import capture
 import claude_cli
 import read_guidance
 
-from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, RateLimited, FIELDS, ScanCache, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, atomic, claude_projects, claude_turns, codex_home,
+from capture import (CYCLE_TIMEOUT, CaptureBudgetExpired, ExtractorFailure, RateLimited, FIELDS, ScanCache, SCHEMA as NOTE_SCHEMA, SINCE, SKILLS, antigravity_paths, antigravity_turns, atomic, claude_projects, claude_turns, codex_home,
                      completed_turns, message_context, model_response, safe_path, timestamp, validate_notes)
 
 # Source checks need more room than extraction, which also carries duplicate-note context.
@@ -441,6 +441,8 @@ def verify(config, state_root, note_sha=None, recheck=False, now=None):
                             eligible_only=False, source_notes=recovery_notes, cache=cache)
     turns += claude_turns(claude_projects(config).rglob('*.jsonl'), since, errors,
                           eligible_only=False, source_notes=recovery_notes, cache=cache)
+    turns += antigravity_turns(antigravity_paths(config), since, errors,
+                               eligible_only=False, source_notes=recovery_notes, cache=cache)
     if cache:
         cache.save()
     by_id = {(turn['thread'], turn['turn']): turn for turn in turns}

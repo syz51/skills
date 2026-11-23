@@ -1016,7 +1016,7 @@ class ScanCache:
         self.changed = False
 
     def turns(self, kind, path, errors):
-        parse = codex_file if kind == 'codex' else claude_file
+        parse = {'codex': codex_file, 'claude': claude_file, 'antigravity': antigravity_file}[kind]
         status = path.stat()
         identity = [status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns]
         entry, digest = valid_scan_entry(self.previous.get(str(path)), kind), None
@@ -1400,6 +1400,260 @@ def claude_projects(config):
                 Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude') / 'projects').expanduser().resolve()
 
 
+def antigravity_providers(config):
+    return Path(config.get('antigravity_providers_root') or
+                Path(os.environ.get('T3CODE_HOME') or Path.home() / '.t3') / 'userdata' / 'providers' / 'antigravity').expanduser().resolve()
+
+
+def antigravity_paths(config):
+    """Per-conversation Antigravity JSONL logs, preferring transcript_full.jsonl over transcript.jsonl."""
+    root = antigravity_providers(config)
+    if not root.is_dir():
+        return []
+    paths = []
+    for logs in sorted(root.glob('*/antigravity-acp/brain/*/.system_generated/logs')):
+        full = logs / 'transcript_full.jsonl'
+        compact = logs / 'transcript.jsonl'
+        if full.is_file():
+            paths.append(full)
+        elif compact.is_file():
+            paths.append(compact)
+    return paths
+
+
+def antigravity_text(content):
+    """Typed user text from an Antigravity USER_INPUT step, without T3/harness wrappers."""
+    if not isinstance(content, str):
+        return ''
+    text = re.sub(r'<(t3_code_instructions|runtime_info|ADDITIONAL_METADATA)>[\s\S]*?</\1>', '', content)
+    for tag in ('user_request', 'USER_REQUEST'):
+        match = re.search(r'<' + tag + r'>\s*([\s\S]*?)\s*</' + tag + r'>', text)
+        if match:
+            text = match[1]
+    return text.strip()
+
+
+def antigravity_read_content(output):
+    """Extract (content, complete) from Antigravity's read_file GENERIC tool output, or (None, False)."""
+    if not isinstance(output, str):
+        return None, False
+    lines = output.splitlines()
+    header_idx = None
+    partial = False
+    start = end = total = None
+    for index, line in enumerate(lines[:10]):
+        match = re.match(r'^Showing lines (\d+)-(\d+) of (\d+)$', line)
+        if match:
+            header_idx, start, end, total = index, int(match[1]), int(match[2]), int(match[3])
+            break
+        match = re.match(r'^Partial read \(lines (\d+)-(\d+) of (\d+)\)\.', line)
+        if match:
+            header_idx, partial, start, end, total = index, True, int(match[1]), int(match[2]), int(match[3])
+            break
+    if header_idx is None:
+        return None, False
+    body = lines[header_idx + 1:]
+    no_newline = False
+    if body and body[-1] == '(no newline at end of file)':
+        no_newline = True
+        body = body[:-1]
+    extracted = []
+    for line in body:
+        numbered = re.match(r'^\d+: (.*)$', line)
+        if not numbered:
+            return None, False
+        extracted.append(numbered[1])
+    text = '\n'.join(extracted) + ('' if no_newline or not extracted else '\n')
+    complete = (not partial) and start == 1 and end == total
+    return text, complete
+
+
+def antigravity_command_output(output):
+    """Extract (exit_code, stdout) from Antigravity's run_command GENERIC tool output."""
+    if not isinstance(output, str):
+        return 1, ''
+    match = re.search(r'(?m)^Command exited with code (\d+)\b', output)
+    code = int(match[1]) if match else 0
+    marker = '\nCommand output:\n'
+    pos = output.find(marker)
+    stdout = output[pos + len(marker):] if pos >= 0 else output
+    return code, stdout
+
+
+def antigravity_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None, cache=None):
+    """Group Antigravity transcript records into completed prompt turns with the Codex/Claude turn shape."""
+    now = now or datetime.now(timezone.utc)
+    turns = {}
+    for path in sorted(paths):
+        try:
+            quiet = now - datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) >= CLAUDE_QUIET
+        except OSError:
+            continue
+        try:
+            found = cache.turns('antigravity', path, errors) if cache else antigravity_file(path, errors, source_notes)[0]
+        except FileNotFoundError:
+            continue
+        for current in found:
+            if current.pop('broken') or current.pop('stop') != 'end_turn' or (current.pop('last', False) and not quiet):
+                continue
+            try:
+                keep_turn(turns, current, since, eligible_only)
+            except (ValueError, TypeError, AttributeError):
+                if errors is not None:
+                    errors.append({'file': path.name[:200], 'line': 0, 'reason': 'invalid transcript timestamp'})
+    return sorted(turns.values(), key=lambda t: (t['completed_at'], t['evidence_id']))
+
+
+def antigravity_file(path, errors=None, source_notes=None, resume=None, digest=None):
+    """Prompt turns of one Antigravity transcript in file order, supporting ScanCache resume."""
+    thread = path.parents[2].name if len(path.parents) >= 3 and path.parents[1].name == '.system_generated' else path.stem
+    scan = {'finished': [], 'current': None, 'pending': [], 'loaded': set(), 'reads': [], 'context': '', 'thread': thread}
+    offset = count = 0
+    if resume:
+        scan.update(loaded=set(resume['loaded']), reads=list(resume['reads']), context=resume['context'])
+        offset, count = resume['offset'], resume['line']
+    file_errors = []
+
+    def mark(at, line, context, errors_before, before):
+        return {'offset': at, 'line': line, 'context': context, 'loaded': sorted(scan['loaded']),
+                'reads': list(scan['reads']), 'turns': len(scan['finished']), 'errors': errors_before, 'digest': before}
+    checkpoint = mark(offset, count, scan['context'], 0, digest.copy() if digest else None)
+    with path.open('rb') as stream:
+        stream.seek(offset)
+        for line in stream:
+            if not line.endswith(b'\n'):
+                break
+            opened, context, at, line_before, errors_before = scan['current'], scan['context'], offset, count, len(file_errors)
+            before = digest.copy() if digest else None
+            offset, count = offset + len(line), count + 1
+            if digest:
+                digest.update(line)
+            try:
+                parse_line = parse_bytes(line)
+                if len(parse_line) > MAX_RECORD_BYTES:
+                    raise ValueError('oversized transcript record')
+                record = json.loads(parse_line)
+                if not isinstance(record, dict):
+                    raise ValueError('invalid transcript object')
+                antigravity_record(scan, record, line, count, source_notes)
+            except (ValueError, UnicodeError, TypeError, AttributeError, KeyError) as error:
+                reason = str(error) if str(error).startswith(('oversized', 'invalid transcript')) else 'invalid transcript record'
+                file_errors.append({'file': path.name[:200], 'line': count, 'reason': reason})
+                if scan['current']:
+                    scan['current']['broken'] = True
+            if scan['current'] is not None and scan['current'] is not opened:
+                checkpoint = mark(at, line_before, context, errors_before, before)
+    if scan['current']:
+        scan['current']['last'] = True
+        close_claude_turn(scan)
+    else:
+        checkpoint = mark(offset, count, scan['context'], len(file_errors), digest.copy() if digest else None)
+    if errors is not None:
+        errors.extend(file_errors)
+    return scan['finished'], file_errors, checkpoint
+
+
+def antigravity_record(scan, record, line, line_no, source_notes):
+    kind, current = record.get('type'), scan['current']
+    if kind == 'USER_INPUT' and record.get('source') == 'USER_EXPLICIT':
+        if current:
+            close_claude_turn(scan)
+        text = antigravity_text(record.get('content'))
+        if text:
+            scan['context'] = text
+        step = record.get('step_index', line_no)
+        current = scan['current'] = {'thread': scan['thread'], 'turn': 'step-' + str(step), 'messages': [], 'calls': [],
+            'verified_skills': [], 'loaded_hash': 'unknown', 'loaded_reads': [], 'hash': hashlib.sha256(),
+            'stop': None, 'completed_at': None, 'broken': False, 'filter': scan['context']}
+        scan['pending'] = []
+        current['hash'].update(line)
+        if text:
+            current['messages'].append({'role': 'user', 'text': text})
+        return
+    if current is None:
+        return  # Subagent sessions and pre-prompt records have no USER_EXPLICIT turn.
+    if kind == 'PLANNER_RESPONSE':
+        current['hash'].update(line)
+        content = record.get('content')
+        if isinstance(content, str) and content.strip():
+            current['messages'].append({'role': 'assistant', 'text': content})
+        calls = record.get('tool_calls')
+        if isinstance(calls, list) and calls:
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                name = str(call.get('name') or '')
+                args = call.get('args') if isinstance(call.get('args'), dict) else {}
+                scan['pending'].append((name, args))
+                current['calls'].append({'name': name})
+            current['stop'] = 'tool_use'
+        elif isinstance(content, str) and content.strip():
+            current['stop'] = 'end_turn'
+        created = record.get('created_at')
+        if not isinstance(created, str):
+            raise ValueError('invalid transcript timestamp')
+        current['completed_at'] = created
+    elif kind == 'GENERIC':
+        current['hash'].update(line)
+        antigravity_result(scan, record, source_notes)
+
+
+def antigravity_result(scan, record, source_notes):
+    """Record observed skill reads and note writes from one Antigravity GENERIC tool result."""
+    current = scan['current']
+    name, args = scan['pending'].pop(0) if scan['pending'] else ('', {})
+    output = record.get('content') if isinstance(record.get('content'), str) else ''
+    failed = record.get('status') == 'ERROR' or bool(record.get('error'))
+    skill_read, created = False, []
+    if name == 'read_file' and not failed:
+        target = str(args.get('Path') or args.get('path') or '')
+        try:
+            rel = guidance_path(target)
+        except ValueError:
+            rel = None
+        if rel:
+            text, complete = antigravity_read_content(output)
+            if text is not None and '\x00' not in text:
+                skill_read = True
+                add_read(scan, {'path': rel, 'sha256': hashlib.sha256(text.encode()).hexdigest(),
+                                'coverage': 'complete' if complete else 'partial', 'read_turn': current['turn']})
+                skill, relative = rel.split('/', 1)
+                if relative == 'SKILL.md' and re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', text, re.I):
+                    scan['loaded'].add(skill)
+    elif name == 'run_command':
+        command = args.get('CommandLine') or args.get('command')
+        if isinstance(command, str):
+            exit_code, stdout = antigravity_command_output(output)
+            failed = failed or exit_code != 0
+            raw = json.dumps({'cmd': command})
+            envelope = json.dumps({'exit_code': 1 if failed else 0, 'output': stdout})
+            skills = [s for s in SKILLS if re.search(r'(?<![\w.-])skills/' + re.escape(s) + r'/SKILL\.md\b', command)]
+            skill_read = bool(skills)
+            if not failed and re.search(r'\b(?:cat|sed|read_text|read_guidance\.py)\b', command):
+                entries = loaded_reads(raw, envelope, current['turn'])
+                proven = {entry['path'].split('/')[0] for entry in entries
+                          if entry['path'].endswith('/SKILL.md')}
+                legacy = literal_entrypoint(command)
+                if legacy:
+                    proven.add(legacy)
+                scan['loaded'].update(s for s in proven if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', stdout, re.I))
+                for entry in entries:
+                    skill_read = True
+                    add_read(scan, entry)
+            if source_notes:
+                created = creation_matches(raw, envelope, source_notes, record.get('created_at'))
+    elif name == 'write_file' and source_notes and not failed:
+        target = args.get('Path') or args.get('path')
+        content = args.get('Content')
+        if isinstance(target, str) and isinstance(content, str):
+            created = write_matches({'type': 'create', 'filePath': target, 'content': content},
+                                    source_notes, record.get('created_at'))
+    if created:
+        current['created_notes'] = sorted(set(current.get('created_notes', [])) | set(created))
+    if not skill_read:
+        current['messages'].append({'role': 'tool', 'text': 'Tool returned; ' + ('error' if failed else 'success')})
+
+
 def safe_path(path):
     if any(p.is_symlink() for p in (path, *path.parents) if str(p) not in ('/tmp', '/var', '/etc')):
         raise ValueError('Capture paths must not contain user symlinks')
@@ -1760,7 +2014,8 @@ def capture(config, state_root, *, now=None, retry_now=False):
     since = timestamp(config.get('capture_since', SINCE))
     cache = ScanCache(state_root / 'capture-scan.json')
     turns = sorted(completed_turns([*sessions.rglob('*.jsonl'), *archived.rglob('*.jsonl')], since, scan_errors, cache=cache) +
-                   claude_turns(claude_projects(config).rglob('*.jsonl'), since, scan_errors, now=now, cache=cache),
+                   claude_turns(claude_projects(config).rglob('*.jsonl'), since, scan_errors, now=now, cache=cache) +
+                   antigravity_turns(antigravity_paths(config), since, scan_errors, now=now, cache=cache),
                    key=lambda t: (t['completed_at'], t['evidence_id']))
     cache.save()
     pending = [turn for turn in turns if turn['evidence_id'] not in state['processed']]

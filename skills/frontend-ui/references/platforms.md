@@ -16,7 +16,7 @@ Do not install UnoCSS to satisfy this guide. The old dual-theme mandate, dials, 
 
 ## Hosted pages and inline visuals
 
-Use the acting host's page and visual tools when it provides them (for example, claude.ai Artifacts with the `artifact-design` skill), and follow their design, capability, preview, and publishing contracts. Keep host styling inside host surfaces; an ordinary web project uses its own components and styles, and host-only utilities are not a production frontend design system.
+Use the acting host's page and visual tools when it provides them (for example, T3 Code's `html_preview` and `html_render`, or claude.ai Artifacts with the `artifact-design` skill), and follow their design, capability, preview, and publishing contracts. Keep host styling inside host surfaces; an ordinary web project uses its own components and styles, and host-only utilities are not a production frontend design system.
 
 - Show a coherent first version with the requested product, real visual direction, and main affordance visible. Complete the requested behavior and relevant responsive/accessibility checks before reporting completion.
 - A sparse brief permits coherent design decisions and sample content. It does not authorize speculative features, invented factual claims, new external integrations, or misleading success states. Add capabilities because the requested experience needs them.
@@ -26,7 +26,7 @@ Use the acting host's page and visual tools when it provides them (for example, 
 
 ## Images
 
-Claude Code has no built-in image generation. Use supplied or existing assets, code-native vectors, or an image tool the host provides. Preserve provenance and transparency, verify any text in the image, and save final project assets into the workspace.
+Hosts vary in image generation support (for example, Antigravity provides an `image-generator` subagent, while Claude Code has no built-in image generation). Use supplied or existing assets, code-native vectors, or an image tool the host provides. Preserve provenance and transparency, verify any text in the image, and save final project assets into the workspace.
 
 ## Browser verification
 
