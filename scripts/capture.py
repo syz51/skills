@@ -65,6 +65,19 @@ PROMPT = prompt_runtime.load('extract', root=prompt_runtime.DEFAULT_ROOT)
 REJECTED_DEFAULT = prompt_runtime.REJECTED_DEFAULT
 REJECTED_DEFAULT_SKILL = 'frontend-ui'
 REJECTED_DEFAULT_TITLE = re.compile(r'\s*rejected\s+default\s*:(.*)', re.I | re.S)
+# Automated board daemon wake-up prompts (legacy snapshot wakes and current delta wakes, with optional
+# tool-origin banner and wake-up marker). Every body line must be a daemon `board <slug>:` notice so wakes
+# that carry a user's ask answer stay eligible. Pure board-wake turns qualify only with an in-turn skill read.
+BOARD_WAKE = re.compile(
+    r'\A'
+    r'(?:\[T3 Code:[^\n]*\]\s+)?'
+    r'(?:board [^\s:]+:[^\n]*\n)*'
+    r'board [^\s:]+:[^\n]*'
+    r'(?:(?:\n|[ \t]+)Run board_snapshot and continue(?: your loop)?\.|\nContinue from this and the board delta in this prompt, if there is one\.)'
+    r'(?:\s*\(wake-up [0-9a-f]+\))?'
+    r'\Z'
+)
+WAKE_HOOK_BLOCK = re.compile(r'<(system-reminder|board)\b[^>]*>[\s\S]*?</\1>')
 
 
 class CaptureBudgetExpired(RuntimeError):
@@ -827,7 +840,7 @@ def parse_bytes(line):
     return INLINE_BASE64.sub(b'"[inline base64 omitted]"', line) if len(line) > MAX_RECORD_BYTES else line
 
 
-def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=None, cache=None):
+def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=None, cache=None, excluded=None):
     """Stream complete JSONL records; rescanning also handles appended/rollover files. A `cache` resumes
     each file where the previous scan's checkpoint left it."""
     turns = {}
@@ -837,7 +850,7 @@ def completed_turns(paths, since, errors=None, eligible_only=True, source_notes=
         except FileNotFoundError:
             continue  # Removed after it was listed: the scan sees it as already gone.
         for current in found:
-            keep_turn(turns, current, since, eligible_only)
+            keep_turn(turns, current, since, eligible_only, excluded=excluded)
     return sorted(turns.values(), key=lambda t: (t['completed_at'], t['evidence_id']))
 
 
@@ -898,7 +911,8 @@ def codex_file(path, errors=None, source_notes=None, resume=None, digest=None):
                 continue
             if kind == 'event_msg' and payload.get('type') == 'task_started':
                 current = {'thread': meta.get('session_id') or meta.get('id'), 'turn': payload.get('turn_id'),
-                           'messages': [], 'calls': [], 'verified_skills': [], 'loaded_hash': 'unknown'}
+                           'messages': [], 'calls': [], 'verified_skills': [], 'loaded_hash': 'unknown',
+                           'turn_skill_read': False}
                 calls = {}
                 source_hash = hashlib.sha256()
             if current is None:
@@ -958,7 +972,10 @@ def codex_file(path, errors=None, source_notes=None, resume=None, digest=None):
                         legacy = literal_entrypoint(raw)
                         if legacy and successful and re.match(r'^Exit code: 0\n', output):
                             proven.add(legacy)
-                        loaded.update(skill for skill in proven if re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', output, re.I))
+                        matched = {skill for skill in proven if re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', output, re.I)}
+                        loaded.update(matched)
+                        if matched or observed_reads:
+                            current['turn_skill_read'] = True
                         for item in observed_reads:
                             if not any(all(previous[key] == item[key] for key in ('path', 'sha256', 'coverage')) for previous in reads):
                                 reads.append(item)
@@ -1089,6 +1106,7 @@ def valid_scan_turn(turn, kind):
             and isinstance(turn.get('verified_skills'), list) and isinstance(turn.get('messages'), list)
             and all(isinstance(message, dict) and isinstance(message.get('role'), str) and isinstance(message.get('text'), str)
                     for message in turn['messages'])
+            and type(turn.get('turn_skill_read')) is bool
             and (kind == 'codex' or ('broken' in turn and 'stop' in turn)))
 
 
@@ -1118,17 +1136,30 @@ def prefix_digest(path, size):
     return digest
 
 
-def keep_turn(turns, current, since, eligible_only):
+def is_board_wake(messages):
+    """True when a turn's own user messages are board daemon wake-up prompts."""
+    own = [WAKE_HOOK_BLOCK.sub('', m['text']).strip() for m in messages if m['role'] == 'user']
+    own = [text for text in own if text]
+    return bool(own) and all(BOARD_WAKE.fullmatch(text) for text in own)
+
+
+def keep_turn(turns, current, since, eligible_only, excluded=None):
     thread, turn = current['thread'], current['turn']
+    in_turn_skill = current.pop('turn_skill_read', False)
+    filter_text = current.pop('filter', '')
     if not (thread and turn and (current['verified_skills'] or not eligible_only) and timestamp(current['completed_at']) >= since):
         return
     # Claude Code notification turns are judged by the latest typed prompt; Codex turns have no filter text.
-    user = '\n'.join([m['text'] for m in current['messages'] if m['role'] == 'user'] + [current.pop('filter', '')])
+    user = '\n'.join([m['text'] for m in current['messages'] if m['role'] == 'user'] + [filter_text])
     maintenance = re.search(r'(?i)(?:maintenance-prompt\.md|scripts/(?:jobs|capture|sync|monitor)\.py|skill-feedback/|capture-state\.json|synthetic (?:exercise|test|task)|test fixture|simulate (?:skill|work))', user)
     readonly = re.search(r'(?i)\b(?:read.only|do not (?:edit|change|write)|review only|planning only)\b', user)
-    if eligible_only and (maintenance or readonly):
+    board_wake = is_board_wake(current['messages'])
+    evidence_id = hashlib.sha256((thread + ':' + turn).encode()).hexdigest()
+    if eligible_only and (maintenance or readonly or (board_wake and not in_turn_skill)):
+        if excluded is not None:
+            excluded.add(evidence_id)
         return
-    current['evidence_id'] = hashlib.sha256((thread + ':' + turn).encode()).hexdigest()
+    current['evidence_id'] = evidence_id
     key = (thread, turn)
     # Rollover copies can contain different amounts of context.
     if key not in turns or len(json.dumps(current)) > len(json.dumps(turns[key])):
@@ -1168,7 +1199,7 @@ def write_matches(result, notes, recorded_at):
     return found
 
 
-def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None, cache=None):
+def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None, cache=None, excluded=None):
     """Group Claude Code transcript records into completed prompt turns with the Codex turn shape."""
     now = now or datetime.now(timezone.utc)
     turns = {}
@@ -1188,7 +1219,7 @@ def claude_turns(paths, since, errors=None, eligible_only=True, source_notes=Non
             if current.pop('broken') or current.pop('stop') != 'end_turn' or (current.pop('last', False) and not quiet):
                 continue
             try:
-                keep_turn(turns, current, since, eligible_only)
+                keep_turn(turns, current, since, eligible_only, excluded=excluded)
             except (ValueError, TypeError, AttributeError):
                 if errors is not None:
                     errors.append({'file': path.name[:200], 'line': 0, 'reason': 'invalid transcript timestamp'})
@@ -1286,7 +1317,7 @@ def claude_record(scan, record, line, source_notes):
         # Notification turns have no typed text; the latest prompt still decides read-only or maintenance scope.
         current = scan['current'] = {'thread': record.get('sessionId'), 'turn': prompt, 'messages': [], 'calls': [],
             'verified_skills': [], 'loaded_hash': 'unknown', 'loaded_reads': [], 'hash': hashlib.sha256(),
-            'stop': None, 'completed_at': None, 'broken': False, 'filter': scan['context']}
+            'stop': None, 'completed_at': None, 'broken': False, 'filter': scan['context'], 'turn_skill_read': False}
         scan['uses'] = {}
     if current is None or (kind == 'user' and prompt != current['turn']):
         return  # Compaction summaries and local-command output belong to no prompt turn.
@@ -1320,6 +1351,7 @@ def claude_record(scan, record, line, source_notes):
             guidance = guidance[:marker] if marker >= 0 else guidance
             if guidance.strip():
                 scan['loaded'].add(skill)
+                current['turn_skill_read'] = True
                 # Injected skills omit frontmatter, so the hash covers an excerpt of SKILL.md.
                 add_read(scan, {'path': skill + '/SKILL.md', 'sha256': hashlib.sha256(guidance.encode()).hexdigest(),
                                 'coverage': 'partial', 'read_turn': current['turn']})
@@ -1358,6 +1390,7 @@ def claude_result(scan, record, results, source_notes):
                 skill, relative = path.split('/', 1)
                 if relative == 'SKILL.md' and re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', read['content'], re.I):
                     scan['loaded'].add(skill)
+                current['turn_skill_read'] = True
         elif name == 'Bash' and isinstance(arguments.get('command'), str):
             command = arguments['command']
             raw, envelope = json.dumps({'cmd': command}), json.dumps({'exit_code': 1 if failed else 0, 'output': output})
@@ -1370,7 +1403,10 @@ def claude_result(scan, record, results, source_notes):
                 legacy = literal_entrypoint(command)
                 if legacy:
                     proven.add(legacy)
-                scan['loaded'].update(s for s in proven if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', output, re.I))
+                matched = {s for s in proven if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', output, re.I)}
+                scan['loaded'].update(matched)
+                if matched or entries:
+                    current['turn_skill_read'] = True
                 # Claude Code trims and may wrap shell output, so only self-identifying guidance-reader envelopes are hashed.
                 try:
                     request(command)
@@ -1378,7 +1414,7 @@ def claude_result(scan, record, results, source_notes):
                     pass
                 else:
                     skill_read = True
-                    for entry in loaded_reads(raw, envelope, current['turn']):
+                    for entry in entries:
                         add_read(scan, entry)
             if source_notes:
                 created = creation_matches(raw, envelope, source_notes, record.get('timestamp'))
@@ -1480,7 +1516,7 @@ def antigravity_command_output(output):
     return code, stdout
 
 
-def antigravity_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None, cache=None):
+def antigravity_turns(paths, since, errors=None, eligible_only=True, source_notes=None, now=None, cache=None, excluded=None):
     """Group Antigravity transcript records into completed prompt turns with the Codex/Claude turn shape."""
     now = now or datetime.now(timezone.utc)
     turns = {}
@@ -1497,7 +1533,7 @@ def antigravity_turns(paths, since, errors=None, eligible_only=True, source_note
             if current.pop('broken') or current.pop('stop') != 'end_turn' or (current.pop('last', False) and not quiet):
                 continue
             try:
-                keep_turn(turns, current, since, eligible_only)
+                keep_turn(turns, current, since, eligible_only, excluded=excluded)
             except (ValueError, TypeError, AttributeError):
                 if errors is not None:
                     errors.append({'file': path.name[:200], 'line': 0, 'reason': 'invalid transcript timestamp'})
@@ -1564,7 +1600,7 @@ def antigravity_record(scan, record, line, line_no, source_notes):
         step = record.get('step_index', line_no)
         current = scan['current'] = {'thread': scan['thread'], 'turn': 'step-' + str(step), 'messages': [], 'calls': [],
             'verified_skills': [], 'loaded_hash': 'unknown', 'loaded_reads': [], 'hash': hashlib.sha256(),
-            'stop': None, 'completed_at': None, 'broken': False, 'filter': scan['context']}
+            'stop': None, 'completed_at': None, 'broken': False, 'filter': scan['context'], 'turn_skill_read': False}
         scan['pending'] = []
         current['hash'].update(line)
         if text:
@@ -1620,6 +1656,7 @@ def antigravity_result(scan, record, source_notes):
                 skill, relative = rel.split('/', 1)
                 if relative == 'SKILL.md' and re.search(r'(?:name:\s*' + re.escape(skill) + r'\b|#\s*' + HEADINGS[skill] + ')', text, re.I):
                     scan['loaded'].add(skill)
+                current['turn_skill_read'] = True
     elif name == 'run_command':
         command = args.get('CommandLine') or args.get('command')
         if isinstance(command, str):
@@ -1636,7 +1673,10 @@ def antigravity_result(scan, record, source_notes):
                 legacy = literal_entrypoint(command)
                 if legacy:
                     proven.add(legacy)
-                scan['loaded'].update(s for s in proven if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', stdout, re.I))
+                matched = {s for s in proven if re.search(r'(?:name:\s*' + re.escape(s) + r'\b|#\s*' + HEADINGS[s] + ')', stdout, re.I)}
+                scan['loaded'].update(matched)
+                if matched or entries:
+                    current['turn_skill_read'] = True
                 for entry in entries:
                     skill_read = True
                     add_read(scan, entry)
@@ -2011,17 +2051,26 @@ def capture(config, state_root, *, now=None, retry_now=False):
         if isinstance(revision, str) and re.fullmatch(r'[a-f0-9]{40,64}', revision):
             deployed = revision
     scan_errors = []
+    excluded = set()
     since = timestamp(config.get('capture_since', SINCE))
     cache = ScanCache(state_root / 'capture-scan.json')
-    turns = sorted(completed_turns([*sessions.rglob('*.jsonl'), *archived.rglob('*.jsonl')], since, scan_errors, cache=cache) +
-                   claude_turns(claude_projects(config).rglob('*.jsonl'), since, scan_errors, now=now, cache=cache) +
-                   antigravity_turns(antigravity_paths(config), since, scan_errors, now=now, cache=cache),
+    turns = sorted(completed_turns([*sessions.rglob('*.jsonl'), *archived.rglob('*.jsonl')], since, scan_errors, cache=cache, excluded=excluded) +
+                   claude_turns(claude_projects(config).rglob('*.jsonl'), since, scan_errors, now=now, cache=cache, excluded=excluded) +
+                   antigravity_turns(antigravity_paths(config), since, scan_errors, now=now, cache=cache, excluded=excluded),
                    key=lambda t: (t['completed_at'], t['evidence_id']))
     cache.save()
+    turn_ids = {turn['evidence_id'] for turn in turns}
+    # Turns whose source is still on disk but now excluded by local filters (such as board-wake turns)
+    # are no longer pending work and must not become permanent unavailable_sources errors.
+    retired = (excluded - turn_ids) & (set(state['pending']) | set(state['deferred']))
+    for evidence in retired:
+        state['pending'].pop(evidence, None)
+        state['deferred'].pop(evidence, None)
+    if retired:
+        atomic(state_path, json.dumps(state, indent=2) + '\n')
     pending = [turn for turn in turns if turn['evidence_id'] not in state['processed']]
     # A moved or temporarily unavailable source must not disappear from job health.
-    unavailable = ((set(state['pending']) | set(state['deferred'])) - set(state['processed']) -
-                   {turn['evidence_id'] for turn in turns})
+    unavailable = ((set(state['pending']) | set(state['deferred'])) - set(state['processed']) - turn_ids)
     written = 0
     machine = re.sub(r'[^A-Za-z0-9.-]', '-', socket.gethostname())
     processed = 0

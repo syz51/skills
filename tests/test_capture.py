@@ -264,6 +264,29 @@ class CaptureTests(unittest.TestCase):
         self.rollout(self.transcript(), source={'subagent': {'thread_spawn': {}}}, filename='child.jsonl')
         self.assertEqual(len(capture.completed_turns(self.sessions.glob('*.jsonl'), capture.timestamp(capture.SINCE), eligible_only=False)), 1)
 
+    def test_board_wake_turns_require_an_in_turn_skill_load_or_read(self):
+        wake = 'board demo: demo-7 is ready (p2)\nRun board_snapshot and continue.'
+        wake_with_hook = (
+            self.record('event_msg', {'type': 'task_started', 'turn_id': 'turn2b'})
+            + self.record('event_msg', {'type': 'user_message', 'message': wake})
+            + self.record('response_item', {'type': 'message', 'role': 'user',
+                                            'content': [{'text': '<board agent="codex:1" board="demo">counts: open 1</board>'}]})
+            + self.record('response_item', {'type': 'message', 'role': 'assistant', 'content': [{'text': 'Checked board.'}]})
+            + self.record('event_msg', {'type': 'task_complete', 'turn_id': 'turn2b'})
+        )
+        self.rollout(
+            self.transcript('turn1', user='Build a small page', load=True)
+            + self.transcript('turn2', user=wake, load=False)
+            + wake_with_hook
+            + self.transcript('turn3', user=wake, load=True)
+            + self.transcript('turn4', user='Tighten spacing on mobile', load=False)
+        )
+        eligible = self.scan()
+        self.assertEqual(sorted(t['turn'] for t in eligible), ['turn1', 'turn3', 'turn4'])
+        self.assertTrue(all('turn_skill_read' not in t for t in eligible))
+        all_turns = capture.completed_turns(self.sessions.glob('*.jsonl'), capture.timestamp(capture.SINCE), eligible_only=False)
+        self.assertEqual(sorted(t['turn'] for t in all_turns), ['turn1', 'turn2', 'turn2b', 'turn3', 'turn4'])
+
     def test_ineligible_sources_and_turns(self):
         for text, source in [(self.transcript(load=False), 'desktop'),
                              (self.transcript(complete=False), 'desktop'),

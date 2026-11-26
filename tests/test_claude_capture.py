@@ -229,6 +229,89 @@ class ClaudeCaptureTests(unittest.TestCase):
         self.assertEqual(len(evidence_view), 1)
         self.assertNotIn('filter', evidence_view[0])
 
+    def test_board_wake_turns_require_an_in_turn_skill_load_or_read(self):
+        wake = 'board demo: demo-12 is ready (p2)\nRun board_snapshot and continue.'
+        delta_wake = ('[T3 Code: this message came through T3 Code\'s tools, not from the user typing in this chat.]\n\n'
+                      'board demo: your demo-12 is in doing, and you have been away from it.\n'
+                      'Continue from this and the board delta in this prompt, if there is one.\n(wake-up deadbeef1234)')
+        transcript = (ClaudeTranscript()
+                      .prompt('Find a changelog skill', prompt='p1').skill(prompt='p1', use='s1').reply('Found one.')
+                      # Wake with no in-turn skill load or read is skipped.
+                      .prompt(wake, prompt='p2').reply('Checked board; nothing to load.')
+                      # Notification turn after a wake does not inherit wake status.
+                      .prompt('<task-notification>\n<task-id>bg</task-id>\n</task-notification>', prompt='p3',
+                              turnOrigin='task_notification').reply('Background worker finished.')
+                      # Wake that re-loads the same skill (deduplicated in loaded_reads) is kept.
+                      .prompt(wake, prompt='p4').skill(prompt='p4', use='s4').reply('Re-checked skill.')
+                      # Wake that reads a skill reference file is kept.
+                      .prompt(wake, prompt='p5')
+                      .tool('Read', {'file_path': '/x/.claude/skills/find-skills/references/guide.md'}, 'Guide', prompt='p5',
+                            result={'type': 'text', 'file': {'filePath': '/x/.claude/skills/find-skills/references/guide.md',
+                                                             'content': '# Guide\n', 'startLine': 1, 'numLines': 1, 'totalLines': 1}},
+                            use='r5')
+                      .reply('Read reference.')
+                      # Wake that reads a later slice of SKILL.md (past frontmatter and heading) is kept.
+                      .prompt(wake, prompt='p5b')
+                      .tool('Read', {'file_path': '/x/.claude/skills/find-skills/SKILL.md'}, 'Excerpt', prompt='p5b',
+                            result={'type': 'text', 'file': {'filePath': '/x/.claude/skills/find-skills/SKILL.md',
+                                                             'content': 'Check maintenance status before recommending.\n',
+                                                             'startLine': 20, 'numLines': 1, 'totalLines': 40}},
+                            use='r5b')
+                      .reply('Read lower section.')
+                      # Wake that loads a skill via Bash cat (not added to loaded_reads) is kept.
+                      .prompt(wake, prompt='p6')
+                      .tool('Bash', {'command': 'cat /x/skills/rust/SKILL.md'}, '# Rust\n', prompt='p6', use='b6')
+                      .reply('Loaded rust via shell.')
+                      # Modern delta wake without an in-turn skill load is skipped; with one is kept.
+                      .prompt(delta_wake, prompt='p7').reply('Checked status.')
+                      .prompt(delta_wake, prompt='p8').skill(prompt='p8', use='s8').reply('Used skill.')
+                      # Combined wake carrying a user ask answer stays eligible even without an in-turn load.
+                      .prompt('the user answered ask #9 about demo-1: "Skip it"\n' + wake, prompt='p8b').reply('Noted.')
+                      .prompt('board demo: demo-12 is ready (p2)\nthe user answered ask #10: "Use option A"\nRun board_snapshot and continue.',
+                              prompt='p8c').reply('Noted.')
+                      # Typed follow-up with no in-turn skill load stays eligible.
+                      .prompt('Also compare stars before picking.', prompt='p9').reply('Compared stars.')
+                      # Typed prompt quoting wake text stays eligible.
+                      .prompt('Fix parser when prompt says board demo: x\nRun board_snapshot and continue.', prompt='p10').reply('Fixed.'))
+        found = self.scan(transcript)
+        self.assertEqual([t['turn'] for t in found], ['p1', 'p3', 'p4', 'p5', 'p5b', 'p6', 'p8', 'p8b', 'p8c', 'p9', 'p10'])
+        self.assertTrue(all('turn_skill_read' not in t for t in found))
+        # Source verification (eligible_only=False) still sees skipped wake turns.
+        all_turns = self.scan(transcript, eligible_only=False)
+        self.assertEqual([t['turn'] for t in all_turns],
+                         ['p1', 'p2', 'p3', 'p4', 'p5', 'p5b', 'p6', 'p7', 'p8', 'p8b', 'p8c', 'p9', 'p10'])
+        self.assertTrue(all('turn_skill_read' not in t for t in all_turns))
+        # A board wake with a queued typed user message in the same turn is not a pure wake.
+        queued = (ClaudeTranscript()
+                  .prompt('Find a skill', prompt='q1').skill(prompt='q1', use='sq1').reply('Found.')
+                  .prompt(wake, prompt='q2'))
+        queued.add('attachment', attachment={'type': 'queued_command', 'commandMode': 'prompt', 'prompt': 'Focus on maintained ones'})
+        queued.reply('Filtered.')
+        self.assertEqual([t['turn'] for t in self.scan(queued)], ['q1', 'q2'])
+        # A board-wake turn already deferred in capture-state.json is retired cleanly rather than failing as unavailable.
+        state_dir = self.root / 'wake-state'
+        state_dir.mkdir()
+        wake_ev = hashlib.sha256((SESSION + ':p2').encode()).hexdigest()
+        ClaudeTranscript().prompt('Find', prompt='p1').skill(prompt='p1', use='s1').reply('Done.').prompt(
+            wake, prompt='p2').reply('Checked.').write(self.projects / 'wake/s.jsonl')
+        state_path = state_dir / 'capture-state.json'
+        state_path.write_text(json.dumps({
+            'processed': {hashlib.sha256((SESSION + ':p1').encode()).hexdigest(): {'completed_at': '2026-10-16T01:00:05Z', 'notes': 0}},
+            'pending': {},
+            'deferred': {wake_ev: {'attempts': 1, 'reason': 'extractor rate limit failure',
+                                   'completed_at': '2026-10-16T01:00:08Z', 'retry_at': '2026-10-16T02:00:00Z',
+                                   'rate_limited': True}},
+        }))
+        config = {'sessions_root': str(self.root / 'empty-sessions'), 'archived_sessions_root': str(self.root / 'empty-archive'),
+                  'feedback_dir': str(self.root / 'wake-feedback'), 'install_root': str(self.root / 'wake-install'),
+                  'claude_path': '/bin/false', 'claude_projects_root': str(self.projects / 'wake'),
+                  'antigravity_providers_root': str(self.root / 'empty-ag')}
+        with patch.object(capture, 'extract') as extract:
+            summary = capture.capture(config, state_dir, now=LATER)
+        extract.assert_not_called()
+        self.assertEqual((summary['eligible'], summary['pending'], summary['errors'], summary['unavailable_sources']), (0, 0, 0, 0))
+        self.assertEqual(json.loads(state_path.read_text())['deferred'], {})
+
     def test_read_tool_records_complete_or_partial_file_hashes(self):
         for lines, coverage in ((4, 'complete'), (2, 'partial')):
             with self.subTest(coverage=coverage):
