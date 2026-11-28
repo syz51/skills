@@ -50,7 +50,7 @@
     "rust-toolchain.toml": "d13306be0ecda81ce779baa290ffb417380d525928477f16200884b5169cca33",
     "scripts/activation_trace.py": "e18b9435c8038e71bde4f8d6e761a8dad4db2c8bed1c2d48f480f75c2c7f0426",
     "scripts/bundle_rust_licenses.py": "305e09c13dd7a2a0e86cf407be1dd2043a774c3d79f820af540e168c3e6da3fe",
-    "scripts/capture.py": "2b2c13e467103d734872bd49011a66735cf2622ed9cd44bfdc8687f6f62e5bc7",
+    "scripts/capture.py": "37a833df79af5cc076962fabc5babf12f23780d67088b0e191ca63e4ba3b6d8f",
     "scripts/claude_api.py": "6e047c8d6354a9f8401801124cf7294eb52a7b0753f362c1bab867f5c8a62b77",
     "scripts/claude_cli.py": "f609c06b3a5e4000e824f2c5ac0f71e0be8d2416c41be5c24bdc81ccf2f3f4f1",
     "scripts/evidence.py": "b0dd43edbdad2ff95bf5d19206b84cb43a19f9cc0394a76bb91a5ed2bc82cd2d",

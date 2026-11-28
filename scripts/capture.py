@@ -1610,21 +1610,26 @@ def antigravity_record(scan, record, line, line_no, source_notes):
         return  # Subagent sessions and pre-prompt records have no USER_EXPLICIT turn.
     if kind == 'PLANNER_RESPONSE':
         current['hash'].update(line)
-        content = record.get('content')
-        if isinstance(content, str) and content.strip():
-            current['messages'].append({'role': 'assistant', 'text': content})
-        calls = record.get('tool_calls')
-        if isinstance(calls, list) and calls:
-            for call in calls:
-                if not isinstance(call, dict):
-                    continue
-                name = str(call.get('name') or '')
-                args = call.get('args') if isinstance(call.get('args'), dict) else {}
-                scan['pending'].append((name, args))
-                current['calls'].append({'name': name})
-            current['stop'] = 'tool_use'
-        elif isinstance(content, str) and content.strip():
-            current['stop'] = 'end_turn'
+        status = record.get('status')
+        failed = (status is not None and status != 'DONE') or bool(record.get('error'))
+        if failed:
+            current['stop'] = 'error'
+        else:
+            content = record.get('content')
+            if isinstance(content, str) and content.strip():
+                current['messages'].append({'role': 'assistant', 'text': content})
+            calls = record.get('tool_calls')
+            if isinstance(calls, list) and calls:
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    name = str(call.get('name') or '')
+                    args = call.get('args') if isinstance(call.get('args'), dict) else {}
+                    scan['pending'].append((name, args))
+                    current['calls'].append({'name': name})
+                current['stop'] = 'tool_use'
+            elif isinstance(content, str) and content.strip():
+                current['stop'] = 'end_turn'
         created = record.get('created_at')
         if not isinstance(created, str):
             raise ValueError('invalid transcript timestamp')
